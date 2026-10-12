@@ -107,19 +107,19 @@ static void publish_now(const struct kestrel_tty *t, int x, int y, int w, int h)
 static void paint_glyph(struct kestrel_tty *t, unsigned char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
 {
     if (t->graphics) return;
-    const unsigned char *glyph = kestrel_font[c];
+    const uint16_t *glyph = kfont_glyph(t->font, c);
     const uint32_t fg = native_color(t, fg_color);
     const uint32_t bg = native_color(t, bg_color);
 
-    for (int row = 0; row < KFONT_HEIGHT; row++) {
+    for (int row = 0; row < t->font->height; row++) {
         int py = y + row;
         if (py < 0 || py >= t->native_height) continue;
         uint8_t *line = row_ptr(t, py);
-        unsigned char bits = glyph[row];
-        for (int col = 0; col < KFONT_WIDTH; col++) {
+        unsigned bits = glyph[row];
+        for (int col = 0; col < t->font->width; col++) {
             int px = x + col;
             if (px < 0 || px >= t->native_width) continue;
-            put_px(t, line, px, (bits & (0x80u >> col)) ? fg : bg);    /* bit 7 = leftmost pixel */
+            put_px(t, line, px, (bits & (0x8000u >> col)) ? fg : bg);  /* bit 15 = leftmost pixel */
         }
     }
 }
@@ -145,7 +145,7 @@ void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, u
 {
     if (!t || !t->active || t->graphics) return;
     paint_glyph(t, (unsigned char)c, x, y, fg_color, bg_color);    /* char may be signed */
-    publish(t, x, y, KFONT_WIDTH, KFONT_HEIGHT);
+    publish(t, x, y, t->font->width, t->font->height);
 }
 
 /* ======================================================================== */
@@ -160,7 +160,7 @@ static inline struct tty_cell *cell_at(const struct kestrel_tty *t, int cx, int 
 static void cell_draw(struct kestrel_tty *t, int cx, int cy, bool inverse)
 {
     const struct tty_cell *k = cell_at(t, cx, cy);
-    draw_char(t, (char)k->ch, cx * TTY_CELL_W, cy * TTY_CELL_H,
+    draw_char(t, (char)k->ch, cx * t->font->width, cy * t->font->height,
               inverse ? k->bg : k->fg, inverse ? k->fg : k->bg);
 }
 
@@ -172,9 +172,9 @@ static void paint_cells(struct kestrel_tty *t, int cy, int x0, int x1, bool pub)
     if (t->graphics || x0 >= x1) return;
     for (int cx = x0; cx < x1; cx++) {
         const struct tty_cell *k = cell_at(t, cx, cy);
-        paint_glyph(t, k->ch, cx * TTY_CELL_W, cy * TTY_CELL_H, k->fg, k->bg);
+        paint_glyph(t, k->ch, cx * t->font->width, cy * t->font->height, k->fg, k->bg);
     }
-    if (pub) publish(t, x0 * TTY_CELL_W, cy * TTY_CELL_H, (x1 - x0) * TTY_CELL_W, TTY_CELL_H);
+    if (pub) publish(t, x0 * t->font->width, cy * t->font->height, (x1 - x0) * t->font->width, t->font->height);
 }
 
 static const uint32_t ansi[16] = {
@@ -227,10 +227,10 @@ static void cursor_paint(struct kestrel_tty *t)
     if (t->index == active_keyboard_tty) { cell_draw(t, cx, cy, true); return; }
     cell_draw(t, cx, cy, false);
     uint32_t v = native_color(t, cell_at(t, cx, cy)->fg);
-    for (int py = cy * TTY_CELL_H + TTY_CELL_H - 2; py < (cy + 1) * TTY_CELL_H && py < t->native_height; py++)
-        for (int px = cx * TTY_CELL_W; px < (cx + 1) * TTY_CELL_W && px < t->native_width; px++)
+    for (int py = cy * t->font->height + t->font->height - 2; py < (cy + 1) * t->font->height && py < t->native_height; py++)
+        for (int px = cx * t->font->width; px < (cx + 1) * t->font->width && px < t->native_width; px++)
             put_px(t, row_ptr(t, py), px, v);
-    publish(t, cx * TTY_CELL_W, cy * TTY_CELL_H, TTY_CELL_W, TTY_CELL_H);
+    publish(t, cx * t->font->width, cy * t->font->height, t->font->width, t->font->height);
 }
 
 static void cursor_hide(struct kestrel_tty *t)
@@ -315,22 +315,22 @@ static void scroll_region(struct kestrel_tty *t, int top, int bot, int n)
         return;
     }
     if (t->cursor_visible) cursor_hide(t);              /* its pixels move too */
-    const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
+    const size_t row_bytes = (size_t)t->max_cols * t->font->width * (size_t)t->bytes_pp;
     const size_t cells = sizeof(struct tty_cell) * (size_t)t->max_cols;
     if (n > 0) {
         memmove(cell_at(t, 0, top), cell_at(t, 0, top + a), cells * (size_t)(h - a));
         if (!t->graphics)
-            for (int py = top * TTY_CELL_H; py < (bot + 1 - a) * TTY_CELL_H; py++)
-                memcpy(row_ptr(t, py), row_ptr(t, py + a * TTY_CELL_H), row_bytes);
+            for (int py = top * t->font->height; py < (bot + 1 - a) * t->font->height; py++)
+                memcpy(row_ptr(t, py), row_ptr(t, py + a * t->font->height), row_bytes);
         for (int y = bot - a + 1; y <= bot; y++) erase_cells(t, y, 0, t->max_cols, false);
     } else {
         memmove(cell_at(t, 0, top + a), cell_at(t, 0, top), cells * (size_t)(h - a));
         if (!t->graphics)
-            for (int py = (bot + 1) * TTY_CELL_H - 1; py >= (top + a) * TTY_CELL_H; py--)
-                memcpy(row_ptr(t, py), row_ptr(t, py - a * TTY_CELL_H), row_bytes);
+            for (int py = (bot + 1) * t->font->height - 1; py >= (top + a) * t->font->height; py--)
+                memcpy(row_ptr(t, py), row_ptr(t, py - a * t->font->height), row_bytes);
         for (int y = top; y < top + a; y++) erase_cells(t, y, 0, t->max_cols, false);
     }
-    if (!t->graphics) publish(t, 0, top * TTY_CELL_H, t->max_cols * TTY_CELL_W, h * TTY_CELL_H);
+    if (!t->graphics) publish(t, 0, top * t->font->height, t->max_cols * t->font->width, h * t->font->height);
 }
 
 void scroll_screen(struct kestrel_tty *t)
@@ -395,16 +395,16 @@ static void batch_begin(struct kestrel_tty *t)
 static void batch_end(struct kestrel_tty *t)
 {
     t->batch = false;
-    const int rows = t->max_rows, text_h = rows * TTY_CELL_H;
+    const int rows = t->max_rows, text_h = rows * t->font->height;
     int lo = rows, hi = -1;
     if (t->repaint_all) {
         lo = 0; hi = rows - 1;
         for (int y = 0; y < rows; y++) paint_cells(t, y, 0, t->max_cols, false);
     } else {
         if (t->pending_up && !t->graphics) {
-            const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
-            for (int py = 0; py < text_h - t->pending_up * TTY_CELL_H; py++)
-                memcpy(row_ptr(t, py), row_ptr(t, py + t->pending_up * TTY_CELL_H), row_bytes);
+            const size_t row_bytes = (size_t)t->max_cols * t->font->width * (size_t)t->bytes_pp;
+            for (int py = 0; py < text_h - t->pending_up * t->font->height; py++)
+                memcpy(row_ptr(t, py), row_ptr(t, py + t->pending_up * t->font->height), row_bytes);
         }
         if (t->pending_up) { lo = 0; hi = rows - 1; }
         for (int y = 0; y < rows; y++)
@@ -418,7 +418,7 @@ static void batch_end(struct kestrel_tty *t)
     t->pending_up = 0;
     t->repaint_all = false;
     if (t->graphics) return;
-    if (hi >= lo) publish(t, 0, lo * TTY_CELL_H, t->max_cols * TTY_CELL_W, (hi - lo + 1) * TTY_CELL_H);
+    if (hi >= lo) publish(t, 0, lo * t->font->height, t->max_cols * t->font->width, (hi - lo + 1) * t->font->height);
     if (t->dirty_x1 > t->dirty_x0)
         publish_now(t, t->dirty_x0, t->dirty_y0, t->dirty_x1 - t->dirty_x0, t->dirty_y1 - t->dirty_y0);
 }
@@ -989,8 +989,9 @@ static bool tty_setup(struct kestrel_tty *t, int index, const struct display_hea
     t->bytes_pp      = h->bytes_pp;
     t->r_pos = h->r_pos; t->g_pos = h->g_pos; t->b_pos = h->b_pos;
     t->index    = index;
-    t->max_cols = h->width / TTY_CELL_W;
-    t->max_rows = h->height / TTY_CELL_H;
+    t->font     = kfont_for(h->width, h->height);  /* Kestrel 10 below 1024x768 */
+    t->max_cols = h->width / t->font->width;
+    t->max_rows = h->height / t->font->height;
     if (t->max_cols < 1 || t->max_rows < 1) return false;
     t->cells = kmalloc(sizeof(struct tty_cell) * (size_t)t->max_cols * (size_t)t->max_rows);
     t->row_dirty = kzalloc((size_t)t->max_rows);
@@ -1050,12 +1051,12 @@ int tty_set_graphics(int index, bool on)
         for (int cy = 0; cy < t->max_rows; cy++)
             for (int cx = 0; cx < t->max_cols; cx++) {
                 const struct tty_cell *k = cell_at(t, cx, cy);
-                const unsigned char *glyph = kestrel_font[k->ch];
+                const uint16_t *glyph = kfont_glyph(t->font, k->ch);
                 const uint32_t fg = native_color(t, k->fg), bg = native_color(t, k->bg);
-                for (int row = 0; row < KFONT_HEIGHT; row++) {
-                    uint8_t *line = row_ptr(t, cy * TTY_CELL_H + row);
-                    for (int col = 0; col < KFONT_WIDTH; col++)
-                        put_px(t, line, cx * TTY_CELL_W + col, (glyph[row] & (0x80u >> col)) ? fg : bg);
+                for (int row = 0; row < t->font->height; row++) {
+                    uint8_t *line = row_ptr(t, cy * t->font->height + row);
+                    for (int col = 0; col < t->font->width; col++)
+                        put_px(t, line, cx * t->font->width + col, (glyph[row] & (0x8000u >> col)) ? fg : bg);
                 }
             }
         publish(t, 0, 0, t->native_width, t->native_height);

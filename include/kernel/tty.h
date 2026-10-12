@@ -60,8 +60,6 @@
 #include <kernel/display.h>
 #include <kernel/keyboard.h>
 
-#define TTY_CELL_W      8               /* kestrel_font glyph size */
-#define TTY_CELL_H      16
 #define TTY_BLINK_MS    500
 #define TTY_INPUT_MAX   1024
 #define TTY_KEYQ        64              /* key events buffered per TTY */
@@ -89,7 +87,8 @@ struct kestrel_tty {
     int       index;                    /* monitor number = system_ttys[] index     */
 
     /* ---- text grid ----------------------------------------------------- */
-    int       max_cols, max_rows;       /* native_width / 8, native_height / 16     */
+    const struct kfont *font;           /* for this resolution (kestrel_font.h)    */
+    int       max_cols, max_rows;       /* native size / the font's cell size       */
     int       cursor_col, cursor_row;   /* where the next character goes            */
     struct tty_cell *cells;             /* max_rows x max_cols shadow of the text   */
     uint32_t  fg, bg;                   /* current colours                          */
@@ -151,7 +150,7 @@ struct kestrel_tty *tty_current(void);  /* the calling task's TTY (NULL if none)
 void tty_bind_current(int index);       /* bind the calling task to TTY `index`     */
 
 /* ---- rendering (per monitor) ---------------------------------------------- */
-/* Draw byte `c` of kestrel_font with its top-left pixel at (x, y) of this
+/* Draw byte `c` of the TTY's font (t->font) with its top-left pixel at (x, y) of this
  * TTY's monitor; set bits in fg_color, clear bits in bg_color. Clipped to the
  * monitor's native size. */
 void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, uint32_t bg_color);

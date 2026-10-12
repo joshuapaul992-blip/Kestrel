@@ -73,7 +73,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/sys
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
-           drivers/kestrel_font.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \
+           drivers/kfont_10.c drivers/kfont_12.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \
            kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
@@ -494,9 +494,10 @@ check: $(KERNEL)
 	@test -n "$(GRUB_FILE)" || { echo "error: grub-file not found"; exit 1; }
 	@$(GRUB_FILE) --is-x86-multiboot2 $(KERNEL) && echo "  $(KERNEL): valid Multiboot2 header"
 
-# ---- fonts (Spleen, BSD-2-Clause, third_party/spleen)
+# ---- fonts: the terminals' (third_party/kestrel_font) and Spleen (BSD-2-Clause, third_party/spleen)
 fonts:
-	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/kestrel_font_sheet.png drivers/kestrel_font.c
+	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/Kestrel_10.bmp drivers/kfont_10.c kfont_10
+	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/Kestrel_12.bmp drivers/kfont_12.c kfont_12
 	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-8x16.bdf  font_8x16  > drivers/font_8x16.c
 	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-12x24.bdf font_12x24 > drivers/font_12x24.c
 

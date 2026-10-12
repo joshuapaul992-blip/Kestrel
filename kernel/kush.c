@@ -313,7 +313,7 @@ static const struct kush_cmd commands[] = {
     { "report",   "",       "write REPORT.TXT + VBIOS.ROM to the boot stick",  cmd_report },
     { "gpu",      "",       "NVIDIA GPU: chip, VBIOS tables, outputs, monitors", cmd_gpu },
     { "run",      "PROG",   "run a ring-3 program (from /boot/bin)",           cmd_run },
-    { "font",     "",       "show all 256 glyphs of kestrel_font",             cmd_font },
+    { "font",     "",       "show all 256 glyphs of this terminal's font",     cmd_font },
     { "reboot",   "",       "restart the machine",                             cmd_reboot },
     { "poweroff", "",       "power off the machine (ACPI)",                    cmd_reboot },
     { NULL, NULL, NULL, NULL },
