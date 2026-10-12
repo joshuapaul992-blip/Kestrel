@@ -733,6 +733,35 @@ out:
     return r;
 }
 
+/* MADV_WILLNEED: read the file pages behind [addr, addr + len) into the
+ * page cache now (vnode_ops.readahead), outside the address space's lock. */
+void vm_madvise_willneed(struct mm *mm, uint64_t addr, uint64_t len)
+{
+    enum { MAXRUNS = 8 };
+    struct { struct file *f; uint64_t idx, n; } run[MAXRUNS];
+    int nr = 0;
+    uint64_t end = addr + pgup(len);
+    if (end < addr) return;
+    mm_lock(mm);
+    for (struct vma *v = mm->vmas; v && nr < MAXRUNS; v = v->next) {
+        if (v->end <= addr || v->start >= end || !v->file) continue;
+        struct vnode *vn = v->file->vn;
+        if (!vn || !vn->ops || !vn->ops->readahead) continue;
+        uint64_t s = v->start > addr ? v->start : addr, e = v->end < end ? v->end : end;
+        if (v->file_end && e > v->file_end) e = v->file_end;
+        if (e <= s) continue;
+        run[nr].f = vfs_file_get(v->file);
+        run[nr].idx = (v->off + (s - v->start)) / PAGE;
+        run[nr].n = (e - s + PAGE - 1) / PAGE;
+        nr++;
+    }
+    mm_unlock(mm);
+    for (int i = 0; i < nr; i++) {
+        run[i].f->vn->ops->readahead(run[i].f->vn, run[i].idx, run[i].n);
+        vfs_close(run[i].f);
+    }
+}
+
 int vm_madvise_dontneed(struct mm *mm, uint64_t addr, uint64_t len)
 {
     if (addr & (PAGE - 1)) return -EINVAL;

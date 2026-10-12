@@ -72,6 +72,11 @@ struct vnode_ops {
      * `io` false only a page already cached (*phys = 0 if none). Private
      * mappings map these frames instead of copying (pagecache.h). */
     int     (*getpage)(struct vnode *vn, uint64_t idx, bool io, uint64_t *phys);
+    /* Optional, with getpage: pages [idx, idx + count) will be needed
+     * (readahead(), fadvise WILLNEED, MADV_WILLNEED). Read them into the
+     * page cache now in large requests, or for a large range read the file
+     * in larger pieces from then on. Stops at the end of the file. */
+    int     (*readahead)(struct vnode *vn, uint64_t idx, uint64_t count);
     /* Optional: the time_ms() at which readiness may change on its own
      * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
     uint64_t (*poll_deadline)(struct file *f);

@@ -31,6 +31,7 @@
 #define CSW_TIMEOUT_MS      3000
 #define SMALL_DATA_TIMEOUT  5000
 #define READ_RETRIES        4
+#define SAFE_XFER_BYTES     (240 * 512)  /* what every stick takes per command */
 
 struct cbw {
     uint32_t signature;
@@ -526,9 +527,15 @@ int usb_msc_probe(const struct xhci_msc_info *info, uint8_t lun, struct usb_msc_
                 (unsigned)d->blocks, d->block_size);
         return MSC_ERR_UNSUPPORTED;
     }
+    /* As Linux's usb-storage: up to 1 MiB per command at SuperSpeed, 120
+     * KiB (240 sectors) below it, where some sticks fail larger ones. A
+     * command that fails falls back to that size (shrink_transfer). */
+    uint32_t bytes = info->speed >= XHCI_SPEED_SUPER ? XHCI_BULK_MAX : SAFE_XFER_BYTES;
+    d->max_blocks = bytes / d->block_size ? bytes / d->block_size : 1;
     uint64_t mib = (d->blocks * d->block_size) >> 20;
-    msc_log("usb-msc: slot %u lun %u: %lu blocks x %u bytes = %lu MiB%s\n", d->slot, lun,
-            (unsigned long)d->blocks, d->block_size, (unsigned long)mib, d->use_16 ? " (16-byte CDBs)" : "");
+    msc_log("usb-msc: slot %u lun %u: %lu blocks x %u bytes = %lu MiB%s, %u KiB per command\n", d->slot, lun,
+            (unsigned long)d->blocks, d->block_size, (unsigned long)mib, d->use_16 ? " (16-byte CDBs)" : "",
+            d->max_blocks * d->block_size / 1024);
     d->present = true;
     return MSC_OK;
 }
@@ -536,6 +543,21 @@ int usb_msc_probe(const struct xhci_msc_info *info, uint8_t lun, struct usb_msc_
 /* ======================================================================== */
 /*  READ(10) / READ(16)                                                        */
 /* ======================================================================== */
+/* A command of more than SAFE_XFER_BYTES failed: from now on use that size
+ * for this device, and retry this chunk with it. */
+static bool shrink_transfer(struct usb_msc_dev *d, uint32_t *n)
+{
+    uint32_t safe = SAFE_XFER_BYTES / d->block_size ? SAFE_XFER_BYTES / d->block_size : 1;
+    if (*n <= safe) return false;
+    if (d->max_blocks > safe) {
+        d->max_blocks = safe;
+        msc_log("usb-msc: slot %u: a %u-block command failed; using %u KiB per command\n", d->slot, *n,
+                safe * d->block_size / 1024);
+    }
+    *n = safe;
+    return true;
+}
+
 static int read_chunk(struct usb_msc_dev *d, uint64_t lba, uint32_t n, uint8_t *buf)
 {
     uint8_t cdb[16];
@@ -571,14 +593,14 @@ int usb_msc_read(struct usb_msc_dev *d, uint64_t lba, uint32_t count, void *buf)
                 d->slot, count, (unsigned long)lba, (unsigned long)d->blocks);
         return MSC_ERR_RANGE;
     }
-    uint32_t per = XHCI_BULK_MAX / d->block_size;
     uint8_t *out = buf;
     d->reads++;
 
     while (count) {
-        uint32_t n = count < per ? count : per;
+        uint32_t n = count < d->max_blocks ? count : d->max_blocks;
         int rc = MSC_ERR_IO;
         for (int attempt = 0; attempt < READ_RETRIES; attempt++) {
+            if (attempt && shrink_transfer(d, &n)) attempt = 1;     /* a fresh try at the safe size */
             if (attempt) {
                 d->retries++;
                 msc_log("usb-msc: slot %u: retrying READ at LBA %lu (attempt %d/%d)\n", d->slot,
@@ -590,7 +612,7 @@ int usb_msc_read(struct usb_msc_dev *d, uint64_t lba, uint32_t count, void *buf)
             if (!usb_msc_alive(d)) { rc = MSC_ERR_NODEV; break; }
             if (rc == MSC_ERR_CHECK) {
                 if (d->sense_key == SENSE_NOT_READY && d->asc == 0x3A) { rc = MSC_ERR_NOMEDIUM; break; }
-                if (d->sense_key == SENSE_ILLEGAL_REQ) break;   /* retrying cannot help */
+                if (d->sense_key == SENSE_ILLEGAL_REQ && n * d->block_size <= SAFE_XFER_BYTES) break;
             }
         }
         if (rc != MSC_OK) {
@@ -648,14 +670,14 @@ int usb_msc_write(struct usb_msc_dev *d, uint64_t lba, uint32_t count, const voi
                 d->slot, count, (unsigned long)lba, (unsigned long)d->blocks);
         return MSC_ERR_RANGE;
     }
-    uint32_t per = XHCI_BULK_MAX / d->block_size;
     const uint8_t *in = buf;
     d->writes++;
 
     while (count) {
-        uint32_t n = count < per ? count : per;
+        uint32_t n = count < d->max_blocks ? count : d->max_blocks;
         int rc = MSC_ERR_IO;
         for (int attempt = 0; attempt < READ_RETRIES; attempt++) {
+            if (attempt && shrink_transfer(d, &n)) attempt = 1;     /* a fresh try at the safe size */
             if (attempt) {
                 d->retries++;
                 msc_log("usb-msc: slot %u: retrying WRITE at LBA %lu (attempt %d/%d)\n", d->slot,
@@ -667,7 +689,7 @@ int usb_msc_write(struct usb_msc_dev *d, uint64_t lba, uint32_t count, const voi
             if (!usb_msc_alive(d)) { rc = MSC_ERR_NODEV; break; }
             if (rc == MSC_ERR_CHECK) {
                 if (d->sense_key == SENSE_NOT_READY && d->asc == 0x3A) { rc = MSC_ERR_NOMEDIUM; break; }
-                if (d->sense_key == SENSE_ILLEGAL_REQ) break;
+                if (d->sense_key == SENSE_ILLEGAL_REQ && n * d->block_size <= SAFE_XFER_BYTES) break;
                 if (d->sense_key == SENSE_DATA_PROTECT) { rc = MSC_ERR_READONLY; break; }
             }
         }

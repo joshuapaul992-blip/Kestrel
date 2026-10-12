@@ -113,7 +113,9 @@
 #define CACHE_BYTES   (4u << 20)            /* block cache size per volume */
 #define FLUSH_MS      5000
 #define RAW_INODE     256                   /* bytes of the on-disk inode kept */
-#define RA_PAGES      32                    /* a page cache miss reads up to 128 KiB */
+#define RA_PAGES      32                    /* a page cache miss reads up to 128 KiB, */
+#define RA_MAX_PAGES  256                   /* up to 1 MiB when reads are sequential  */
+#define RA_HINT_PAGES 128                   /* 512 KiB windows: a file said to be needed */
 
 /* One load or store each (the kernel is -ffreestanding: a plain memcpy
  * would be the byte loop in lib/string.c) */
@@ -136,6 +138,9 @@ struct e2ino {
     uint32_t ino;
     int      refs;                          /* vnodes */
     struct pcache *pc;                      /* regular files: cached pages, once read */
+    uint64_t ra_next;                       /* the page after the last read-ahead run */
+    uint32_t ra_win;                        /* that run's window (pages)              */
+    uint32_t hint_win;                      /* readahead() asked for more than we read */
     uint8_t  raw[RAW_INODE] __attribute__((aligned(8)));    /* the size halves load whole */
     struct e2ino *next;
 };
@@ -159,7 +164,8 @@ struct e2fs {
     uint32_t nbufs;
     struct buf *hash[256];
     uint64_t clock;
-    uint8_t *ra_buf;                        /* RA_PAGES contiguous pages: read-ahead runs */
+    uint8_t *ra_buf;                        /* ra_pages contiguous pages: read-ahead runs */
+    uint32_t ra_pages;
     /* inodes in use */
     struct e2ino *inodes_live;
 };
@@ -624,8 +630,9 @@ static ssize_t e2_read_locked(struct e2fs *fs, struct e2ino *e, void *buf, size_
 
 /* ---- the page cache (pagecache.h) ----------------------------------------------------
  * Regular files are read through it: a page is filled from the disk on
- * first use, along with up to RA_PAGES - 1 following pages when their
- * blocks follow on the disk, in one request. A block the block cache holds
+ * first use, along with following pages when their blocks follow on the
+ * disk, in one request: 128 KiB, growing to 1 MiB while a file is read in
+ * order (getpage_ra), and 1 MiB at a time for readahead(). A block the block cache holds
  * is copied from there instead: it may be newer than the disk. Writes go
  * through the block cache as before and update cached pages in passing. */
 
@@ -680,8 +687,18 @@ static int fill_blocks(struct e2fs *fs, struct e2ino *e, uint64_t idx, const uin
     return 0;
 }
 
-/* Page `idx` of the file, referenced for the caller; fs->lock held. */
-static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64_t *out)
+/* Page `idx` of the file, referenced for the caller; fs->lock held. A miss
+ * reads a run of pages with it in one request, as far as their blocks lie
+ * next to its own on the disk and they are not cached yet:
+ * - in order (a file read from start to end; `want`: readahead()) the run
+ *   goes forward from idx: `want` pages, or a window that starts at
+ *   RA_PAGES and doubles while the misses come in order;
+ * - otherwise (page faults in a mapped library jump about) it is the
+ *   aligned window around idx, RA_PAGES or, for a file a program said it
+ *   will need, the larger hint window: windows never overlap in part, so
+ *   each is read in one request instead of the gaps between earlier runs.
+ * All of it at most the read-ahead buffer. */
+static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t want, uint64_t *out)
 {
     if (!e->pc) {                                       /* e2_getpage looks without fs->lock */
         struct pcache *pc = pcache_new();
@@ -704,28 +721,78 @@ static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64
         *out = pcache_insert(e->pc, idx, p, false);
         return 0;
     }
-    /* the pages that follow, while their blocks follow on the disk */
-    uint32_t bpp = PAGE_SIZE / fs->bs, n = 1, next = pb[0] + bpp;
-    while (fs->ra_buf && n < RA_PAGES && !pcache_present(e->pc, idx + n)) {
-        uint32_t nb[4];
-        if (page_blocks(fs, e, idx + n, nb) < 0 || !direct(fs, e, idx + n, nb) || nb[0] != next) break;
-        next += bpp;
-        n++;
+    bool seq = want || (idx == e->ra_next && e->ra_win);
+    uint32_t win = want ? want : seq ? e->ra_win * 2 : e->hint_win ? e->hint_win : RA_PAGES;
+    if (win > fs->ra_pages) win = fs->ra_pages;
+    uint64_t wlo = seq ? idx : idx - idx % win, whi = wlo + win;
+    uint32_t bpp = PAGE_SIZE / fs->bs, first = pb[0], next = pb[0] + bpp, nb[4];
+    uint64_t lo = idx, hi = idx + 1;
+    while (fs->ra_buf && lo > wlo && !pcache_present(e->pc, lo - 1) && page_blocks(fs, e, lo - 1, nb) == 0 &&
+           direct(fs, e, lo - 1, nb) && nb[0] + bpp == first) {
+        first = nb[0];
+        lo--;
     }
+    while (fs->ra_buf && hi < whi && !pcache_present(e->pc, hi) && page_blocks(fs, e, hi, nb) == 0 &&
+           direct(fs, e, hi, nb) && nb[0] == next) {
+        next += bpp;
+        hi++;
+    }
+    uint32_t n = (uint32_t)(hi - lo);
+    e->ra_next = hi;
+    e->ra_win = win;
     if (n == 1) {
         if (!(p = page_alloc())) return -ENOMEM;
         if (dev_io(fs, pb[0], bpp, (void *)p, false) < 0) { page_unref(p); return -EIO; }
         *out = pcache_insert(e->pc, idx, p, false);
         return 0;
     }
-    if (dev_io(fs, pb[0], n * bpp, fs->ra_buf, false) < 0) return -EIO;
+    if (dev_io(fs, first, n * bpp, fs->ra_buf, false) < 0) return -EIO;
+    *out = 0;
     for (uint32_t i = 0; i < n; i++) {
         uint64_t q = page_alloc();
-        if (!q) { if (i) break; return -ENOMEM; }
+        if (!q) break;
         memcpy((void *)q, fs->ra_buf + (size_t)i * PAGE_SIZE, PAGE_SIZE);
-        q = pcache_insert(e->pc, idx + i, q, i > 0);
-        if (i) page_unref(q);
-        else *out = q;
+        q = pcache_insert(e->pc, lo + i, q, lo + i != idx);
+        if (lo + i == idx) *out = q;
+        else page_unref(q);
+    }
+    return *out ? 0 : -ENOMEM;
+}
+
+static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64_t *out)
+{
+    return getpage_ra(fs, e, idx, 0, out);
+}
+
+/* readahead(), fadvise WILLNEED, MADV_WILLNEED: up to a megabyte, the
+ * missing pages of the range now, in one request where the blocks allow;
+ * more than that, larger read-around windows from now on. */
+static int e2_readahead(struct vnode *vn, uint64_t idx, uint64_t count)
+{
+    struct e2fs *fs = fs_of(vn);
+    struct e2ino *e = ino_of(vn);
+    if (count > RA_MAX_PAGES) {
+        /* A whole large file (Firefox: libxul, 187 MB, of which it uses
+         * well under half at start-up): read it in larger windows as it is
+         * used, not all of it now -- on a slow stick the unused part costs
+         * more than the requests it saves. */
+        e->hint_win = RA_HINT_PAGES;
+        return 0;
+    }
+    uint64_t end = idx + count < idx ? UINT64_MAX : idx + count;
+    while (idx < end) {
+        kmutex_lock(&fs->lock);
+        uint64_t pages = (i_size(e) + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (end > pages) end = pages;
+        while (idx < end && e->pc && pcache_present(e->pc, idx)) idx++;
+        int r = 0;
+        if (idx < end) {
+            uint64_t p, want = end - idx < RA_MAX_PAGES ? end - idx : RA_MAX_PAGES;
+            if ((r = getpage_ra(fs, e, idx, (uint32_t)want, &p)) == 0) page_unref(p);
+            idx++;
+        }
+        kmutex_unlock(&fs->lock);
+        if (r < 0) return r;
     }
     return 0;
 }
@@ -1286,6 +1353,7 @@ out:
 
 static const struct vnode_ops e2_file_ops = {
     .read = e2_read, .write = e2_write, .size = e2_size, .truncate = e2_truncate, .getpage = e2_getpage,
+    .readahead = e2_readahead,
     .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
     .nolock = true,                                     /* fs->lock; block I/O takes the big lock itself */
 };
@@ -1413,7 +1481,9 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
     uint8_t *pool = kmalloc(CACHE_BYTES);
     if (!fs->bufs || !pool) { kfree(pool); r = -ENOMEM; goto fail; }
     for (uint32_t i = 0; i < fs->nbufs; i++) fs->bufs[i].data = pool + (size_t)i * fs->bs;
-    uint64_t ra = pmm_alloc_contig(RA_PAGES);           /* none: the page cache reads page by page */
+    fs->ra_pages = RA_MAX_PAGES;                        /* none: the page cache reads page by page */
+    uint64_t ra = pmm_alloc_contig(RA_MAX_PAGES);
+    if (!ra) ra = pmm_alloc_contig(fs->ra_pages = RA_PAGES);
     fs->ra_buf = (uint8_t *)(uintptr_t)ra;
 
     struct mount *m = kzalloc(sizeof *m);

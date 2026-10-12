@@ -117,6 +117,7 @@ int     vm_munmap(struct mm *mm, uint64_t addr, uint64_t len);
 int     vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot);
 int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int flags, uint64_t naddr);
 int     vm_madvise_dontneed(struct mm *mm, uint64_t addr, uint64_t len);
+void    vm_madvise_willneed(struct mm *mm, uint64_t addr, uint64_t len);   /* file pages: read ahead */
 int     vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec);
 int64_t vm_brk(struct mm *mm, uint64_t addr);
 /* Fault in [addr, addr+len) now (MAP_POPULATE, exec). */
