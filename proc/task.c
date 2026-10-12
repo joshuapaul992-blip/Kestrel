@@ -48,6 +48,7 @@ static uint64_t nswitches;
  * Taken inside the big kernel lock when both are held, never the other way
  * round; nothing sleeps, faults or waits for another CPU while holding it. */
 static struct spinlock sched_lock;
+struct spinlock proc_lock;                          /* task.h: the process tree */
 
 /* A sleeping t can run now (sched_lock held): mark it, and get an idle CPU
  * (if any) to look. A task woken before its own CPU has switched it out
@@ -121,11 +122,17 @@ struct files_struct *files_dup(struct files_struct *src)
     return f;
 }
 
+/* The last reference closes every descriptor: under the big kernel lock
+ * (record locks, and the files' last closes), also from exit(), which
+ * runs without it. */
 void files_put(struct files_struct *f)
 {
     if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    bool lock = !bkl_depth();
+    if (lock) bkl_enter();
     for (int i = 0; i < MAX_FDS; i++)
         if (f->fd[i]) { struct file *x = f->fd[i]; f->fd[i] = NULL; vfs_locks_fd_closed(x); vfs_close(x); }
+    if (lock) bkl_exit();
     kfree(f);
 }
 
@@ -242,17 +249,29 @@ bool task_stack_guard_hit(const struct tcb *t, uint64_t addr)
     return addr >= guard && addr < guard + PAGE_SIZE;
 }
 
+/* Big kernel lock held: code under it reads other tasks' state. wait4()
+ * looks at the process tree without it, so the pointers go under
+ * proc_lock first; what they point to is freed after. */
 static void reap_one(struct tcb *t)
 {
-    files_put(t->files); t->files = NULL;              /* normally dropped at exit already */
-    fs_put(t->fs); t->fs = NULL;
-    sighand_put(t->sighand); t->sighand = NULL;
-    signal_put(t->signal); t->signal = NULL;
-    if (t->mm) { mm_put(t->mm); t->mm = NULL; }       /* normally gone at exit already */
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct files_struct *files = t->files;
+    struct fs_struct *fs = t->fs;
+    struct sighand_struct *sh = t->sighand;
+    struct signal_struct *g = t->signal;
+    struct mm *mm = t->mm;
+    t->files = NULL; t->fs = NULL; t->sighand = NULL; t->signal = NULL; t->mm = NULL;
+    t->ppid = 0;
+    spin_unlock_irqrestore(&proc_lock, f);
+    files_put(files);                                   /* normally dropped at exit already */
+    fs_put(fs);
+    sighand_put(sh);
+    signal_put(g);
+    if (mm) mm_put(mm);                                 /* normally gone at exit already */
     t->pml4 = 0;
     kstack_free(t->kstack);
     t->kstack = NULL;
-    t->state = TASK_UNUSED;
+    __atomic_store_n(&t->state, TASK_UNUSED, __ATOMIC_RELEASE);
 }
 
 /* Still on its stack: exiting on another CPU, or not yet switched out. */
@@ -262,21 +281,34 @@ static bool on_a_cpu(struct tcb *t)
 }
 
 /* Zombies go away here unless someone still wants their exit status: a
- * task_wait() caller, or a parent process that has not called wait4(). */
-static void reap_zombies(void)
+ * task_wait() caller, or a parent process that has not called wait4().
+ * Big kernel lock held. False if one was still on its way off a CPU: the
+ * caller looks again later. */
+static bool reap_zombies(void)
 {
+    bool all = true;
     for (int i = 1; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
-        if (t->state != TASK_ZOMBIE || t == cur || t->waiters || process_zombie_kept(t) || on_a_cpu(t)) continue;
+        if (t->state != TASK_ZOMBIE || t == cur || t->waiters || process_zombie_kept(t)) continue;
+        if (on_a_cpu(t)) { all = false; continue; }
         reap_one(t);
     }
+    return all;
 }
 
+/* wait4() collected t's status: free it now if the big kernel lock is
+ * free, or leave it to the idle loop rather than wait for the lock. */
 void task_reap(struct tcb *t)
 {
-    uint64_t f = irq_save();
-    if (t->state == TASK_ZOMBIE && t != cur && !t->waiters && !on_a_cpu(t)) reap_one(t);
-    irq_restore(f);
+    if (bkl_try_enter()) {
+        uint64_t f = irq_save();
+        bool done = t->state == TASK_ZOMBIE && t != cur && !t->waiters && !process_zombie_kept(t) && !on_a_cpu(t);
+        if (done) reap_one(t);
+        irq_restore(f);
+        bkl_exit();
+        if (done) return;
+    }
+    __atomic_add_fetch(&zombie_gen, 1, __ATOMIC_RELEASE);
 }
 
 struct tcb *task_find(int pid)
@@ -332,8 +364,10 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
     for (int i = 1; i < MAX_TASKS; i++)
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     if (!t) { irq_restore(f); return NULL; }
+    spin_lock_irqsave(&proc_lock);      /* wait4() reads slots without the big lock */
     memset(t, 0, sizeof *t);
     t->state = TASK_BLOCKED;            /* not runnable until fully built */
+    spin_unlock_keep_irqs(&proc_lock);
     irq_restore(f);
 
     t->kstack = kstack_alloc();
@@ -816,6 +850,9 @@ void task_sleep_ms(uint64_t ms)
     irq_restore(f);
 }
 
+/* The calling thread ends. exit() and exit_group() come here without the
+ * big kernel lock: the last close of a process's descriptors and the
+ * parent's SIGCHLD take it on the way (files_put, process_exit). */
 void task_exit(int code)
 {
     cur->exit_code = code;
@@ -823,7 +860,9 @@ void task_exit(int code)
      * the address space is still there (this touches user memory). */
     if (cur->user) { sti(); process_thread_exit(cur); }
     cli();
+    spin_lock_irqsave(&proc_lock);              /* the process's totals: threads exit at once */
     kstat_thread_exit(cur);
+    spin_unlock_keep_irqs(&proc_lock);
     kprintf("sched: pid %d (%s) exited with status %d\n", cur->pid, cur->name, code);
     /* close now, not at reap time: pipe and socket peers must see EOF (the
      * table goes when the last thread sharing it is gone) */
@@ -844,9 +883,11 @@ void task_exit(int code)
         cli();
     }
     process_exit(cur);                          /* thread group, parent, children, vfork */
+    uint64_t pf = spin_lock_irqsave(&proc_lock);   /* task_wait() checks under it */
     uint64_t f = spin_lock_irqsave(&sched_lock);
     cur->state = TASK_ZOMBIE;
     spin_unlock_irqrestore(&sched_lock, f);
+    spin_unlock_irqrestore(&proc_lock, pf);
     __atomic_add_fetch(&zombie_gen, 1, __ATOMIC_RELEASE);
     wakeup(cur);                                /* anyone waiting on us */
     schedule();
@@ -856,23 +897,23 @@ void task_exit(int code)
 /* Wait for process (or kernel thread) `pid` to end: every thread of it. */
 int task_wait(int pid)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&proc_lock);
     struct tcb *t = NULL;
     for (int i = 1; i < MAX_TASKS; i++)
         if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) { t = &tasks[i]; break; }
-    if (!t || t == cur) { irq_restore(f); return -ECHILD; }
+    if (!t || t == cur) { spin_unlock_irqrestore(&proc_lock, f); return -ECHILD; }
     t->waiters++;
     for (;;) {
         if (t->pid != pid) {                    /* a thread's execve took over the pid: */
             t = task_find(pid);                 /* the waiter count moved with it        */
-            if (!t) { irq_restore(f); return -ECHILD; }
+            if (!t) { spin_unlock_irqrestore(&proc_lock, f); return -ECHILD; }
         }
         if (t->state == TASK_ZOMBIE && (!t->signal || t->signal->nr_threads == 0)) break;
-        sleep_on(t);
+        sleep_on_locked(t, &proc_lock);
     }
     int code = t->exit_code;
     t->waiters--;
-    irq_restore(f);
+    spin_unlock_irqrestore(&proc_lock, f);
     return code;
 }
 
@@ -886,8 +927,10 @@ static bool any_ready(void)
 /* A CPU's idle thread. Entered holding the big kernel lock, which it lets
  * go of at once: it looks for work and switches to it without the lock
  * (the scheduler has its own), and takes it only to reap the threads that
- * exited since it last looked. A task that held the lock when it was
- * switched out queues for it as it comes back (sched_switch_tail). */
+ * exited since it last looked -- and only if it is free: a busy lock means
+ * another look at the next interrupt, not a wait. A task that held the
+ * lock when it was switched out queues for it as it comes back
+ * (sched_switch_tail). */
 void sched_idle_loop(void)
 {
     struct percpu *c = this_cpu();
@@ -898,18 +941,26 @@ void sched_idle_loop(void)
     for (;;) {
         cli();
         uint32_t g = __atomic_load_n(&zombie_gen, __ATOMIC_ACQUIRE);
-        if (g != reaped) { bkl_enter(); reap_zombies(); bkl_exit(); reaped = g; }
+        bool later = false;                     /* zombies left: look again after an interrupt */
+        if (g != reaped) {
+            if (bkl_try_enter()) {
+                if (reap_zombies()) reaped = g;
+                else later = true;
+                bkl_exit();
+            } else later = true;
+        }
         if (any_ready()) { schedule(); continue; }
         for (;;) {
             /* in_idle before the look at the task table, make_ready() the
              * other way round (smp_kick_idle): one of us sees the other */
             __atomic_store_n(&c->in_idle, true, __ATOMIC_SEQ_CST);
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            if (any_ready() || __atomic_load_n(&zombie_gen, __ATOMIC_RELAXED) != reaped) break;
+            if (any_ready() || (!later && __atomic_load_n(&zombie_gen, __ATOMIC_RELAXED) != reaped)) break;
             c->ks.idle_tsc = rdtsc();
             __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
             cli();
             if (c->ks.idle_tsc) { c->ks.idle_cyc += rdtsc() - c->ks.idle_tsc; c->ks.idle_tsc = 0; }
+            if (later) break;
         }
         __atomic_store_n(&c->in_idle, false, __ATOMIC_RELEASE);
     }

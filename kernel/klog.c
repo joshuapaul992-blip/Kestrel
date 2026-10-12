@@ -6,11 +6,13 @@
 #include <kernel/fb.h>
 #include <kernel/string.h>
 #include <kernel/cpu.h>
+#include <kernel/spinlock.h>
 #include <kernel/tty.h>
 
 static char   log_buf[KLOG_SIZE];
 static size_t log_len;              /* total bytes ever written (wraps buffer) */
 static bool   to_console;
+static struct spinlock log_lock;
 
 void klog_set_console(bool on) { to_console = on; }
 
@@ -55,10 +57,14 @@ void kprintf(const char *fmt, ...)
     va_end(ap);
     if (n >= (int)sizeof buf) n = sizeof buf - 1;
 
-    uint64_t f = irq_save();
+    /* CPUs log at once (calls without the big kernel lock, exit among
+     * them); a panic does not wait for a CPU it has stopped. */
+    bool lock = !smp_panicking;
+    uint64_t f = lock ? spin_lock_irqsave(&log_lock) : irq_save();
     log_append(buf, (size_t)n);
     serial_write(buf);
-    irq_restore(f);
+    if (lock) spin_unlock_irqrestore(&log_lock, f);
+    else irq_restore(f);
     if (!to_console || !g_fb.ready) return;
     if (tty_ready()) tty_write(tty_get(0), buf, (size_t)n);     /* system console: monitor 0 */
     else con_write(&g_con, buf, (size_t)n);
