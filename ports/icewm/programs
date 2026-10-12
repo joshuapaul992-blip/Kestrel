@@ -1,0 +1,6 @@
+# /boot/etc/icewm/programs -- the start menu's Programs folder on Kestrel
+#
+# Entries run through IceWM's fork() + execvp(); programs not found in
+# PATH (/bin, which shows /boot/bin) are hidden.
+prog "XTerm" xterm xterm
+prog "X demo" - xdemo

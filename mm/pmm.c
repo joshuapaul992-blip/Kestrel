@@ -1,0 +1,161 @@
+/* mm/pmm.c -- bitmap physical frame allocator fed by the Multiboot2 memory map.
+ * Its own spinlock (interrupts off while held) guards the bitmap, so frames
+ * can be taken and freed without the big kernel lock: page faults resolved
+ * outside it (vm.c) do both. Zeroing happens after the lock is dropped. */
+#include <kernel/mm.h>
+#include <kernel/multiboot2.h>
+#include <kernel/string.h>
+#include <kernel/klog.h>
+#include <kernel/cpu.h>
+#include <kernel/spinlock.h>
+
+#define MAX_FRAMES (PMM_MAX_PHYS / PAGE_SIZE)
+
+static uint8_t  bitmap[MAX_FRAMES / 8];      /* 1 = used */
+static uint64_t total_frames, free_frames, highest;
+static uint64_t search_hint;
+static uint64_t low_page;                    /* usable RAM below 640 KiB (AP start-up) */
+static struct spinlock lock;                 /* bitmap, counters, search_hint */
+
+uint64_t pmm_low_page(void) { return low_page; }
+
+static inline void set_used(uint64_t f) { bitmap[f >> 3] |=  (uint8_t)(1u << (f & 7)); }
+static inline void set_free(uint64_t f) { bitmap[f >> 3] &= (uint8_t)~(1u << (f & 7)); }
+static inline bool is_used(uint64_t f)  { return bitmap[f >> 3] & (1u << (f & 7)); }
+
+static void reserve_range(uint64_t start, uint64_t end)
+{
+    for (uint64_t f = start / PAGE_SIZE; f < (end + PAGE_SIZE - 1) / PAGE_SIZE && f < MAX_FRAMES; f++)
+        if (!is_used(f)) { set_used(f); free_frames--; }
+}
+
+void pmm_init(uintptr_t mbi)
+{
+    memset(bitmap, 0xFF, sizeof bitmap);
+
+    for (struct mb2_tag *t = mb2_first_tag(mbi); t->type != MB2_TAG_END; t = mb2_next_tag(t)) {
+        if (t->type != MB2_TAG_MMAP) continue;
+        struct mb2_tag_mmap *mm = (struct mb2_tag_mmap *)t;
+        for (uint8_t *p = (uint8_t *)mm->entries; p < (uint8_t *)t + t->size; p += mm->entry_size) {
+            struct mb2_mmap_entry *e = (struct mb2_mmap_entry *)p;
+            static const char *types[] = { "?", "usable", "reserved", "ACPI reclaim", "ACPI NVS", "bad" };
+            kprintf("  mem %016lx-%016lx %s\n", e->addr, e->addr + e->len - 1,
+                    types[e->type <= 5 ? e->type : 0]);
+            if (e->type != 1) continue;
+            uint64_t s = (e->addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            uint64_t end = (e->addr + e->len) & ~(PAGE_SIZE - 1);
+            /* real-mode start-up code for other CPUs: prefer 0x8000, else
+             * the lowest usable page above the BIOS data area */
+            for (uint64_t a = s < 0x1000 ? 0x1000 : s; a + PAGE_SIZE <= end && a < 0x9F000; a += PAGE_SIZE) {
+                if (a == 0x8000) low_page = a;
+                else if (!low_page) low_page = a;
+            }
+            if (end > PMM_MAX_PHYS) end = PMM_MAX_PHYS;
+            for (uint64_t a = s; a < end; a += PAGE_SIZE) {
+                uint64_t f = a / PAGE_SIZE;
+                if (is_used(f)) { set_free(f); free_frames++; total_frames++; }
+            }
+            if (end > highest) highest = end;
+        }
+    }
+
+    /* keep firmware/legacy area, the kernel image and the boot info safe */
+    reserve_range(0, 0x100000);
+    reserve_range((uint64_t)_kernel_start, (uint64_t)_kernel_end);
+    reserve_range(mbi, mbi + ((struct mb2_info *)mbi)->total_size);
+    for (struct mb2_tag *t = mb2_first_tag(mbi); t->type != MB2_TAG_END; t = mb2_next_tag(t))
+        if (t->type == MB2_TAG_MODULE) {                /* e.g. the ISO's boot volume */
+            struct mb2_tag_module *m = (struct mb2_tag_module *)t;
+            reserve_range(m->mod_start, m->mod_end);
+        }
+    search_hint = 0x100000 / PAGE_SIZE;
+
+    kprintf("pmm: %lu MiB usable, %lu MiB free, kernel %p-%p\n",
+            total_frames * PAGE_SIZE >> 20, free_frames * PAGE_SIZE >> 20,
+            _kernel_start, _kernel_end);
+}
+
+static uint64_t alloc_run(size_t n, uint64_t limit)
+{
+    uint64_t flags = spin_lock_irqsave(&lock);
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t run = 0, start = pass ? 0x100 : search_hint;
+        for (uint64_t f = start; f < limit; f++) {
+            if (is_used(f)) { run = 0; continue; }
+            if (++run == n) {
+                uint64_t first = f + 1 - n;
+                for (uint64_t i = first; i <= f; i++) set_used(i);
+                free_frames -= n;
+                if (n == 1) search_hint = f + 1;
+                spin_unlock_irqrestore(&lock, flags);
+                memset((void *)(first * PAGE_SIZE), 0, n * PAGE_SIZE);
+                return first * PAGE_SIZE;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&lock, flags);
+    return 0;
+}
+
+uint64_t pmm_alloc_contig(size_t n) { return alloc_run(n, highest / PAGE_SIZE); }
+uint64_t pmm_alloc(void) { return alloc_run(1, highest / PAGE_SIZE); }
+
+/* Below 4 GiB, for devices that take 32-bit bus addresses (RTL8139). */
+uint64_t pmm_alloc_dma32(size_t n)
+{
+    uint64_t limit = highest / PAGE_SIZE, max = 0x100000000ull / PAGE_SIZE;
+    return alloc_run(n, limit < max ? limit : max);
+}
+
+void pmm_free_contig(uint64_t phys, size_t n)
+{
+    uint64_t flags = spin_lock_irqsave(&lock);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t f = phys / PAGE_SIZE + i;
+        if (f < MAX_FRAMES && is_used(f)) { set_free(f); free_frames++; }
+    }
+    if (phys / PAGE_SIZE < search_hint) search_hint = phys / PAGE_SIZE;
+    spin_unlock_irqrestore(&lock, flags);
+}
+
+void pmm_free(uint64_t phys) { pmm_free_contig(phys, 1); }
+
+/* ---- reference counts of frames mapped into user space --------------------
+ * A user page can be mapped by several address spaces (fork, copy-on-write)
+ * and held by a memory object (shared mappings, files). Each holder counts;
+ * the last page_unref() frees the frame. Locked instructions: holders on
+ * different CPUs may drop their references at the same time. */
+static int32_t frame_refs[MAX_FRAMES];
+
+void page_ref(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    if (f < MAX_FRAMES) __atomic_add_fetch(&frame_refs[f], 1, __ATOMIC_ACQ_REL);
+}
+
+void page_unref(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    if (f >= MAX_FRAMES) return;
+    int32_t n = __atomic_sub_fetch(&frame_refs[f], 1, __ATOMIC_ACQ_REL);
+    if (n == 0) pmm_free(phys & ~(PAGE_SIZE - 1));
+    else if (n < 0) panic("page_unref: frame %lx has no references", phys);
+}
+
+int page_refs(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    return f < MAX_FRAMES ? __atomic_load_n(&frame_refs[f], __ATOMIC_ACQUIRE) : 0;
+}
+
+/* A zeroed frame with one reference, for user memory. */
+uint64_t page_alloc(void)
+{
+    uint64_t p = pmm_alloc();
+    if (p) __atomic_store_n(&frame_refs[p / PAGE_SIZE], 1, __ATOMIC_RELEASE);
+    return p;
+}
+
+uint64_t pmm_total_bytes(void)   { return total_frames * PAGE_SIZE; }
+uint64_t pmm_free_bytes(void)    { return free_frames * PAGE_SIZE; }
+uint64_t pmm_highest_usable(void){ return highest; }

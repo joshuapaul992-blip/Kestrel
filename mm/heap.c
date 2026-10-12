@@ -1,0 +1,236 @@
+/* mm/heap.c -- kernel heap with block splitting and coalescing.
+ * The heap starts as one physically contiguous, identity-mapped arena
+ * reserved at boot and grows by further arenas taken from the frame
+ * allocator when it runs out (at least 1 MiB each). Blocks of all arenas
+ * sit on one address-ordered list; two neighbours on the list are merged
+ * only when they also touch in memory, so arenas never merge. Free blocks
+ * are also kept in bins by size (one per power of two), so an allocation
+ * looks only at free blocks big enough for it, not at every block: with
+ * tens of thousands of blocks (a large program's page cache and mappings)
+ * a list walk per kmalloc made the whole kernel crawl. A spinlock of its
+ * own (interrupts off while held) makes every operation safe from
+ * interrupt handlers and from code running without the big kernel lock;
+ * growing takes the frame allocator's lock inside it. A failed allocation returns NULL: callers turn that into
+ * -ENOMEM, never into a crash. */
+#include <kernel/mm.h>
+#include <kernel/string.h>
+#include <kernel/klog.h>
+#include <kernel/cpu.h>
+#include <kernel/spinlock.h>
+
+#define HEAP_MAGIC 0x4B4845415055ull      /* "KHEAPU" */
+#define ALIGN      16
+
+struct block {
+    uint64_t magic;
+    size_t   size;            /* payload bytes */
+    struct block *next, *prev;      /* every block, in address order */
+    struct block *fnext, *fprev;    /* free blocks of the same bin */
+    uint64_t free;
+    uint64_t pad;             /* keep header a multiple of 16 */
+};
+
+#define NBINS 48
+static struct block *head;
+static struct block *bins[NBINS];   /* bin k: free blocks of 2^k to 2^(k+1)-1 bytes */
+static uint64_t bin_map;            /* bit k: bins[k] is not empty */
+static size_t arena_size, used_bytes;
+static struct spinlock lock;        /* everything above */
+
+static int bin_of(size_t size)
+{
+    int k = 63 - __builtin_clzll(size | 1);
+    return k < NBINS ? k : NBINS - 1;
+}
+
+static void bin_add(struct block *b)
+{
+    int k = bin_of(b->size);
+    b->fprev = NULL;
+    b->fnext = bins[k];
+    if (bins[k]) bins[k]->fprev = b;
+    bins[k] = b;
+    bin_map |= 1ull << k;
+}
+
+static void bin_del(struct block *b)
+{
+    int k = bin_of(b->size);
+    if (b->fprev) b->fprev->fnext = b->fnext; else bins[k] = b->fnext;
+    if (b->fnext) b->fnext->fprev = b->fprev;
+    if (!bins[k]) bin_map &= ~(1ull << k);
+    b->fnext = b->fprev = NULL;
+}
+
+/* A free block of at least n bytes: first fit in n's own bin, else the
+ * first block of the next non-empty bin (every one of those is big enough). */
+static struct block *find_free(size_t n)
+{
+    int k = bin_of(n);
+    for (struct block *b = bins[k]; b; b = b->fnext)
+        if (b->size >= n) return b;
+    uint64_t above = k + 1 < 64 ? bin_map & ~((2ull << k) - 1) : 0;
+    return above ? bins[__builtin_ctzll(above)] : NULL;
+}
+
+#define GROW_MIN    (1u << 20)
+
+static bool adjacent(const struct block *a, const struct block *b)
+{
+    return (const uint8_t *)(a + 1) + a->size == (const uint8_t *)b;
+}
+
+/* Add a new arena of at least `need` payload bytes; the lock is held. */
+static bool heap_grow(size_t need)
+{
+    size_t bytes = need + 2 * sizeof(struct block);
+    if (bytes < GROW_MIN) bytes = GROW_MIN;
+    size_t frames = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t base = pmm_alloc_contig(frames);
+    if (!base) return false;
+    struct block *nb = (struct block *)base;
+    nb->magic = HEAP_MAGIC;
+    nb->size = frames * PAGE_SIZE - sizeof(struct block);
+    nb->free = 1;
+    /* keep the list in address order */
+    struct block *prev = NULL, *b = head;
+    while (b && b < nb) { prev = b; b = b->next; }
+    nb->prev = prev;
+    nb->next = b;
+    if (b) b->prev = nb;
+    if (prev) prev->next = nb; else head = nb;
+    bin_add(nb);
+    arena_size += frames * PAGE_SIZE;
+    return true;
+}
+
+void heap_init(size_t bytes)
+{
+    size_t frames = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t base = pmm_alloc_contig(frames);
+    if (!base) panic("heap: cannot reserve %zu KiB", bytes >> 10);
+    arena_size = frames * PAGE_SIZE;
+    head = (struct block *)base;
+    head->magic = HEAP_MAGIC;
+    head->size = arena_size - sizeof(struct block);
+    head->next = head->prev = NULL;
+    head->free = 1;
+    bin_add(head);
+    kprintf("heap: %zu KiB arena at %p\n", arena_size >> 10, (void *)base);
+}
+
+void *kmalloc(size_t n)
+{
+    if (!n) return NULL;
+    if (n > (1ull << 30)) return NULL;
+    n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
+    uint64_t f = spin_lock_irqsave(&lock);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct block *b = find_free(n);
+        if (!b) {
+            if (attempt == 0 && !heap_grow(n)) break;
+            continue;
+        }
+        bin_del(b);
+        if (b->size >= n + sizeof(struct block) + 64) {      /* split */
+            struct block *nb = (struct block *)((uint8_t *)(b + 1) + n);
+            nb->magic = HEAP_MAGIC;
+            nb->size = b->size - n - sizeof(struct block);
+            nb->free = 1;
+            nb->next = b->next; nb->prev = b;
+            if (b->next) b->next->prev = nb;
+            b->next = nb;
+            b->size = n;
+            bin_add(nb);
+        }
+        b->free = 0;
+        used_bytes += b->size + sizeof(struct block);
+        spin_unlock_irqrestore(&lock, f);
+        return b + 1;
+    }
+    spin_unlock_irqrestore(&lock, f);
+    kprintf("heap: out of memory (request %zu bytes)\n", n);
+    return NULL;
+}
+
+void *kzalloc(size_t n)
+{
+    void *p = kmalloc(n);
+    if (p) memset(p, 0, n);
+    return p;
+}
+
+void kfree(void *p)
+{
+    if (!p) return;
+    struct block *b = (struct block *)p - 1;
+    if (b->magic != HEAP_MAGIC || b->free) panic("kfree: bad pointer %p", p);
+    uint64_t f = spin_lock_irqsave(&lock);
+    b->free = 1;
+    used_bytes -= b->size + sizeof(struct block);
+    if (b->next && b->next->free && adjacent(b, b->next)) { /* merge right */
+        bin_del(b->next);
+        b->size += sizeof(struct block) + b->next->size;
+        b->next = b->next->next;
+        if (b->next) b->next->prev = b;
+    }
+    if (b->prev && b->prev->free && adjacent(b->prev, b)) { /* merge left  */
+        struct block *l = b->prev;
+        bin_del(l);
+        l->size += sizeof(struct block) + b->size;
+        l->next = b->next;
+        if (b->next) b->next->prev = l;
+        b->magic = 0;
+        b = l;
+    }
+    bin_add(b);
+    spin_unlock_irqrestore(&lock, f);
+}
+
+void *krealloc(void *p, size_t n)
+{
+    if (!p) return kmalloc(n);
+    struct block *b = (struct block *)p - 1;
+    if (b->size >= n) return p;
+    void *q = kmalloc(n);
+    if (q) { memcpy(q, p, b->size); kfree(p); }
+    return q;
+}
+
+/* Give back the tail of a block that turned out larger than needed. */
+void *krealloc_shrink(void *p, size_t n)
+{
+    if (!p) return NULL;
+    struct block *b = (struct block *)p - 1;
+    if (b->magic != HEAP_MAGIC || b->free) panic("krealloc_shrink: bad pointer %p", p);
+    n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
+    uint64_t f = spin_lock_irqsave(&lock);
+    if (b->size >= n + sizeof(struct block) + 64) {
+        struct block *nb = (struct block *)((uint8_t *)(b + 1) + n);
+        nb->magic = HEAP_MAGIC;
+        nb->size = b->size - n - sizeof(struct block);
+        nb->free = 0;
+        nb->next = b->next; nb->prev = b;
+        if (b->next) b->next->prev = nb;
+        b->next = nb;
+        used_bytes -= b->size - n;
+        b->size = n;
+        used_bytes += nb->size + sizeof(struct block);
+        spin_unlock_irqrestore(&lock, f);
+        kfree(nb + 1);                                      /* merges with any free neighbour */
+        return p;
+    }
+    spin_unlock_irqrestore(&lock, f);
+    return p;
+}
+
+char *kstrdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *d = kmalloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
+size_t heap_used(void) { return used_bytes; }
+size_t heap_size(void) { return arena_size; }

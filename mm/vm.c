@@ -1,0 +1,857 @@
+/* mm/vm.c -- user address spaces: regions, demand paging, copy-on-write
+ * (see include/kernel/vm.h for the model).
+ *
+ * Locking: each mm has a sleeping, recursive mutex (mm->lock) held while its
+ * regions or page tables change, and while a fault is resolved -- a fault
+ * may sleep (reading a file, waiting for the OOM killer), so it is not a
+ * spinlock. A uaccess copy made while the lock is held can fault again; the
+ * mutex is recursive, so that nests.
+ *
+ * Most user faults need no sleeping, though: a zero-filled page, a copy on
+ * write, a file page the page cache already holds. vm_fault_fast() resolves
+ * those straight from the exception, without the big kernel lock, holding
+ * only the mm's spinlock mm->fast. Taking mm->lock (mm_lock) waits for such
+ * a fault in progress to finish; a fast fault that finds mm->lock taken
+ * goes the slow way, so the two never overlap. Everything else falls back
+ * to vm_fault() under the big lock. Page frames are reference counted with
+ * locked instructions (mm.h). When a page-table entry loses rights or
+ * changes frames, every CPU that has the address space loaded invalidates
+ * the translation (smp.h: tlb_shootdown) before the call goes on, and
+ * frames that were unmapped are freed only after that. */
+#include <kernel/vm.h>
+#include <kernel/smp.h>
+#include <kernel/vmobj.h>
+#include <kernel/uvm.h>
+#include <kernel/mm.h>
+#include <kernel/vfs.h>
+#include <kernel/cpu.h>
+#include <kernel/klog.h>
+#include <kernel/string.h>
+#include <kernel/posix.h>
+#include <kernel/process.h>
+#include <kernel/uaccess.h>
+#include <kernel/time.h>
+#include <kernel/pagecache.h>
+#include <kernel/spinlock.h>
+#include <kernel/kstat.h>
+
+#define PTE_P        0x001ull
+#define PTE_W        0x002ull
+#define PTE_U        0x004ull
+#define PTE_HUGE     0x080ull
+#define PTE_COW      0x200ull           /* software: copy-on-write          */
+#define PTE_PROTNONE 0x400ull           /* software: frame kept, no access   */
+#define PTE_NX       (1ull << 63)
+#define ADDR_MASK    0x000FFFFFFFFFF000ull
+#define PAGE         4096ull
+#define KERNEL_SLOTS 128                /* PML4[0..127]: shared kernel half  */
+
+#define UVM_MMAP_END (UVM_STACK_TOP - UVM_STACK_SIZE - (1ull << 30))
+
+static bool nx_on;
+
+static uint64_t pgdown(uint64_t a) { return a & ~(PAGE - 1); }
+static uint64_t pgup(uint64_t a)   { return (a + PAGE - 1) & ~(PAGE - 1); }
+static bool has_frame(uint64_t e)  { return e & (PTE_P | PTE_PROTNONE); }
+
+/* EFER.NXE: the NX bit (63) of page-table entries takes effect. */
+void vm_init(void)
+{
+    uint32_t a, b, c, d;
+    cpuid(0x80000000, 0, &a, &b, &c, &d);
+    if (a >= 0x80000001) {
+        cpuid(0x80000001, 0, &a, &b, &c, &d);
+        if (d & (1u << 20)) {
+            wrmsr(MSR_EFER, rdmsr(MSR_EFER) | (1ull << 11));
+            nx_on = true;
+        }
+    }
+    kprintf("vm: demand paging, copy-on-write, %s\n",
+            nx_on ? "NX enforced (EFER.NXE)" : "no NX on this CPU: data pages stay executable");
+}
+
+/* ---- page tables ------------------------------------------------------------ */
+static uint64_t *pte_walk(uint64_t pml4, uint64_t va, bool alloc)
+{
+    uint64_t *t = (uint64_t *)pml4;
+    static const int shift[3] = { 39, 30, 21 };
+    for (int l = 0; l < 3; l++) {
+        uint64_t *e = &t[(va >> shift[l]) & 511];
+        if (!(*e & PTE_P)) {
+            if (!alloc) return NULL;
+            uint64_t n = pmm_alloc();                   /* zeroed table */
+            if (!n) return NULL;
+            *e = n | PTE_P | PTE_W | PTE_U;             /* rights are decided at the leaf */
+        }
+        if (*e & PTE_HUGE) return NULL;                 /* never in the user half */
+        t = (uint64_t *)(*e & ADDR_MASK);
+    }
+    return &t[(va >> 12) & 511];
+}
+
+/* Visit every existing leaf entry in [start, end), skipping missing tables. */
+typedef void (*pte_fn)(uint64_t *pte, uint64_t va, void *ctx);
+static void walk_range(uint64_t pml4, uint64_t start, uint64_t end, pte_fn fn, void *ctx)
+{
+    uint64_t va = start;
+    while (va < end) {
+        uint64_t *l4 = (uint64_t *)pml4, e4 = l4[(va >> 39) & 511];
+        if (!(e4 & PTE_P)) { va = (va + (1ull << 39)) & ~((1ull << 39) - 1); continue; }
+        uint64_t *l3 = (uint64_t *)(e4 & ADDR_MASK), e3 = l3[(va >> 30) & 511];
+        if (!(e3 & PTE_P)) { va = (va + (1ull << 30)) & ~((1ull << 30) - 1); continue; }
+        uint64_t *l2 = (uint64_t *)(e3 & ADDR_MASK), e2 = l2[(va >> 21) & 511];
+        if (!(e2 & PTE_P)) { va = (va + (1ull << 21)) & ~((1ull << 21) - 1); continue; }
+        uint64_t *l1 = (uint64_t *)(e2 & ADDR_MASK);
+        for (uint64_t i = (va >> 12) & 511; i < 512 && va < end; i++, va += PAGE)
+            if (l1[i]) fn(&l1[i], va, ctx);
+    }
+}
+
+/* Loaded on some CPU? (Each CPU records its CR3: smp.h.) */
+static bool mm_active(const struct mm *mm)
+{
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online && cpus[i].loaded_cr3 == mm->pml4) return true;
+    return false;
+}
+
+/* Every CPU that has mm loaded drops these translations before we go on
+ * (and before any frame they pointed to is freed or reused). */
+static void tlb_page(struct mm *mm, uint64_t va) { tlb_shootdown(mm->pml4, va, va + PAGE); }
+static void tlb_range(struct mm *mm, uint64_t start, uint64_t end) { tlb_shootdown(mm->pml4, start, end); }
+
+static uint64_t leaf_flags(const struct vma *v, bool writable)
+{
+    uint64_t f = PTE_P | PTE_U;
+    if (writable) f |= PTE_W;
+    if (nx_on && !(v->prot & PROT_EXEC)) f |= PTE_NX;
+    return f;
+}
+
+/* 4 KiB copy with string moves: both frames are page aligned (cache-line
+ * aligned), identity mapped, and rep movsq moves whole lines efficiently. */
+static void copy_page(uint64_t dst, uint64_t src)
+{
+    uint64_t n = PAGE / 8;
+    __asm__ volatile("rep movsq" : "+D"(dst), "+S"(src), "+c"(n) :: "memory");
+}
+
+/* ---- the mm's locks (see the top of this file) ---------------------------------- */
+/* mm->fast, interrupts off; spinning services TLB requests, as the holder
+ * may be shooting down with this CPU's translation in the way. */
+static uint64_t fast_lock(struct mm *mm)
+{
+    uint64_t f = irq_save();
+    while (__atomic_exchange_n(&mm->fast.locked, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&mm->fast.locked, __ATOMIC_RELAXED)) { tlb_service(); cpu_relax(); }
+    return f;
+}
+
+static void mm_lock(struct mm *mm)
+{
+    kmutex_lock(&mm->lock);
+    spin_unlock_irqrestore(&mm->fast, fast_lock(mm));   /* a fast fault in progress ends first */
+}
+
+static void mm_unlock(struct mm *mm) { kmutex_unlock(&mm->lock); }
+
+/* ---- regions ---------------------------------------------------------------- */
+static struct vma *vma_find(struct mm *mm, uint64_t addr)
+{
+    for (struct vma *v = mm->vmas; v; v = v->next)
+        if (addr < v->end) return addr >= v->start ? v : NULL;
+    return NULL;
+}
+
+static void vma_insert(struct mm *mm, struct vma *nv)
+{
+    struct vma **pp = &mm->vmas;
+    while (*pp && (*pp)->start < nv->start) pp = &(*pp)->next;
+    nv->next = *pp;
+    *pp = nv;
+}
+
+static void vma_free(struct vma *v)
+{
+    if (v->obj) vmobj_put(v->obj);
+    if (v->file) vfs_close(v->file);
+    kfree(v);
+}
+
+/* Split v at `at` (start < at < end); the new upper part follows v. */
+static struct vma *vma_split(struct vma *v, uint64_t at)
+{
+    struct vma *n = kmalloc(sizeof *n);
+    if (!n) return NULL;
+    *n = *v;
+    n->start = at;
+    n->off = v->off + (at - v->start);
+    if (n->obj) vmobj_get(n->obj);
+    if (n->file) vfs_file_get(n->file);
+    v->end = at;
+    v->next = n;
+    return n;
+}
+
+static bool vma_mergeable(const struct vma *a, const struct vma *b)
+{
+    return a->end == b->start && a->prot == b->prot && a->flags == b->flags &&
+           !a->obj && !b->obj && !a->file && !b->file;
+}
+
+/* Merge anonymous neighbours (brk growth, malloc, mprotect undo). */
+static void vma_merge_all(struct mm *mm)
+{
+    for (struct vma *v = mm->vmas; v && v->next; ) {
+        struct vma *n = v->next;
+        if (vma_mergeable(v, n)) { v->end = n->end; v->next = n->next; kfree(n); }
+        else v = n;
+    }
+}
+
+/* Make region boundaries fall at `a` (split the region containing it). */
+static int split_at(struct mm *mm, uint64_t a)
+{
+    struct vma *v = vma_find(mm, a);
+    if (v && v->start < a) return vma_split(v, a) ? 0 : -ENOMEM;
+    return 0;
+}
+
+/* Unmapping gathers the frames and frees them only after the TLB
+ * shootdown: another CPU running this address space may still reach a
+ * frame through a stale translation until then. */
+#define ZAP_BATCH 128
+struct zap { struct mm *mm; uint64_t n, lo, hi; uint64_t frames[ZAP_BATCH]; };
+
+static void zap_flush(struct zap *z)
+{
+    if (!z->n) return;
+    tlb_range(z->mm, z->lo, z->hi);
+    for (uint64_t i = 0; i < z->n; i++) page_unref(z->frames[i]);
+    z->n = 0;
+}
+
+static void zap_fn(uint64_t *pte, uint64_t va, void *ctx)
+{
+    struct zap *z = ctx;
+    uint64_t e = *pte;
+    *pte = 0;
+    if (!has_frame(e)) return;
+    if (!z->n) z->lo = va;
+    z->hi = va + PAGE;
+    z->frames[z->n++] = e & ADDR_MASK;
+    z->mm->rss--;
+    if (z->n == ZAP_BATCH) zap_flush(z);
+}
+
+/* Unmap the pages of [start, end) (regions stay). */
+static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
+{
+    struct zap z;                                       /* ~1 KiB of the 16 KiB kernel stack */
+    z.mm = mm;
+    z.n = 0;
+    walk_range(mm->pml4, start, end, zap_fn, &z);
+    zap_flush(&z);
+}
+
+/* Remove [start, end) completely: pages and regions. */
+static int unmap_range(struct mm *mm, uint64_t start, uint64_t end)
+{
+    if (split_at(mm, start) || split_at(mm, end)) return -ENOMEM;
+    zap_range(mm, start, end);
+    for (struct vma **pp = &mm->vmas; *pp; ) {
+        struct vma *v = *pp;
+        if (v->start >= start && v->end <= end) { *pp = v->next; vma_free(v); }
+        else pp = &v->next;
+    }
+    return 0;
+}
+
+static bool range_free(struct mm *mm, uint64_t start, uint64_t end)
+{
+    for (struct vma *v = mm->vmas; v; v = v->next)
+        if (v->start < end && v->end > start) return false;
+    return true;
+}
+
+/* Lowest free gap of len bytes at or above `from`, below `limit`. */
+static uint64_t find_gap(struct mm *mm, uint64_t from, uint64_t limit, uint64_t len)
+{
+    uint64_t cand = from;
+    for (struct vma *v = mm->vmas; v; v = v->next) {
+        if (v->end <= cand) continue;
+        if (cand + len <= v->start) break;
+        cand = v->end;
+    }
+    return cand + len <= limit && cand >= from ? cand : 0;
+}
+
+/* ---- address spaces --------------------------------------------------------- */
+struct mm *mm_create(void)
+{
+    struct mm *mm = kzalloc(sizeof *mm);
+    if (!mm) return NULL;
+    mm->pml4 = uvm_create();
+    if (!mm->pml4) { kfree(mm); return NULL; }
+    mm->users = 1;
+    return mm;
+}
+
+void mm_get(struct mm *mm) { __atomic_add_fetch(&mm->users, 1, __ATOMIC_ACQ_REL); }
+
+/* Free the user half: frames (by reference) and page tables. */
+static void free_tables(uint64_t *t, int level)
+{
+    for (int i = (level == 4 ? KERNEL_SLOTS : 0); i < (level == 4 ? 256 : 512); i++) {
+        uint64_t e = t[i];
+        if (!e) continue;
+        if (level == 1) { if (has_frame(e)) page_unref(e & ADDR_MASK); }
+        else if (e & PTE_P) { free_tables((uint64_t *)(e & ADDR_MASK), level - 1); pmm_free(e & ADDR_MASK); }
+        t[i] = 0;
+    }
+}
+
+static int      oom_pending;          /* victims whose memory is not back yet */
+static uint64_t oom_since;            /* time_ms() of the last kill           */
+
+void mm_put(struct mm *mm)
+{
+    if (!mm || __atomic_sub_fetch(&mm->users, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (mm_active(mm)) panic("mm_put: freeing the loaded address space");
+    while (mm->vmas) { struct vma *v = mm->vmas; mm->vmas = v->next; vma_free(v); }
+    free_tables((uint64_t *)mm->pml4, 4);
+    pmm_free(mm->pml4);
+    if (mm->oom_victim) __atomic_sub_fetch(&oom_pending, 1, __ATOMIC_ACQ_REL);
+    kfree(mm);
+}
+
+struct forkctx { struct mm *dst; const struct vma *v; int err; };
+static void fork_fn(uint64_t *pte, uint64_t va, void *ctx)
+{
+    struct forkctx *c = ctx;
+    if (c->err) return;
+    uint64_t e = *pte;
+    if (!has_frame(e)) return;
+    /* private writable pages become copy-on-write in both processes */
+    if (!(c->v->flags & VMA_SHARED) && (e & PTE_W)) {
+        e = (e & ~PTE_W) | PTE_COW;
+        *pte = e;
+    }
+    uint64_t *d = pte_walk(c->dst->pml4, va, true);
+    if (!d) { c->err = -ENOMEM; return; }
+    *d = e;
+    page_ref(e & ADDR_MASK);
+    c->dst->rss++;
+}
+
+struct mm *mm_fork(struct mm *src)
+{
+    struct mm *dst = mm_create();
+    if (!dst) return NULL;
+    mm_lock(src);
+    dst->brk_start = src->brk_start;
+    dst->brk = src->brk;
+    int err = 0;
+    for (struct vma *v = src->vmas; v && !err; v = v->next) {
+        struct vma *n = kmalloc(sizeof *n);
+        if (!n) { err = -ENOMEM; break; }
+        *n = *v;
+        n->next = NULL;
+        if (n->obj) vmobj_get(n->obj);
+        if (n->file) vfs_file_get(n->file);
+        vma_insert(dst, n);
+        struct forkctx c = { dst, v, 0 };
+        walk_range(src->pml4, v->start, v->end, fork_fn, &c);
+        err = c.err;
+    }
+    tlb_shootdown(src->pml4, 0, UVM_USER_END);          /* the parent lost write access to private pages */
+    mm_unlock(src);
+    if (err) { mm_put(dst); return NULL; }
+    return dst;
+}
+
+/* ---- faults --------------------------------------------------------------- */
+#define FAULT_AROUND 16                 /* pages: a file fault maps the cached pages of its 64 KiB */
+
+static uint64_t file_size(struct file *f)
+{
+    return f->vn->ops && f->vn->ops->size ? f->vn->ops->size(f->vn) : f->vn->size;
+}
+
+/* A page-cache frame mapped into a private region: read-only, and
+ * copy-on-write if the region is writable (the frame is the file's). */
+static uint64_t cache_pte(const struct vma *v, uint64_t phys)
+{
+    return phys | leaf_flags(v, false) | ((v->prot & PROT_WRITE) ? PTE_COW : 0);
+}
+
+/* Map the neighbours of `va` that the page cache already holds: programs
+ * touch their code and data in clusters, and each fault saved is a trip
+ * through the kernel. Only whole file pages, never past the end. */
+static void fault_around(struct mm *mm, struct vma *v, uint64_t va, uint64_t fsize)
+{
+    int (*getpage)(struct vnode *, uint64_t, bool, uint64_t *) = v->file->vn->ops->getpage;
+    uint64_t lo = va & ~(FAULT_AROUND * PAGE - 1), hi = lo + FAULT_AROUND * PAGE;
+    if (lo < v->start) lo = v->start;
+    if (hi > v->end) hi = v->end;
+    if (hi > pgdown(v->file_end)) hi = pgdown(v->file_end);
+    for (uint64_t a = lo; a < hi; a += PAGE) {
+        uint64_t off = v->off + (a - v->start), p;
+        if (a == va || off >= pgup(fsize)) continue;
+        uint64_t *pte = pte_walk(mm->pml4, a, false);
+        if (!pte || *pte) continue;
+        if (getpage(v->file->vn, off / PAGE, false, &p) < 0 || !p) continue;
+        *pte = cache_pte(v, p);
+        mm->rss++;
+    }
+}
+
+/* fast: without the big kernel lock (vm_fault_fast), where anything that
+ * would sleep or needs the lock returns -EAGAIN instead. */
+static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va, bool write, bool fast)
+{
+    bool writable = v->prot & PROT_WRITE;
+    uint64_t phys;
+    struct tcb *t = current_task();
+    t->fault_kind = (v->flags & VMA_SHARED) ? KF_SHARED : (v->file && va < v->file_end) ? KF_FILE : KF_ANON;
+    if (!(v->flags & VMA_SHARED) && v->file && va < v->file_end && v->file->vn->ops &&
+        v->file->vn->ops->getpage && va + PAGE <= v->file_end) {
+        /* a whole page of a cached file: share the cache's frame */
+        uint64_t off = v->off + (va - v->start), fsize = file_size(v->file);
+        if (off >= pgup(fsize)) return fast ? -EAGAIN : -EIO;   /* past EOF: SIGBUS */
+        int r = v->file->vn->ops->getpage(v->file->vn, off / PAGE, !fast, &phys);
+        if (r < 0) return fast ? -EAGAIN : r == -ENOMEM ? -ENOMEM : -EIO;
+        if (!phys) return -EAGAIN;                      /* fast: not cached, the disk is needed */
+        if (write) {                                    /* written at once: the private copy now */
+            uint64_t n = page_alloc();
+            if (!n) { page_unref(phys); return fast ? -EAGAIN : -ENOMEM; }
+            copy_page(n, phys);
+            page_unref(phys);
+            *pte = n | leaf_flags(v, true);
+        } else {
+            *pte = cache_pte(v, phys);
+        }
+        mm->rss++;
+        fault_around(mm, v, va, fsize);
+        return 0;
+    }
+    if (fast && ((v->flags & VMA_SHARED) || (v->file && va < v->file_end))) return -EAGAIN;
+    if (v->flags & VMA_SHARED) {
+        uint64_t off = v->off + (va - v->start);
+        if (off >= pgup(v->obj->size)) return -EIO;     /* past the end of the object: SIGBUS */
+        phys = vmobj_page(v->obj, off / PAGE, true);
+        if (!phys) return -ENOMEM;
+        page_ref(phys);
+    } else {
+        phys = page_alloc();                            /* zeroed */
+        if (!phys) return fast ? -EAGAIN : -ENOMEM;
+        if (v->file && va < v->file_end) {
+            uint64_t off = v->off + (va - v->start);
+            uint64_t fsize = file_size(v->file);
+            if (off >= pgup(fsize)) { page_unref(phys); return -EIO; }   /* past EOF: SIGBUS */
+            uint64_t n = v->file_end - va < PAGE ? v->file_end - va : PAGE;
+            ssize_t r = vfs_pread(v->file, (void *)phys, (size_t)n, off);
+            if (r < 0) { page_unref(phys); return -EIO; }
+        }
+    }
+    *pte = phys | leaf_flags(v, writable);
+    mm->rss++;
+    return 0;
+}
+
+static int fault_cow(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va)
+{
+    uint64_t e = *pte, old = e & ADDR_MASK;
+    current_task()->fault_kind = KF_COW;
+    if ((v->flags & VMA_SHARED) || page_refs(old) == 1) {
+        *pte = (e | PTE_W) & ~PTE_COW;                  /* nobody else has it: take it back */
+        tlb_page(mm, va);
+        return 0;
+    }
+    uint64_t n = page_alloc();
+    if (!n) return -ENOMEM;
+    copy_page(n, old);
+    *pte = n | leaf_flags(v, true);
+    tlb_page(mm, va);                                   /* drop the read-only translation now */
+    page_unref(old);
+    return 0;
+}
+
+static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
+{
+    uint64_t va = pgdown(addr);
+    struct vma *v = vma_find(mm, addr);
+    if (!v) return -EFAULT;
+    bool write = err & PF_WRITE, fetch = err & PF_INSN;
+    if (v->prot == PROT_NONE || (write && !(v->prot & PROT_WRITE)) || (fetch && !(v->prot & PROT_EXEC)))
+        return -EACCES;
+    uint64_t *pte = pte_walk(mm->pml4, va, true);
+    if (!pte) return -ENOMEM;
+    uint64_t e = *pte;
+    if (e & PTE_P) {
+        if (write && !(e & PTE_W)) return fault_cow(mm, v, pte, va);
+        tlb_page(mm, va);                               /* stale translation: retry */
+        return 0;
+    }
+    if ((e & PTE_PROTNONE) && fast) return -EAGAIN;
+    if (e & PTE_PROTNONE) {                             /* rights came back (mprotect) */
+        bool w = (v->prot & PROT_WRITE) && !(e & PTE_COW);
+        *pte = (e & ADDR_MASK) | (e & PTE_COW) | leaf_flags(v, w);
+        return write && !w ? fault_cow(mm, v, pte, va) : 0;
+    }
+    return fault_missing(mm, v, pte, va, write, fast);
+}
+
+static int fault_retry(struct tcb *t, struct mm *mm, uint64_t addr, uint64_t err, bool user_mode)
+{
+    for (int attempt = 0;; attempt++) {
+        mm_lock(mm);
+        int r = fault_once(mm, addr, err, false);
+        mm_unlock(mm);
+        if (r != -ENOMEM) return r;
+        if (attempt < 20 && pcache_shrink(1024)) continue;     /* cached file pages go first */
+        /* Out of memory: free some by ending the largest process, then try
+         * again. Give up (the caller gets SIGKILL/EFAULT) when nothing helps. */
+        if (attempt >= 20 || signal_pending() || !oom_kill(NULL)) {
+            if (user_mode) signal_send(t, SIGKILL);
+            return -ENOMEM;
+        }
+        task_sleep_ms(50);
+    }
+}
+
+int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
+{
+    struct tcb *t = current_task();
+    struct mm *mm = t ? t->mm : NULL;
+    if (!mm || !t->user || !user_range_ok(addr, 1)) return -EFAULT;
+    uint64_t t0 = rdtsc();
+    t->fault_kind = KF_OTHER;
+    int r = fault_retry(t, mm, addr, err, user_mode);
+    if (r == 0) kstat_fault(t, t->fault_kind, rdtsc() - t0);    /* kstat.h */
+    return r;
+}
+
+bool vm_fault_fast(uint64_t addr, uint64_t err)
+{
+    struct tcb *t = current_task();
+    struct mm *mm = t ? t->mm : NULL;
+    if (!mm || !t->user || !user_range_ok(addr, 1)) return false;
+    uint64_t t0 = rdtsc();
+    uint64_t f = fast_lock(mm);
+    int r = -EAGAIN;
+    if (!__atomic_load_n(&mm->lock.owner, __ATOMIC_ACQUIRE)) {     /* else the slow way, after it */
+        t->fault_kind = KF_OTHER;
+        r = fault_once(mm, addr, err, true);
+    }
+    spin_unlock_irqrestore(&mm->fast, f);
+    if (r) return false;                                /* an error is reported by the slow path */
+    kstat_fault(t, t->fault_kind, rdtsc() - t0);
+    this_cpu()->ks.fault_fast_n++;
+    return true;
+}
+
+int vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write)
+{
+    mm_lock(mm);
+    int r = 0;
+    for (uint64_t va = pgdown(addr); va < addr + len && !r; va += PAGE) {
+        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        if (pte && (*pte & PTE_P) && (!write || (*pte & PTE_W))) continue;
+        struct vma *v = vma_find(mm, va);
+        if (!v || v->prot == PROT_NONE) continue;
+        r = fault_once(mm, va, write && (v->prot & PROT_WRITE) ? PF_WRITE : 0, false);
+    }
+    mm_unlock(mm);
+    return r == -EACCES || r == -EIO ? 0 : r;
+}
+
+/* ---- mmap and friends ------------------------------------------------------- */
+int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
+                struct file *file, struct vm_object *obj, uint64_t off, uint64_t file_end)
+{
+    if (!len) return -EINVAL;
+    len = pgup(len);
+    if (!len || len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
+    mm_lock(mm);
+    int64_t r;
+    if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
+        if ((addr & (PAGE - 1)) || !user_range_ok(addr, len)) { r = -EINVAL; goto out; }
+        if (flags & MAP_FIXED_NOREPLACE) {
+            if (!range_free(mm, addr, addr + len)) { r = -EEXIST; goto out; }
+        } else if ((r = unmap_range(mm, addr, addr + len))) {
+            goto out;
+        }
+    } else {
+        uint64_t hint = pgdown(addr);
+        if (hint && user_range_ok(hint, len) && range_free(mm, hint, hint + len)) addr = hint;
+        else if (!(addr = find_gap(mm, UVM_MMAP_BASE, UVM_MMAP_END, len))) { r = -ENOMEM; goto out; }
+    }
+    struct vma *v = kzalloc(sizeof *v);
+    if (!v) { r = -ENOMEM; goto out; }
+    v->start = addr;
+    v->end = addr + len;
+    v->prot = (uint32_t)prot;
+    v->flags = obj ? VMA_SHARED : 0;
+    v->off = off;
+    if (obj) { v->obj = obj; vmobj_get(obj); }
+    if (file) { v->file = vfs_file_get(file); v->file_end = file_end; }
+    vma_insert(mm, v);
+    vma_merge_all(mm);
+    r = (int64_t)addr;
+out:
+    mm_unlock(mm);
+    if (r > 0 && (flags & MAP_POPULATE)) vm_populate(mm, (uint64_t)r, len, false);
+    return r;
+}
+
+int vm_munmap(struct mm *mm, uint64_t addr, uint64_t len)
+{
+    if ((addr & (PAGE - 1)) || !len) return -EINVAL;
+    len = pgup(len);
+    if (!user_range_ok(addr, len)) return -EINVAL;
+    mm_lock(mm);
+    int r = unmap_range(mm, addr, addr + len);
+    mm_unlock(mm);
+    return r;
+}
+
+struct protctx { struct mm *mm; const struct vma *v; };
+static void prot_fn(uint64_t *pte, uint64_t va, void *ctx)
+{
+    (void)va;
+    struct protctx *c = ctx;
+    uint64_t e = *pte;
+    if (!has_frame(e)) return;
+    uint64_t frame = e & ADDR_MASK, cow = e & PTE_COW;
+    if (c->v->prot == PROT_NONE) { *pte = frame | cow | PTE_PROTNONE; return; }
+    /* a private page still shared with another process stays read-only
+     * (copy-on-write) even if the region becomes writable */
+    bool w = (c->v->prot & PROT_WRITE) && ((c->v->flags & VMA_SHARED) || page_refs(frame) == 1);
+    if ((c->v->prot & PROT_WRITE) && !w && !(c->v->flags & VMA_SHARED)) cow = PTE_COW;
+    if (w) cow = 0;
+    *pte = frame | cow | leaf_flags(c->v, w);
+}
+
+int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
+{
+    if ((addr & (PAGE - 1))) return -EINVAL;
+    prot &= ~0x03000000;                                /* PROT_GROWSDOWN/UP: accepted */
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
+    len = pgup(len);
+    if (!len) return 0;
+    if (!user_range_ok(addr, len)) return -ENOMEM;
+    uint64_t end = addr + len;
+    mm_lock(mm);
+    int r = 0;
+    for (uint64_t a = addr; a < end; ) {                /* all of it must be mapped */
+        struct vma *v = vma_find(mm, a);
+        if (!v) { r = -ENOMEM; goto out; }
+        if ((prot & PROT_WRITE) && (v->flags & VMA_SHARED) && v->file == NULL && v->obj && v->obj->seals & 0x0008) {
+            r = -EACCES; goto out;                      /* F_SEAL_WRITE */
+        }
+        if ((prot & PROT_WRITE) && (v->flags & (VMA_VVAR | VMA_VDSO))) { r = -EACCES; goto out; }   /* shared by all */
+        a = v->end;
+    }
+    if ((r = split_at(mm, addr)) || (r = split_at(mm, end))) goto out;
+    for (struct vma *v = mm->vmas; v; v = v->next) {
+        if (v->start < addr || v->end > end) continue;
+        v->prot = (uint32_t)prot;
+        struct protctx c = { mm, v };
+        walk_range(mm->pml4, v->start, v->end, prot_fn, &c);
+    }
+    tlb_range(mm, addr, end);
+    vma_merge_all(mm);
+out:
+    mm_unlock(mm);
+    return r;
+}
+
+struct movectx { struct mm *mm; int64_t delta; int err; };
+static void move_fn(uint64_t *pte, uint64_t va, void *ctx)
+{
+    struct movectx *c = ctx;
+    if (c->err) return;
+    uint64_t *d = pte_walk(c->mm->pml4, (uint64_t)((int64_t)va + c->delta), true);
+    if (!d) { c->err = -ENOMEM; return; }
+    *d = *pte;
+    *pte = 0;
+}
+
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+
+int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int flags, uint64_t naddr)
+{
+    if ((old & (PAGE - 1)) || (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED))) return -EINVAL;
+    if ((flags & MREMAP_FIXED) && (!(flags & MREMAP_MAYMOVE) || (naddr & (PAGE - 1)))) return -EINVAL;
+    olen = pgup(olen);
+    nlen = pgup(nlen);
+    if (!nlen || !olen || !user_range_ok(old, olen)) return -EINVAL;
+    mm_lock(mm);
+    int64_t r;
+    struct vma *v = vma_find(mm, old);
+    if (!v || old + olen > v->end) { r = -EFAULT; goto out; }     /* must lie in one region */
+    if (!(flags & MREMAP_FIXED)) {
+        if (nlen <= olen) {                                       /* shrink in place */
+            r = unmap_range(mm, old + nlen, old + olen);
+            if (!r) r = (int64_t)old;
+            goto out;
+        }
+        if (old + olen == v->end && user_range_ok(old, nlen) && range_free(mm, old + olen, old + nlen)) {
+            v->end = old + nlen;                                  /* grow in place */
+            r = (int64_t)old;
+            goto out;
+        }
+        if (!(flags & MREMAP_MAYMOVE)) { r = -ENOMEM; goto out; }
+        if (!(naddr = find_gap(mm, UVM_MMAP_BASE, UVM_MMAP_END, nlen))) { r = -ENOMEM; goto out; }
+    } else {
+        if (!user_range_ok(naddr, nlen) || (naddr < old + olen && old < naddr + nlen)) { r = -EINVAL; goto out; }
+        if ((r = unmap_range(mm, naddr, naddr + nlen))) goto out;
+        v = vma_find(mm, old);
+    }
+    /* move: carve [old, old+olen) out as its own region, then relocate it */
+    if ((r = split_at(mm, old)) || (r = split_at(mm, old + olen))) goto out;
+    v = vma_find(mm, old);
+    uint64_t keep = olen < nlen ? olen : nlen;
+    if (olen > keep) zap_range(mm, old + keep, old + olen);
+    struct movectx c = { mm, (int64_t)naddr - (int64_t)old, 0 };
+    walk_range(mm->pml4, old, old + keep, move_fn, &c);
+    if (c.err) { r = c.err; goto out; }
+    tlb_range(mm, old, old + olen);
+    /* detach v and re-insert it at the new place */
+    for (struct vma **pp = &mm->vmas; *pp; pp = &(*pp)->next) if (*pp == v) { *pp = v->next; break; }
+    if (v->file) v->file_end = v->file_end + (naddr - old);
+    v->start = naddr;
+    v->end = naddr + nlen;
+    vma_insert(mm, v);
+    vma_merge_all(mm);
+    r = (int64_t)naddr;
+out:
+    mm_unlock(mm);
+    return r;
+}
+
+int vm_madvise_dontneed(struct mm *mm, uint64_t addr, uint64_t len)
+{
+    if (addr & (PAGE - 1)) return -EINVAL;
+    len = pgup(len);
+    if (!user_range_ok(addr, len)) return -EINVAL;
+    mm_lock(mm);
+    zap_range(mm, addr, addr + len);                    /* next touch: zeros / file / object page */
+    mm_unlock(mm);
+    return 0;
+}
+
+int vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec)
+{
+    mm_lock(mm);
+    int r = 0;
+    uint64_t i = 0;
+    for (uint64_t va = addr; va < addr + len; va += PAGE, i++) {
+        if (!vma_find(mm, va)) { r = -ENOMEM; break; }
+        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        vec[i] = pte && has_frame(*pte) ? 1 : 0;
+    }
+    mm_unlock(mm);
+    return r;
+}
+
+int64_t vm_brk(struct mm *mm, uint64_t addr)
+{
+    mm_lock(mm);
+    uint64_t cur = mm->brk;
+    if (addr < mm->brk_start || addr >= UVM_MMAP_BASE) goto out;
+    uint64_t oend = pgup(mm->brk), nend = pgup(addr);
+    if (nend > oend) {
+        if (!range_free(mm, oend, nend)) goto out;      /* would run into a mapping */
+        struct vma *v = kzalloc(sizeof *v);
+        if (!v) goto out;
+        v->start = oend;
+        v->end = nend;
+        v->prot = PROT_READ | PROT_WRITE;
+        v->flags = VMA_HEAP;
+        vma_insert(mm, v);
+        vma_merge_all(mm);
+    } else if (nend < oend) {
+        unmap_range(mm, nend, oend);
+    }
+    mm->brk = cur = addr;
+out:
+    mm_unlock(mm);
+    return (int64_t)cur;
+}
+
+void vm_mark(struct mm *mm, uint64_t addr, uint32_t flag)
+{
+    mm_lock(mm);
+    struct vma *v = vma_find(mm, addr);
+    if (v) v->flags |= flag;
+    mm_unlock(mm);
+}
+
+/* Futex key of a shared mapping: the object and the byte offset in it. */
+int vm_shared_key(struct mm *mm, uint64_t addr, struct vm_object **obj, uint64_t *off)
+{
+    int r = -EFAULT;
+    mm_lock(mm);
+    struct vma *v = vma_find(mm, addr);
+    if (v) {
+        r = 0;
+        if (v->flags & VMA_SHARED && v->obj) { *obj = v->obj; *off = v->off + (addr - v->start); }
+        else *obj = NULL;
+    }
+    mm_unlock(mm);
+    return r;
+}
+
+/* ---- /proc/PID/maps --------------------------------------------------------- */
+size_t vm_maps(struct mm *mm, char *buf, size_t cap)
+{
+    size_t n = 0;
+    mm_lock(mm);
+    for (struct vma *v = mm->vmas; v && n + 160 < cap; v = v->next) {
+        char path[VFS_PATH_MAX] = "";
+        if (v->file && v->file->vn) vfs_path_of(v->file->vn, path, sizeof path);
+        else if (v->flags & VMA_STACK) strlcpy(path, "[stack]", sizeof path);
+        else if (v->flags & VMA_HEAP) strlcpy(path, "[heap]", sizeof path);
+        else if (v->flags & VMA_VVAR) strlcpy(path, "[vvar]", sizeof path);
+        else if (v->flags & VMA_VDSO) strlcpy(path, "[vdso]", sizeof path);
+        else if (v->obj) strlcpy(path, "/memfd: (deleted)", sizeof path);
+        n += (size_t)snprintf(buf + n, cap - n, "%012lx-%012lx %c%c%c%c %08lx 00:00 %-10lu %s\n",
+                              v->start, v->end, (v->prot & PROT_READ) ? 'r' : '-',
+                              (v->prot & PROT_WRITE) ? 'w' : '-', (v->prot & PROT_EXEC) ? 'x' : '-',
+                              (v->flags & VMA_SHARED) ? 's' : 'p', v->off,
+                              v->file && v->file->vn ? v->file->vn->ino : 0, path);
+    }
+    mm_unlock(mm);
+    return n < cap ? n : cap;
+}
+
+/* ---- out of memory ------------------------------------------------------------ */
+bool oom_kill(struct tcb *spare)
+{
+    /* A victim is still giving its memory back (freeing a large address
+     * space takes a while): wait for it rather than kill another process.
+     * Five seconds without progress, and the next one goes. */
+    if (__atomic_load_n(&oom_pending, __ATOMIC_ACQUIRE) > 0 && time_ms() - oom_since < 5000) return true;
+    struct tcb *victim = NULL;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = task_slot(i);
+        if (t == spare || !t->user || !t->mm || t->state == TASK_UNUSED || t->state == TASK_ZOMBIE) continue;
+        if (t->mm->oom_victim) continue;
+        if (!victim || t->mm->rss > victim->mm->rss) victim = t;
+    }
+    if (!victim) return false;
+    if (!victim->oom_killed && !victim->signal->group_exit) {
+        victim->oom_killed = true;
+        victim->mm->oom_victim = true;
+        __atomic_add_fetch(&oom_pending, 1, __ATOMIC_ACQ_REL);
+        oom_since = time_ms();
+        kprintf("oom: out of memory: killing pid %d (%s), %lu KiB resident\n", victim->tgid, victim->name,
+                victim->mm->rss * 4);
+        signal_send(victim, SIGKILL);
+    }
+    return true;
+}
