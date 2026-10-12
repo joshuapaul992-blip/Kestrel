@@ -183,7 +183,7 @@ $(LKPI_DRV_OBJS): $(BUILD)/%.o: %.c
 # Compile only, keep going, and print one line per file: "ok" or its first error.
 lkpi-drm-check:
 	@for f in $(LKPI_DRM_SRC); do \
-	    if out=$$($(CC) $(LKPI_DRM_CFLAGS) -DKBUILD_MODNAME='"drm"' -fsyntax-only $$f 2>&1 | grep -m1 'error'); \
+	    if out=$$($(CC) $(LKPI_DRM_CFLAGS) -DKBUILD_MODNAME='"drm"' -fsyntax-only -MF /dev/null $$f 2>&1 | grep -m1 'error'); \
 	    then echo "  FAIL    $$f: $$out"; else echo "  ok      $$f"; fi; \
 	done
 
