@@ -116,4 +116,6 @@
 #define ERECALLCONFLICT 530
 #define ENOGRACE        531
 
+#define EMULTIHOP       72
+
 #endif

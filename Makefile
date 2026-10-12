@@ -112,6 +112,22 @@ LKPI_CFLAGS := $(filter-out -I% -W% -MMD -MP,$(CFLAGS)) -nostdinc -D__KERNEL__ \
                -fno-strict-aliasing -fno-delete-null-pointer-checks -fno-strict-overflow -fno-common \
                -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -MMD -MP
 
+# Phase 2 (DRM through the KPI): the vendored DRM core, KMS helpers, TTM
+# and bochs, not linked yet. `make lkpi-drm-check` compiles each of them
+# against the KPI and lists what is still missing (third_party/linux/README.md).
+# Linux reaches kernel.h, export.h and slab.h through its deep header graph;
+# the KPI's headers are shallower, so DRM files get them up front.
+LKPI_DRM_SRC := $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c) \
+                $(wildcard third_party/linux/drivers/gpu/drm/ttm/*.c) \
+                third_party/linux/drivers/gpu/drm/tiny/bochs.c \
+                third_party/linux/drivers/dma-buf/dma-resv.c \
+                third_party/linux/drivers/video/aperture.c third_party/linux/drivers/video/hdmi.c \
+                third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c)
+LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linux/include/uapi \
+                   -include linux/kernel.h -include linux/export.h -include linux/slab.h \
+                   -Werror=implicit-function-declaration -Werror=implicit-int -Werror=int-conversion \
+                   -Werror=incompatible-pointer-types -Werror=return-type
+
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC)) \
           $(LKPI_OBJS) $(LKPI_DRV_OBJS)
 KERNEL := $(BUILD)/kernel.elf
@@ -132,7 +148,7 @@ KERNEL_CMDLINE ?=
 ROOTFS_BASE ?=
 ROOTDISK    := $(BUILD)/rootdisk.ext2
 
-.PHONY: FORCE xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
+.PHONY: FORCE lkpi-drm-check xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
 
 all: $(KERNEL)
 
@@ -153,6 +169,13 @@ $(LKPI_DRV_OBJS): $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC [L]  $<"
 	@$(CC) $(LKPI_CFLAGS) -DKBUILD_MODNAME='"$(subst -,_,$(basename $(notdir $<)))"' -c $< -o $@
+
+# Compile only, keep going, and print one line per file: "ok" or its first error.
+lkpi-drm-check:
+	@for f in $(LKPI_DRM_SRC); do \
+	    if out=$$($(CC) $(LKPI_DRM_CFLAGS) -DKBUILD_MODNAME='"drm"' -fsyntax-only $$f 2>&1 | grep -m1 'error'); \
+	    then echo "  FAIL    $$f: $$out"; else echo "  ok      $$f"; fi; \
+	done
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)

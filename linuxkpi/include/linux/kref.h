@@ -3,6 +3,7 @@
 #define _LKPI_LINUX_KREF_H
 
 #include <linux/refcount.h>
+#include <linux/bits.h>
 
 struct kref { refcount_t refcount; };
 

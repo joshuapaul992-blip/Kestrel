@@ -89,4 +89,6 @@ typedef void (*rcu_callback_t)(struct rcu_head *head);
 
 #define DECLARE_BITMAP(name, bits)  unsigned long name[((bits) + 63) / 64]
 
+typedef unsigned long           pgoff_t;
+
 #endif

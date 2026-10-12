@@ -7,6 +7,7 @@
 #include <linux/mm_types.h>
 #include <linux/gfp_types.h>
 #include <asm/page.h>
+#include <linux/mm.h>
 
 struct scatterlist {
     struct page    *lkpi_page;
@@ -47,5 +48,48 @@ int  sg_nents(struct scatterlist *sg);
     for (__i = 0, sg = (sglist); __i < (nr); __i++, sg = sg_next(sg))
 #define for_each_sgtable_sg(sgt, sg, i)         for_each_sg((sgt)->sgl, sg, (sgt)->orig_nents, i)
 #define for_each_sgtable_dma_sg(sgt, sg, i)     for_each_sg((sgt)->sgl, sg, (sgt)->nents, i)
+
+/* walking a table page by page */
+struct sg_page_iter {
+    struct scatterlist *sg;
+    unsigned int        sg_pgoffset;    /* page within sg */
+    unsigned int        __nents;
+    int                 __pg_advance;
+};
+struct sg_dma_page_iter { struct sg_page_iter base; };
+static inline unsigned int __lkpi_sg_npages(struct scatterlist *sg)
+{ return (sg->offset + sg->length + PAGE_SIZE - 1) >> PAGE_SHIFT; }
+static inline void __sg_page_iter_start(struct sg_page_iter *piter, struct scatterlist *sglist,
+                                        unsigned int nents, unsigned long pgoffset)
+{
+    piter->__pg_advance = 0;
+    piter->__nents = nents;
+    piter->sg = sglist;
+    piter->sg_pgoffset = pgoffset;
+}
+static inline bool __sg_page_iter_next(struct sg_page_iter *piter)
+{
+    if (!piter->__nents || !piter->sg) return false;
+    piter->sg_pgoffset += piter->__pg_advance;
+    piter->__pg_advance = 1;
+    while (piter->sg_pgoffset >= __lkpi_sg_npages(piter->sg)) {
+        piter->sg_pgoffset -= __lkpi_sg_npages(piter->sg);
+        piter->sg = sg_next(piter->sg);
+        if (!--piter->__nents || !piter->sg) return false;
+    }
+    return true;
+}
+static inline struct page *sg_page_iter_page(struct sg_page_iter *piter)
+{ return pfn_to_page(page_to_pfn(sg_page(piter->sg)) + piter->sg_pgoffset); }
+static inline bool __sg_page_iter_dma_next(struct sg_dma_page_iter *dma_iter) { return __sg_page_iter_next(&dma_iter->base); }
+static inline dma_addr_t sg_page_iter_dma_address(struct sg_dma_page_iter *dma_iter)
+{ return sg_dma_address(dma_iter->base.sg) + ((dma_addr_t)dma_iter->base.sg_pgoffset << PAGE_SHIFT); }
+#define for_each_sg_page(sglist, piter, nents, pgoffset) \
+    for (__sg_page_iter_start((piter), (sglist), (nents), (pgoffset)); __sg_page_iter_next(piter);)
+#define for_each_sg_dma_page(sglist, dma_iter, dma_nents, pgoffset) \
+    for (__sg_page_iter_start(&(dma_iter)->base, sglist, dma_nents, pgoffset); __sg_page_iter_dma_next(dma_iter);)
+#define for_each_sgtable_page(sgt, piter, pgoffset) for_each_sg_page((sgt)->sgl, piter, (sgt)->orig_nents, pgoffset)
+#define for_each_sgtable_dma_page(sgt, dma_iter, pgoffset) \
+    for_each_sg_dma_page((sgt)->sgl, dma_iter, (sgt)->nents, pgoffset)
 
 #endif

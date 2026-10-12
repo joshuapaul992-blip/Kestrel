@@ -17,4 +17,7 @@ static inline void memcpy_from_page(char *to, struct page *p, size_t off, size_t
 static inline void memcpy_to_page(struct page *p, size_t off, const char *from, size_t len) { memcpy((char *)page_address(p) + off, from, len); }
 static inline void memzero_page(struct page *p, size_t off, size_t len) { memset((char *)page_address(p) + off, 0, len); }
 #define flush_dcache_page(p)            do { } while (0)
+#define kmap_local_page_prot(p, prot)   kmap_local_page(p)
+static inline void clear_page(void *page) { memset(page, 0, PAGE_SIZE); }
+
 #endif

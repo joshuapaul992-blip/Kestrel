@@ -23,6 +23,9 @@
 #define CONFIG_PVPANIC_PCI          1
 #define CONFIG_PRINTK               1
 #define CONFIG_PANIC_TIMEOUT        0
+#define CONFIG_DRM                  1           /* phase 2: the DRM core, TTM and bochs */
+#define CONFIG_APERTURE_HELPERS     1
+#define CONFIG_PM_SLEEP             1
 #define CONFIG_PAGE_OFFSET          0
 
 /* IS_ENABLED(CONFIG_FOO): 1 when CONFIG_FOO is defined to 1, else 0,

@@ -137,4 +137,6 @@ struct work_struct *current_work(void);
 bool current_is_workqueue_rescuer(void);
 #define workqueue_set_max_active(wq, n) do { } while (0)
 
+#define queue_work_node(node, wq, work) queue_work(wq, work)
+
 #endif

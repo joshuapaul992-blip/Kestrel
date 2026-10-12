@@ -212,7 +212,7 @@ struct page *vmalloc_to_page(const void *addr) { return virt_to_page(addr); }
 unsigned long vmalloc_to_pfn(const void *addr) { return virt_to_pfn(addr); }
 
 /* nothing to map: pages that happen to be contiguous are already a range */
-void *vmap(struct page **pages, unsigned int count, unsigned long flags, unsigned long prot)
+void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot)
 {
     for (unsigned int i = 1; i < count; i++) {
         if (page_to_pfn(pages[i]) != page_to_pfn(pages[0]) + i) {

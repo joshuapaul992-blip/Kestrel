@@ -10,6 +10,7 @@
 #include <linux/list.h>
 #include <linux/jiffies.h>
 #include <linux/container_of.h>
+#include <linux/ktime.h>
 
 struct timer_list {
     struct list_head    entry;          /* on the pending list (entry.prev == NULL: not pending) */

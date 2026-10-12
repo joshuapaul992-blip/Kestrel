@@ -105,4 +105,20 @@ void *memdup_user(const void __user *src, size_t len);
 char *strndup_user(const char __user *s, long n);
 void *memdup_user_nul(const void __user *src, size_t len);
 
+void *memdup_array_user(const void __user *src, size_t n, size_t size);
+static inline bool mem_is_zero(const void *s, size_t n)
+{
+    const unsigned char *p = s;
+    while (n--) if (*p++) return false;
+    return true;
+}
+/* copy a string into a fixed-size field that need not be terminated, padding with pad */
+#define strtomem_pad(dest, src, pad) do {                                       \
+        const size_t _dest_len = sizeof(dest);                                 \
+        const char *_src = (src);                                               \
+        size_t _src_len = strnlen(_src, _dest_len);                             \
+        memcpy(dest, _src, _src_len);                                           \
+        memset((char *)(dest) + _src_len, pad, _dest_len - _src_len);           \
+    } while (0)
+
 #endif

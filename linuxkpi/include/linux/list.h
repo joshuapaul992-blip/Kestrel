@@ -207,4 +207,21 @@ static inline void hlist_add_behind(struct hlist_node *n, struct hlist_node *pre
     for (pos = hlist_entry_safe((head)->first, typeof(*pos), member); \
          pos && ({ n = pos->member.next; 1; }); pos = hlist_entry_safe(n, typeof(*pos), member))
 
+#define list_for_each_entry_from_reverse(pos, head, member) \
+    for (; !list_entry_is_head(pos, head, member); pos = list_prev_entry(pos, member))
+#define list_for_each_entry_continue_reverse(pos, head, member) \
+    for (pos = list_prev_entry(pos, member); !list_entry_is_head(pos, head, member); \
+         pos = list_prev_entry(pos, member))
+
+/* move first..last (a run of entries of one list) to the tail of head */
+static inline void list_bulk_move_tail(struct list_head *head, struct list_head *first, struct list_head *last)
+{
+    first->prev->next = last->next;
+    last->next->prev = first->prev;
+    head->prev->next = first;
+    first->prev = head->prev;
+    last->next = head;
+    head->prev = last;
+}
+
 #endif

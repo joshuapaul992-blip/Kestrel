@@ -27,6 +27,9 @@
 #include <linux/static_call_types.h>
 #include <asm/byteorder.h>
 #include <asm/div64.h>
+#include <linux/sizes.h>
+#include <linux/bitmap.h>
+#include <linux/math64.h>
 
 #define STACK_MAGIC             0xdeadbeef
 #define u64_to_user_ptr(x)      ((void __user *)(uintptr_t)(x))
@@ -52,6 +55,18 @@ int lkpi_num_online_cpus(void);
 __printf(1, 2) __noreturn void lkpi_panic(const char *fmt, ...);
 #define panic                   lkpi_panic
 
-#define oops_in_progress        0
+
+struct sysinfo {
+    unsigned long totalram, freeram, sharedram, bufferram, totalswap, freeswap, totalhigh, freehigh;
+    unsigned int mem_unit;
+};
+void si_meminfo(struct sysinfo *val);
+
+#define overflowuid             65534
+#define overflowgid             65534
+
+/* picoseconds per pixel from a pixel clock in kHz, and back (Linux has them in fb.h) */
+#define KHZ2PICOS(a)            (1000000000UL / (a))
+#define PICOS2KHZ(a)            (1000000000UL / (a))
 
 #endif
