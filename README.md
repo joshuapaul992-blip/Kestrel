@@ -1,6 +1,7 @@
 # Kestrel
 
 A fully vibe-coded, VERY Linux-compatible operating system, vibe-coded entirely with Claude Opus 5.5
+Also capable of running Firefox 157 natively over an unmodified musl tree
 
 ### Why vibe-code an OS to work like Linux?
 Because I can.
