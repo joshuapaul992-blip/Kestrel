@@ -253,7 +253,7 @@ void nv_vram_fill(struct nv_device *d, uint64_t addr, uint32_t value, uint32_t l
 /* ======================================================================== */
 /*  VBIOS scripts                                                              */
 /* ======================================================================== */
-static int outp_pos(struct nv_device *d, const struct nvbios_output *o)
+static int outp_pos(struct nv_device *d, const struct kvbios_output *o)
 {
     if (!o) return -1;
     int pos = (int)(o - d->bios.output);
@@ -267,7 +267,7 @@ static void     sops_wr08(void *c, uint32_t r, uint8_t v) { nv_wr08(c, r, v); }
 static void     sops_delay(void *c, uint32_t us) { (void)c; nv_udelay(us); }
 static void     sops_log(void *c, const char *line) { (void)c; nv_log("%s\n", line); }
 
-static int sops_aux_rd(void *c, const struct nvbios_output *o, uint32_t addr, uint8_t *v)
+static int sops_aux_rd(void *c, const struct kvbios_output *o, uint32_t addr, uint8_t *v)
 {
     struct nv_device *d = c;
     int pos = outp_pos(d, o);
@@ -275,7 +275,7 @@ static int sops_aux_rd(void *c, const struct nvbios_output *o, uint32_t addr, ui
     return nv_aux_dpcd_read(d, d->dp[pos].aux, addr, v, 1);
 }
 
-static int sops_aux_wr(void *c, const struct nvbios_output *o, uint32_t addr, uint8_t v)
+static int sops_aux_wr(void *c, const struct kvbios_output *o, uint32_t addr, uint8_t v)
 {
     struct nv_device *d = c;
     int pos = outp_pos(d, o);
@@ -309,7 +309,7 @@ static void run_script(struct nv_device *d, uint32_t offset, int pos, int or, in
 {
     if (!offset) return;
     struct nvinit st;
-    const struct nvbios_output *o = pos >= 0 ? &d->bios.output[pos] : 0;
+    const struct kvbios_output *o = pos >= 0 ? &d->bios.output[pos] : 0;
     int rc = nvinit_run(&d->bios, &script_ops, offset, o, or, link, head, X.opts.trace_scripts, &st);
     d->ms.script_runs++;
     d->ms.script_writes += st.writes;
@@ -333,15 +333,15 @@ static uint32_t crystal_khz(struct nv_device *d)
 
 static int vpll_set(struct nv_device *d, int head, uint32_t khz)
 {
-    struct nvbios_pll p;
-    if (!nvbios_pll_parse(&d->bios, (uint8_t)(NVBIOS_PLL_VPLL0 + head), &p)) {
+    struct kvbios_pll p;
+    if (!kvbios_pll_parse(&d->bios, (uint8_t)(NVBIOS_PLL_VPLL0 + head), &p)) {
         nv_log("nvdisp: VPLL%d: no PLL limits entry (table version %02x)\n", head, p.ver);
         return NV_ERR_NOBIOS;
     }
     if (!p.reg) p.reg = 0x614100u + (uint32_t)head * 0x800u;
     if (!p.refclk) p.refclk = d->ms.crystal_khz;
     int N = 0, fN = 0, M = 0, P = 0;
-    int got = nvbios_pll_calc(&p, khz, &N, &fN, &M, &P);
+    int got = kvbios_pll_calc(&p, khz, &N, &fN, &M, &P);
     if (got < 0 || !M) {
         nv_log("nvdisp: VPLL%d: no coefficients for %u kHz (ref %u, vco %u-%u, in %u-%u, M %u-%u, N %u-%u, P %u-%u)\n",
                head, khz, p.refclk, p.vco1.min_freq, p.vco1.max_freq, p.vco1.min_inputfreq, p.vco1.max_inputfreq,
@@ -719,7 +719,7 @@ static int dp_wr(struct nv_device *d, int pos, uint32_t addr, const uint8_t *buf
 /* nvkm_dp_enable: LTTPRs, receiver caps, usable lanes and rates. */
 static bool dp_enable(struct nv_device *d, int pos)
 {
-    const struct nvbios_output *o = &d->bios.output[pos];
+    const struct kvbios_output *o = &d->bios.output[pos];
     struct nv_dp_probe *p = &d->dp[pos];
     typeof(d->ms.dp[0]) *s = &d->ms.dp[pos];
     mzero(s, sizeof *s);
@@ -750,7 +750,7 @@ static bool dp_enable(struct nv_device *d, int pos)
 struct lt_state {
     struct nv_device *d;
     int      pos, sor, link, nr;
-    struct nvbios_dpout info;
+    struct kvbios_dpout info;
     bool     have_info;
     uint8_t  stat[6], conf[4], pc2stat, pc2conf[2];
     bool     pc2;
@@ -831,8 +831,8 @@ static int lt_drive(struct lt_state *lt, bool pc)
         lt->conf[i] = (uint8_t)(lpre << 3 | lvsw);
         lt->pc2conf[i >> 1] |= (uint8_t)(lpc2 << ((i & 1) * 4));
 
-        struct nvbios_dpcfg cfg;
-        if (lt->have_info && nvbios_dpcfg_match(&lt->d->bios, &lt->info, lpc2 & 3, lvsw & 3, lpre & 3, &cfg))
+        struct kvbios_dpcfg cfg;
+        if (lt->have_info && kvbios_dpcfg_match(&lt->d->bios, &lt->info, lpc2 & 3, lvsw & 3, lpre & 3, &cfg))
             sor_dp_drive(lt->d, lt->sor, lt->link, i, cfg.pc, cfg.dc, cfg.pe, cfg.tx_pu);
         else
             nv_log("nvdisp:   lane %d: no DP drive config for vs %d pe %d pc %d\n", i, lvsw & 3, lpre & 3, lpc2 & 3);
@@ -898,7 +898,7 @@ static int lt_eq(struct lt_state *lt)
     return eq_done ? 0 : -1;
 }
 
-static int dp_train_link(struct nv_device *d, int pos, int sor, int link, const struct nvbios_dpout *info, bool have_info)
+static int dp_train_link(struct nv_device *d, int pos, int sor, int link, const struct kvbios_dpout *info, bool have_info)
 {
     typeof(d->ms.dp[0]) *s = &d->ms.dp[pos];
     struct lt_state lt;
@@ -925,14 +925,14 @@ static int dp_train_link(struct nv_device *d, int pos, int sor, int link, const 
     return rc;
 }
 
-static int dp_train_links(struct nv_device *d, int pos, int sor, int link, const struct nvbios_dpout *info, bool have_info)
+static int dp_train_links(struct nv_device *d, int pos, int sor, int link, const struct kvbios_dpout *info, bool have_info)
 {
     typeof(d->ms.dp[0]) *s = &d->ms.dp[pos];
     nv_log("nvdisp: DCB %d: programming SOR %d link %d for %u lane(s) x %02x\n", pos, sor, link, s->nr, s->bw);
     if (have_info && info->lnkcmp) {
         uint32_t l = info->lnkcmp;
-        for (int g = 0; g < 16 && s->bw < nvbios_rd08(&d->bios, l); g++) l += info->ver < 0x30 ? 4 : 3;
-        run_script(d, nvbios_rd16(&d->bios, l + 1), pos, sor, link, -1, "DP link rate");
+        for (int g = 0; g < 16 && s->bw < kvbios_rd08(&d->bios, l); g++) l += info->ver < 0x30 ? 4 : 3;
+        run_script(d, kvbios_rd16(&d->bios, l + 1), pos, sor, link, -1, "DP link rate");
     }
     sor_dp_links(d, sor, link, s->bw, s->nr, s->ef);
     sor_dp_power(d, sor, link, s->nr);
@@ -943,9 +943,9 @@ static int dp_train(struct nv_device *d, int pos, int sor, int link, uint32_t da
 {
     typeof(d->ms.dp[0]) *s = &d->ms.dp[pos];
     const uint8_t *dpcd = d->dp[pos].dpcd;
-    const struct nvbios_output *o = &d->bios.output[pos];
-    struct nvbios_dpout info;
-    bool have_info = nvbios_dpout_match(&d->bios, o->hasht, o->hashm, &info) != 0;
+    const struct kvbios_output *o = &d->bios.output[pos];
+    struct kvbios_dpout info;
+    bool have_info = kvbios_dpout_match(&d->bios, o->hasht, o->hashm, &info) != 0;
     if (!have_info) nv_log("nvdisp: DCB %d: no DP table entry for %04x:%04x\n", pos, o->hasht, o->hashm);
 
     uint8_t pwr;
@@ -981,9 +981,9 @@ static int dp_train(struct nv_device *d, int pos, int sor, int link, uint32_t da
 
 static void dp_disable(struct nv_device *d, int pos, int sor, int link)
 {
-    const struct nvbios_output *o = &d->bios.output[pos];
-    struct nvbios_dpout info;
-    if (nvbios_dpout_match(&d->bios, o->hasht, o->hashm, &info))
+    const struct kvbios_output *o = &d->bios.output[pos];
+    struct kvbios_dpout info;
+    if (kvbios_dpout_match(&d->bios, o->hasht, o->hashm, &info))
         run_script(d, info.script[4], pos, sor, link, -1, "DP DisableLT");
 }
 
@@ -1051,11 +1051,11 @@ static int ior_asy(struct nv_device *d, int head)
     return -1;
 }
 
-static uint32_t iedt(struct nv_device *d, int head, int pos, struct nvbios_outp *t)
+static uint32_t iedt(struct nv_device *d, int head, int pos, struct kvbios_outp *t)
 {
-    const struct nvbios_output *o = &d->bios.output[pos];
+    const struct kvbios_output *o = &d->bios.output[pos];
     const uint16_t m = (uint16_t)((0x0100u << head) | (uint32_t)ffs32(o->link) << 6 | o->or);
-    uint32_t data = nvbios_outp_match(&d->bios, o->hasht, m, t);
+    uint32_t data = kvbios_outp_match(&d->bios, o->hasht, m, t);
     if (!data) nv_log("nvdisp: no IED table for %04x:%04x\n", o->hasht, m);
     return data;
 }
@@ -1064,15 +1064,15 @@ static void ied_on(struct nv_device *d, int head, int sor, int id, uint32_t khz)
 {
     int pos = (int)d->ms.sor_asy[sor] - 1;
     if (pos < 0) { nv_log("nvdisp: SOR %d: nothing to attach\n", sor); return; }
-    struct nvbios_outp t;
-    struct nvbios_ocfg c;
+    struct kvbios_outp t;
+    struct kvbios_ocfg c;
     if (!iedt(d, head, pos, &t)) return;
     uint8_t flags = X.sor_asyst[sor].link == 3 ? 0x01 : 0x00;
-    if (!nvbios_ocfg_match(&d->bios, &t, X.sor_asyst[sor].proto_evo, flags, &c)) {
+    if (!kvbios_ocfg_match(&d->bios, &t, X.sor_asyst[sor].proto_evo, flags, &c)) {
         nv_log("nvdisp: DCB %d: no IEDT config for %02x:%02x\n", pos, X.sor_asyst[sor].proto_evo, flags);
         return;
     }
-    uint16_t script = nvbios_oclk_match(&d->bios, c.clkcmp[id], khz);
+    uint16_t script = kvbios_oclk_match(&d->bios, c.clkcmp[id], khz);
     if (!script) { nv_log("nvdisp: DCB %d: no OnInt%d script for %u kHz\n", pos, id + 2, khz); return; }
     run_script(d, script, pos, sor, X.sor_asyst[sor].link, head, id ? "IED OnInt3" : "IED OnInt2");
 }
@@ -1081,14 +1081,14 @@ static void ied_off(struct nv_device *d, int head, int sor, int id)
 {
     int pos = (int)d->ms.sor_arm[sor] - 1;
     if (pos < 0) { nv_log("nvdisp: SOR %d: nothing attached\n", sor); return; }
-    struct nvbios_outp t;
+    struct kvbios_outp t;
     if (!iedt(d, head, pos, &t)) return;
     run_script(d, t.script[id], pos, sor, X.sor_armst[sor].link, head, id == 1 ? "IED OffInt1" : "IED OffInt2");
 }
 
 static void route_set(struct nv_device *d, int pos, int sor)
 {
-    const struct nvbios_output *o = &d->bios.output[pos];
+    const struct kvbios_output *o = &d->bios.output[pos];
     const uint32_t moff = (uint32_t)(ffs32(o->or) - 1) * 0x100u;
     const uint32_t sorv = sor >= 0 ? (uint32_t)sor + 1u : 0u;
     uint32_t link = sor >= 0 ? (X.sor_asyst[sor].link == 2) : 0;
@@ -1434,7 +1434,7 @@ static int plan(struct nv_device *d)
     }
 
     for (int pos = 0; pos < d->bios.noutputs && ms->nouts < NV_MAX_HEADS; pos++) {
-        const struct nvbios_output *o = &d->bios.output[pos];
+        const struct kvbios_output *o = &d->bios.output[pos];
         if (o->type != DCB_OUTPUT_DP || o->location || !d->dp[pos].sink) continue;
         int lit_sor = -1;
         for (int s = 0; s < NV_MAX_SORS; s++) if (ms->sor_arm[s] == (uint32_t)pos + 1) lit_sor = s;
@@ -1531,7 +1531,7 @@ int nv_modeset(struct nv_device *d, const struct nv_modeset_opts *opts)
         return fail(d, NV_ERR_NODEV, "display, VBIOS, AUX or VRAM missing");
     ms->crystal_khz = crystal_khz(d);
     nv_log("nvdisp: %s, crystal %u kHz, VRAM %lu MiB, DP table version %02x, max mode %dx%d%s\n", d->chip_name,
-           ms->crystal_khz, (unsigned long)(d->vram_bytes >> 20), nvbios_dp_version(&d->bios),
+           ms->crystal_khz, (unsigned long)(d->vram_bytes >> 20), kvbios_dp_version(&d->bios),
            X.opts.max_width, X.opts.max_height, X.opts.takeover ? ", takeover" : "");
 
     for (int s = 0; s < NV_MAX_SORS; s++) if (d->sor_mask & (1u << s)) ior_state(d, s, false, &X.sor_armst[s]);

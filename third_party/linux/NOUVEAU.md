@@ -7,7 +7,7 @@ LEDs, the backlight, SVM or the Tegra platform driver
 (`linuxkpi/nouveau/files.mk` lists the `.c` files), plus what it needs on top
 of phase 2's DRM core:
 - the DisplayPort, DSC, HDMI and SCDC helpers (`drivers/gpu/drm/display/`);
-- the GPU scheduler, `drm_exec` and `drm_gpuvm`;
+- the GPU scheduler, `drm_exec`, `drm_gpuvm` and `drm_encoder_slave` (the I2C TV encoders of NV04-era cards);
 - `i2c-algo-bit` and the maple tree (GPL-2.0-or-later).
 
 ## Licenses
@@ -90,6 +90,7 @@ The headers written in the KPI:
 | `drivers/gpu/drm/display/drm_hdmi_helper.c` | MIT | `bac4c2b4369f2001edafce341dd4097176aae53a6a50b5c57a1dd2bb265d6c40` |
 | `drivers/gpu/drm/display/drm_scdc_helper.c` | MIT (license text) | `0bf5ad4449b95e6c5b75b2714bcb5e947b47df2f7ea0f0e52be378c75e5423a1` |
 | `drivers/gpu/drm/display/drm_dp_helper_internal.h` | MIT | `caf04f4863f2688450bd613b8f0526e4d498f80ef39904ae99e34a654bd28fa3` |
+| `drivers/gpu/drm/drm_encoder_slave.c` | MIT (license text) | `d5d0ea8c7ba80fa25e347a3d35a9cacd40b665eb338ddc9c409e9c7dcd7307e3` |
 | `drivers/gpu/drm/drm_exec.c` | GPL-2.0 OR MIT | `d9f8216b0584c4d53d8ee388a6d9eef77afe02135698ed9bd7db42c68c46d5e4` |
 | `drivers/gpu/drm/drm_gpuvm.c` | GPL-2.0-only OR MIT | `3283fa63bd5cbff93b5fec8af28b2a0f4fc0703db388cff539cd9319c04eb2a9` |
 | `drivers/gpu/drm/scheduler/sched_main.c` | MIT (license text) | `fa3e62b76a545f8f34d9318fd679311e3a50b90adef667d503a95733f8ae6c13` |

@@ -202,6 +202,8 @@ static inline void i2c_del_driver(struct i2c_driver *driver) { }
 static inline struct i2c_client *i2c_new_client_device(struct i2c_adapter *adap, struct i2c_board_info const *info)
 { return ERR_PTR(-ENODEV); }
 static inline void i2c_unregister_device(struct i2c_client *client) { }
+static inline bool i2c_client_has_driver(struct i2c_client *client)
+{ return !IS_ERR_OR_NULL(client) && client->dev.driver; }
 
 static inline int i2c_master_send(const struct i2c_client *client, const char *buf, int count)
 { return i2c_transfer_buffer_flags(client, (char *)buf, count, 0); }

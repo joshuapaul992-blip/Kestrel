@@ -179,8 +179,8 @@ static uint32_t shadow(struct nv_device *d, const struct source *s, uint8_t *buf
         uint32_t want = base + 0x1000;
         if (want > NV_BIOS_MAX) break;
         if (want > have) { if (s->read(d, buf, have, want - have) != want - have) break; have = want; }
-        struct nvbios_image im;
-        if (!nvbios_image_header(buf, have, base, &im)) break;
+        struct kvbios_image im;
+        if (!kvbios_image_header(buf, have, base, &im)) break;
         want = (base + im.size + 3) & ~3u;
         if (want > NV_BIOS_MAX) break;
         if (want > have) { if (s->read(d, buf, have, want - have) != want - have) break; have = want; }
@@ -203,7 +203,7 @@ static void read_vbios(struct nv_device *d)
         uint32_t size = shadow(d, s, cand);
         s->fini(d);
         int score = 0;
-        int n = size ? nvbios_images(cand, size, (struct nvbios_image[NVBIOS_MAX_IMAGES]){0}, NVBIOS_MAX_IMAGES, &score) : 0;
+        int n = size ? kvbios_images(cand, size, (struct kvbios_image[NVBIOS_MAX_IMAGES]){0}, NVBIOS_MAX_IMAGES, &score) : 0;
         nvlog("nvidia: VBIOS from %s: %u bytes, %d image(s), score %d\n", s->name, size, n, score);
         if (n && score > d->bios_score) {                       /* keep the best, as nouveau does */
             uint8_t *t = d->bios_data;
@@ -216,7 +216,7 @@ static void read_vbios(struct nv_device *d)
         }
     }
     if (cand && cand != d->bios_data && P->free) P->free(cand, NV_BIOS_MAX);
-    if (d->bios_data) d->bios_ok = nvbios_parse(&d->bios, d->bios_data, d->bios_size);
+    if (d->bios_data) d->bios_ok = kvbios_parse(&d->bios, d->bios_data, d->bios_size);
 }
 
 /* ======================================================================== */
@@ -366,10 +366,10 @@ int nv_aux_i2c_read(struct nv_device *d, int ch, uint8_t i2c, uint8_t offset, ui
 static void probe_dp(struct nv_device *d)
 {
     for (int i = 0; i < d->bios.noutputs; i++) {
-        const struct nvbios_output *o = &d->bios.output[i];
+        const struct kvbios_output *o = &d->bios.output[i];
         struct nv_dp_probe *p = &d->dp[i];
         if (o->type != DCB_OUTPUT_DP || o->location != 0 || o->i2c_index >= d->bios.ni2c) continue;
-        const struct nvbios_i2c *c = &d->bios.i2c[o->i2c_index];
+        const struct kvbios_i2c *c = &d->bios.i2c[o->i2c_index];
         if (c->auxch == DCB_I2C_UNUSED) continue;
         p->probed = true;
         p->aux = c->auxch;
@@ -440,7 +440,7 @@ static void read_display_state(struct nv_device *d)
     /* gm200_sor_route_get: which SOR each DCB output is routed to */
     if (d->chipset >= 0x120)
         for (int i = 0; i < d->bios.noutputs; i++) {
-            const struct nvbios_output *o = &d->bios.output[i];
+            const struct kvbios_output *o = &d->bios.output[i];
             if (!o->or || o->location) continue;
             int orbit = 0;
             while (!(o->or & (1u << orbit))) orbit++;
@@ -573,11 +573,11 @@ size_t nv_report(const struct nv_device *d, char *buf, size_t cap)
 
     nv_sb_printf(&b, "\nConnectors\n");
     for (int i = 0; i < v->nconns; i++)
-        nv_sb_printf(&b, "  %d: %-12s type %02x, location %u, hpd %02x, dp %02x\n", i, nvbios_conn_type_name(v->conn[i].type),
+        nv_sb_printf(&b, "  %d: %-12s type %02x, location %u, hpd %02x, dp %02x\n", i, kvbios_conn_type_name(v->conn[i].type),
                   v->conn[i].type, v->conn[i].location, v->conn[i].hpd, v->conn[i].dp);
     nv_sb_printf(&b, "\nI2C / AUX ports\n");
     for (int i = 0; i < v->ni2c; i++) {
-        const struct nvbios_i2c *c = &v->i2c[i];
+        const struct kvbios_i2c *c = &v->i2c[i];
         if (c->type == DCB_I2C_UNUSED) { nv_sb_printf(&b, "  %d: unused\n", i); continue; }
         nv_sb_printf(&b, "  %d: type %02x, i2c port %d, aux channel %d, pad %d\n", i, c->type,
                   c->drive == 0xff ? -1 : c->drive, c->auxch == 0xff ? -1 : c->auxch, c->share == 0xff ? -1 : c->share);
@@ -585,10 +585,10 @@ size_t nv_report(const struct nv_device *d, char *buf, size_t cap)
 
     nv_sb_printf(&b, "\nOutputs (DCB) and what is attached\n");
     for (int i = 0; i < v->noutputs; i++) {
-        const struct nvbios_output *o = &v->output[i];
+        const struct kvbios_output *o = &v->output[i];
         const struct nv_dp_probe *p = &d->dp[i];
         nv_sb_printf(&b, "  DCB %d: %-6s SOR mask %x, link %x, heads %x, connector %u, i2c %u, location %u  [%08x %08x]\n",
-                  o->index, nvbios_output_type_name(o->type), o->or, o->link, o->heads, o->connector, o->i2c_index,
+                  o->index, kvbios_output_type_name(o->type), o->or, o->link, o->heads, o->connector, o->i2c_index,
                   o->location, o->raw_conn, o->raw_conf);
         if (o->type == DCB_OUTPUT_DP)
             nv_sb_printf(&b, "         board limit %u lanes x %u.%02u Gbps\n", o->dp_link_nr, o->dp_link_bw * 27 / 100, o->dp_link_bw * 27 % 100);

@@ -37,9 +37,9 @@ static void ilog(struct nvinit *init, const char *what, const char *f, ...)
 #define warn(...)  do { init->warnings++; ilog(init, "warn", __VA_ARGS__); } while (0)
 #define error(...) do { init->warnings++; ilog(init, "ERROR", __VA_ARGS__); } while (0)
 
-#define B08(a) nvbios_rd08(init->bios, (a))
-#define B16(a) nvbios_rd16(init->bios, (a))
-#define B32(a) nvbios_rd32(init->bios, (a))
+#define B08(a) kvbios_rd08(init->bios, (a))
+#define B16(a) kvbios_rd16(init->bios, (a))
+#define B32(a) kvbios_rd32(init->bios, (a))
 
 /* ---- control flow helpers --------------------------------------------------------- */
 static inline bool init_exec(struct nvinit *init) { return (init->execute == 1) || ((init->execute & 5) == 5); }
@@ -197,7 +197,7 @@ static void init_delay_us(struct nvinit *init, uint32_t us)
 static uint32_t init_table_(struct nvinit *init, uint16_t offset, const char *name)
 {
     uint8_t ver; uint16_t off, len;
-    if (!nvbios_bit_entry(init->bios, 'I', &ver, &off, &len)) { warn("init data not found"); return 0; }
+    if (!kvbios_bit_entry(init->bios, 'I', &ver, &off, &len)) { warn("init data not found"); return 0; }
     if (len < offset + 2) { warn("init data too short for %s pointer", name); return 0; }
     uint32_t data = B16(off + offset);
     if (!data) warn("%s pointer invalid", name);
@@ -213,7 +213,7 @@ static uint32_t init_table_(struct nvinit *init, uint16_t offset, const char *na
 static uint8_t init_ram_restrict_group_count(struct nvinit *init)
 {
     uint8_t ver; uint16_t off, len;
-    if (nvbios_bit_entry(init->bios, 'M', &ver, &off, &len)) {
+    if (kvbios_bit_entry(init->bios, 'M', &ver, &off, &len)) {
         if (ver == 1 && len >= 5) return B08(off + 2);
         if (ver == 2 && len >= 3) return B08(off + 0);
     }
@@ -225,7 +225,7 @@ static uint8_t init_ram_restrict(struct nvinit *init)
     if (!init->ramcfg || init->bios->version[0] < 0x70) {
         uint8_t strap = (uint8_t)((init->ops->rd32(init->ops->ctx, 0x101000) & 0x3c) >> 2);
         uint8_t ver; uint16_t off, len; uint32_t xlat = 0;
-        if (nvbios_bit_entry(init->bios, 'M', &ver, &off, &len)) {
+        if (kvbios_bit_entry(init->bios, 'M', &ver, &off, &len)) {
             if (ver == 1 && len >= 5) xlat = B16(off + 3);
             if (ver == 2 && len >= 3) xlat = B16(off + 1);
         }
@@ -395,8 +395,8 @@ static void init_generic_condition(struct nvinit *init)
         if (init_conn(init) != DCB_CONNECTOR_eDP) init_exec_set(init, false);
         break;
     case 1: case 2: {                               /* CONDITION_ID_USE_SPPLL0/1 */
-        struct nvbios_dpout info;
-        if (init->outp && nvbios_dpout_match(init->bios, DCB_OUTPUT_DP,
+        struct kvbios_dpout info;
+        if (init->outp && kvbios_dpout_match(init->bios, DCB_OUTPUT_DP,
                                              (uint16_t)(init->outp->or | init->outp->link << 6), &info)) {
             if (!(info.flags & cond)) init_exec_set(init, false);
             break;
@@ -1010,7 +1010,7 @@ static const opfn init_opcode[256] = {
     [0xaa] = init_reserved,
 };
 
-/* nouveau nvbios_exec(), plus a runaway guard (a corrupt or misparsed
+/* nouveau kvbios_exec(), plus a runaway guard (a corrupt or misparsed
  * script must not hang the boot). */
 static int nvinit_exec(struct nvinit *init)
 {
@@ -1027,7 +1027,7 @@ static int nvinit_exec(struct nvinit *init)
 }
 
 int nvinit_run(const struct nvbios *bios, const struct nvinit_ops *ops, uint32_t offset,
-               const struct nvbios_output *outp, int or, int link, int head, bool trace,
+               const struct kvbios_output *outp, int or, int link, int head, bool trace,
                struct nvinit *stats_out)
 {
     struct nvinit init = {
