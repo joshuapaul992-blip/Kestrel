@@ -36,6 +36,7 @@ void lkpi_deferred_probe_flush(void);
 
 /* pci.c, irq.c */
 void lkpi_pci_core_init(void);
+void lkpi_drm_core_init(void);          /* drm.c */
 void lkpi_pci_irq_setup(struct pci_dev *pdev);      /* at enable: a lazy irq for the device */
 void lkpi_pci_irq_release(struct pci_dev *pdev);    /* at unbind: vectors back            */
 

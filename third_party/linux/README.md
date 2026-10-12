@@ -102,6 +102,7 @@ calls.
 | `drivers/gpu/drm/drm_modes.c` | MIT (license text) | `bbd8079eebc846aefb3c9f54f47d1162f96f85d1f2413ab4aca596b4fb8b9d97` |
 | `drivers/gpu/drm/drm_modeset_helper.c` | MIT (license text) | `42bb13e3676007e55b491fd0684c7aafdc53609e2e63aeca89dcb33455bccaad` |
 | `drivers/gpu/drm/drm_modeset_lock.c` | MIT (license text) | `035a917a1c58a8c28531fbc54c53106ab9142c217ca33f6134ed5dc340329d19` |
+| `drivers/gpu/drm/drm_pci.c` | MIT (license text) | `779cacbd450668361747399b2fba5518629d809b707e38f725276c2043c97386` |
 | `drivers/gpu/drm/drm_plane.c` | MIT (license text) | `abab950b95dff48c1b546976277b4d56477d26f3283a4b573d4074d7d1e33ebb` |
 | `drivers/gpu/drm/drm_plane_helper.c` | MIT (license text) | `4e89ec927bfe7d10a804c613239a7b59fd5339dcfcddcf5a2a58cac8c3d6d88d` |
 | `drivers/gpu/drm/drm_print.c` | MIT (license text) | `4f276252940216bf8baaa939f32ef296d3c561d9b4a44194f9280d9a8e7d699a` |

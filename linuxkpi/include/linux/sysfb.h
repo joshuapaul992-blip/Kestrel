@@ -4,6 +4,8 @@
 
 #include <linux/types.h>
 
+struct device;
+
 void sysfb_disable(struct device *dev);
 
 #endif

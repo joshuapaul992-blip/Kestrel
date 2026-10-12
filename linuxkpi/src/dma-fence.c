@@ -8,6 +8,7 @@
 #include <linux/atomic.h>
 #include <linux/seq_file.h>
 #include <linux/export.h>
+#include <linux/kernel.h>
 
 static atomic64_t dma_fence_context_counter = ATOMIC64_INIT(1);
 

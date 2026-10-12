@@ -12,6 +12,7 @@
 #include <linux/wait.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
+#include <linux/kernel.h>
 
 /* should ctx back off rather than wait for lock? (read without the lock: a
  * stale answer only means one more pass round the loop) */
@@ -78,4 +79,55 @@ void ww_mutex_unlock(struct ww_mutex *lock)
     mutex_unlock(&lock->base);
     /* waiters that hold other locks re-check whether they must back off */
     if (waitqueue_active(&lock->base.wait)) wake_up_all(&lock->base.wait);
+}
+
+/* ---- sleepable RCU (include/linux/srcu.h) --------------------------------------------- */
+#include <linux/srcu.h>
+
+int init_srcu_struct(struct srcu_struct *ssp)
+{
+    atomic_set(&ssp->readers[0], 0);
+    atomic_set(&ssp->readers[1], 0);
+    ssp->idx = 0;
+    mutex_init(&ssp->sync);
+    init_waitqueue_head(&ssp->wait);
+    return 0;
+}
+
+void cleanup_srcu_struct(struct srcu_struct *ssp) { }
+
+int srcu_read_lock(struct srcu_struct *ssp)
+{
+    int idx;
+    for (;;) {
+        idx = READ_ONCE(ssp->idx) & 1;
+        atomic_inc(&ssp->readers[idx]);
+        smp_mb();
+        if ((READ_ONCE(ssp->idx) & 1) == idx) return idx;
+        /* the phase flipped under us: count ourselves in the new one */
+        if (atomic_dec_and_test(&ssp->readers[idx])) wake_up_all(&ssp->wait);
+    }
+}
+
+void srcu_read_unlock(struct srcu_struct *ssp, int idx)
+{
+    smp_mb();
+    if (atomic_dec_and_test(&ssp->readers[idx]) && waitqueue_active(&ssp->wait)) wake_up_all(&ssp->wait);
+}
+
+static void srcu_flip_and_drain(struct srcu_struct *ssp)
+{
+    int old = ssp->idx & 1;
+    WRITE_ONCE(ssp->idx, ssp->idx + 1);
+    smp_mb();
+    wait_event(ssp->wait, atomic_read(&ssp->readers[old]) == 0);
+}
+
+void synchronize_srcu(struct srcu_struct *ssp)
+{
+    might_sleep();
+    mutex_lock(&ssp->sync);
+    srcu_flip_and_drain(ssp);
+    srcu_flip_and_drain(ssp);
+    mutex_unlock(&ssp->sync);
 }

@@ -180,3 +180,37 @@ void kthread_complete_and_exit(struct completion *c, long result)
     if (c) complete(c);
     kthread_exit(result);
 }
+
+/* ---- kthread workers (linux/kthread.h): an ordered workqueue each ----------------------- */
+#include <linux/workqueue.h>
+#include <linux/stdarg.h>
+
+void lkpi_kthread_work_fn(struct work_struct *ws)
+{
+    struct kthread_work *work = container_of(ws, struct kthread_work, ws);
+    work->func(work);
+}
+
+struct kthread_worker *kthread_create_worker(unsigned int flags, const char namefmt[], ...)
+{
+    struct kthread_worker *worker = kzalloc(sizeof(*worker), GFP_KERNEL);
+    char name[32];
+    va_list ap;
+
+    if (!worker) return ERR_PTR(-ENOMEM);
+    va_start(ap, namefmt);
+    vsnprintf(name, sizeof(name), namefmt, ap);
+    va_end(ap);
+    worker->wq = alloc_ordered_workqueue("%s", 0, name);
+    if (!worker->wq) {
+        kfree(worker);
+        return ERR_PTR(-ENOMEM);
+    }
+    return worker;
+}
+
+void kthread_destroy_worker(struct kthread_worker *worker)
+{
+    destroy_workqueue(worker->wq);
+    kfree(worker);
+}

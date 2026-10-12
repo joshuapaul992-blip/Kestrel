@@ -24,6 +24,9 @@
 #include <linux/gfp_types.h>
 
 struct module;
+struct dentry;
+struct seq_file;
+struct super_block;
 struct vm_area_struct;
 struct cdev;
 

@@ -69,4 +69,10 @@ void si_meminfo(struct sysinfo *val);
 #define KHZ2PICOS(a)            (1000000000UL / (a))
 #define PICOS2KHZ(a)            (1000000000UL / (a))
 
+/* structures Linux headers name in prototypes before any header defines them */
+struct dentry;
+struct inode;
+struct file;
+struct seq_file;
+
 #endif

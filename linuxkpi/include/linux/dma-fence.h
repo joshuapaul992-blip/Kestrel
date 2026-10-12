@@ -22,6 +22,7 @@
 #include <linux/err.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
+#include <linux/wordpart.h>
 
 struct dma_fence;
 struct dma_fence_ops;

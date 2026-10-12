@@ -100,7 +100,8 @@ LKPI_SRC := linuxkpi/src/printk.c linuxkpi/src/vsprintf.c linuxkpi/src/lib.c lin
             linuxkpi/src/workqueue.c linuxkpi/src/irq.c linuxkpi/src/device.c linuxkpi/src/pci.c \
             linuxkpi/src/dma.c linuxkpi/src/io.c linuxkpi/src/firmware.c linuxkpi/src/notifier.c \
             linuxkpi/src/chardev.c linuxkpi/src/watchdog.c linuxkpi/src/idr.c linuxkpi/src/module.c \
-            linuxkpi/src/selftest.c
+            linuxkpi/src/selftest.c linuxkpi/src/ww_mutex.c linuxkpi/src/dma-fence.c \
+            linuxkpi/src/sort.c
 LKPI_DRV_SRC := third_party/linux/drivers/misc/pvpanic/pvpanic.c \
                 third_party/linux/drivers/misc/pvpanic/pvpanic-pci.c \
                 third_party/linux/drivers/watchdog/i6300esb.c
@@ -113,23 +114,32 @@ LKPI_CFLAGS := $(filter-out -I% -W% -MMD -MP,$(CFLAGS)) -nostdinc -D__KERNEL__ \
                -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -MMD -MP
 
 # Phase 2 (DRM through the KPI): the vendored DRM core, KMS helpers, TTM
-# and bochs, not linked yet. `make lkpi-drm-check` compiles each of them
-# against the KPI and lists what is still missing (third_party/linux/README.md).
+# and bochs (third_party/linux/README.md). bochs comes last so that its
+# initcall runs after drm_core_init. `make lkpi-drm-check` compiles each of
+# them and prints its first error, if any.
 # Linux reaches kernel.h, export.h and slab.h through its deep header graph;
 # the KPI's headers are shallower, so DRM files get them up front.
-LKPI_DRM_SRC := $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c) \
-                $(wildcard third_party/linux/drivers/gpu/drm/ttm/*.c) \
-                third_party/linux/drivers/gpu/drm/tiny/bochs.c \
+LKPI_DRM_SRC := linuxkpi/src/drm.c third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c \
                 third_party/linux/drivers/dma-buf/dma-resv.c \
                 third_party/linux/drivers/video/aperture.c third_party/linux/drivers/video/hdmi.c \
-                third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c)
+                $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c)) \
+                $(sort $(wildcard third_party/linux/drivers/gpu/drm/ttm/*.c)) \
+                third_party/linux/drivers/gpu/drm/tiny/bochs.c
+LKPI_DRM_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_DRM_SRC))
 LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linux/include/uapi \
                    -include linux/kernel.h -include linux/export.h -include linux/slab.h \
                    -Werror=implicit-function-declaration -Werror=implicit-int -Werror=int-conversion \
-                   -Werror=incompatible-pointer-types -Werror=return-type
+                   -Werror=incompatible-pointer-types -Werror=return-type \
+                   -Wno-pointer-sign -Wno-type-limits -Wno-maybe-uninitialized -Wno-unused-but-set-variable
+# Files that define pr_fmt before their includes get the same definition on
+# the command line, since the force-included headers would define it first.
+lkpi_drm_prfmt = $(if $(filter %/ttm_device.c,$(1)),-D'pr_fmt(fmt)="[TTM DEVICE] " fmt',$(if \
+                 $(filter %/ttm_bo.c %/ttm_tt.c %/ttm_bo_vm.c,$(1)),-D'pr_fmt(fmt)="[TTM] " fmt'))
+# KBUILD_MODNAME as Linux's modules: drm, ttm, bochs; the library files by name
+lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1)))))))
 
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC)) \
-          $(LKPI_OBJS) $(LKPI_DRV_OBJS)
+          $(LKPI_OBJS) $(LKPI_DRV_OBJS) $(LKPI_DRM_OBJS)
 KERNEL := $(BUILD)/kernel.elf
 ISO    := $(BUILD)/kestrel.iso
 FLOPPY := $(BUILD)/kestrel-floppy.img
@@ -176,6 +186,11 @@ lkpi-drm-check:
 	    if out=$$($(CC) $(LKPI_DRM_CFLAGS) -DKBUILD_MODNAME='"drm"' -fsyntax-only $$f 2>&1 | grep -m1 'error'); \
 	    then echo "  FAIL    $$f: $$out"; else echo "  ok      $$f"; fi; \
 	done
+
+$(LKPI_DRM_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC [L]  $<"
+	@$(CC) $(LKPI_DRM_CFLAGS) $(call lkpi_drm_prfmt,$<) -DKBUILD_MODNAME='"$(call lkpi_drm_modname,$<)"' -c $< -o $@
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
