@@ -3,7 +3,8 @@
  * page at once), page faults on several CPUs at once (resolved without the
  * kernel lock), unix sockets used from several CPUs at once (also without
  * the kernel lock), regular files and names in the file tree shared by
- * several CPUs, and the kernel under concurrent system calls.
+ * several CPUs, terminals (ptys) driven from several CPUs, and the kernel
+ * under concurrent system calls.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -26,6 +27,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -786,6 +789,177 @@ static int path_round(const char *dir)
     return bad + pr_errors;
 }
 
+/* ---- terminals: ptys from several CPUs -------------------------------------------- */
+#define TT_PAIRS 2
+#define TT_BYTES (256 * 1024)
+static volatile int tt_errors, tt_stop;
+static const char *volatile tt_why;
+static void tt_fail(const char *why) { if (!tt_errors++) tt_why = why; }
+static int tt_master[TT_PAIRS], tt_slave[TT_PAIRS];
+
+static int tt_open(int *m, int *sl, int raw)
+{
+    *m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (*m < 0 || grantpt(*m) || unlockpt(*m)) return -1;
+    *sl = open(ptsname(*m), O_RDWR | O_NOCTTY);
+    if (*sl < 0) return -1;
+    struct termios t;
+    tcgetattr(*sl, &t);
+    if (raw) cfmakeraw(&t); else t.c_lflag &= ~(tcflag_t)(ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE);
+    return tcsetattr(*sl, TCSANOW, &t);
+}
+
+static unsigned char tt_byte(int pair, int dir, long i) { return (unsigned char)(i * 7 + pair * 31 + dir * 101 + (i >> 9)); }
+
+/* arg: pair * 2 + direction; direction 0 = master to slave, 1 = slave to master */
+static void *tt_writer(void *arg)
+{
+    int k = (int)(intptr_t)arg, pair = k / 2, dir = k % 2;
+    int fd = dir ? tt_slave[pair] : tt_master[pair];
+    unsigned char buf[1000];
+    for (long i = 0; i < TT_BYTES;) {
+        int n = (int)(TT_BYTES - i < (long)sizeof buf ? TT_BYTES - i : (long)sizeof buf);
+        n = 1 + (int)((i / 3) % (unsigned)n);                   /* writes of every size */
+        for (int j = 0; j < n; j++) buf[j] = tt_byte(pair, dir, i + j);
+        ssize_t w = write(fd, buf, (size_t)n);
+        if (w <= 0) { tt_fail("write"); return NULL; }
+        i += w;
+    }
+    return NULL;
+}
+
+static void *tt_reader(void *arg)
+{
+    int k = (int)(intptr_t)arg, pair = k / 2, dir = k % 2;
+    int fd = dir ? tt_master[pair] : tt_slave[pair];
+    unsigned char buf[4096];
+    for (long i = 0; i < TT_BYTES;) {
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, 10000) != 1) { tt_fail("poll: no data for 10 s"); return NULL; }
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r <= 0) { tt_fail("read"); return NULL; }
+        for (ssize_t j = 0; j < r; j++)
+            if (buf[j] != tt_byte(pair, dir, i + j)) { tt_fail("bytes out of order or changed"); return NULL; }
+        i += r;
+    }
+    return NULL;
+}
+
+/* settings, window size and bytes waiting, on both sides, while data flows */
+static void *tt_ioctls(void *arg)
+{
+    (void)arg;
+    for (int i = 0; !tt_stop; i++) {
+        int pair = i % TT_PAIRS, fd = i & 2 ? tt_master[pair] : tt_slave[pair], q;
+        struct termios t;
+        struct winsize ws;
+        if (tcgetattr(fd, &t) || (t.c_lflag & ICANON)) { tt_fail("tcgetattr"); break; }
+        if (tcsetattr(tt_slave[pair], TCSANOW, &t)) { tt_fail("tcsetattr"); break; }
+        if (ioctl(fd, TIOCGWINSZ, &ws)) { tt_fail("TIOCGWINSZ"); break; }
+        ws.ws_row = (unsigned short)(24 + i % 5);
+        if (ioctl(fd, TIOCSWINSZ, &ws)) { tt_fail("TIOCSWINSZ"); break; }
+        if (ioctl(fd, FIONREAD, &q) || q < 0 || q > 16384) { tt_fail("FIONREAD"); break; }
+    }
+    return NULL;
+}
+
+/* canonical mode: one line per read, in order */
+static void *tt_lines(void *arg)
+{
+    (void)arg;
+    int m, sl;
+    if (tt_open(&m, &sl, 0)) { tt_fail("canonical pty"); return NULL; }
+    char want[32], got[64];
+    for (int i = 0; i < 400; i++) {
+        int n = snprintf(want, sizeof want, "line %d of 400\n", i);
+        if (write(m, want, (size_t)n) != n) { tt_fail("canonical write"); break; }
+        ssize_t r = read(sl, got, sizeof got);
+        if (r != n || memcmp(got, want, (size_t)n)) { tt_fail("canonical read: not one whole line"); break; }
+    }
+    close(sl);
+    close(m);
+    return NULL;
+}
+
+/* open and close pairs, and hang up a slave's reader by closing the master */
+static void *tt_churn(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 150; i++) {
+        int m, sl;
+        if (tt_open(&m, &sl, 1)) { tt_fail("open a pty pair"); if (m >= 0) close(m); return NULL; }
+        if (i % 3 == 0) {
+            pid_t c = fork();
+            if (c == 0) { char b; close(m); _exit(read(sl, &b, 1) == 0 ? 0 : 1); }   /* hung up: EOF */
+            close(sl);
+            struct timespec ts = { 0, 2000000 };
+            nanosleep(&ts, NULL);
+            close(m);
+            int st;
+            if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st)) tt_fail("a blocked slave read did not see the hang-up");
+        } else {
+            close(i & 1 ? m : sl);
+            close(i & 1 ? sl : m);
+        }
+    }
+    return NULL;
+}
+
+/* Ctrl-C typed into the master reaches the slave's foreground process group */
+static int tt_sigint(void)
+{
+    int m, sl, bad = 0;
+    if (tt_open(&m, &sl, 0)) return 1;
+    struct termios t;
+    tcgetattr(sl, &t);
+    t.c_lflag |= ISIG;
+    tcsetattr(sl, TCSANOW, &t);
+    int sync[2];
+    if (pipe(sync)) return 1;
+    pid_t c = fork();
+    if (c == 0) {
+        setsid();
+        if (ioctl(sl, TIOCSCTTY, 0) || tcsetpgrp(sl, getpid())) _exit(2);
+        write(sync[1], "x", 1);
+        for (;;) pause();
+    }
+    char b;
+    if (read(sync[0], &b, 1) != 1) bad++;
+    write(m, "\003", 1);
+    int st;
+    if (waitpid(c, &st, 0) != c || !WIFSIGNALED(st) || WTERMSIG(st) != SIGINT) {
+        printf("  FAIL detail: the session leader was not killed by SIGINT (status %#x)\n", st);
+        bad++;
+    }
+    close(sync[0]); close(sync[1]); close(sl); close(m);
+    return bad;
+}
+
+static int tty_round(void)
+{
+    pthread_t w[TT_PAIRS * 2], r[TT_PAIRS * 2], io, li, ch;
+    tt_errors = 0;
+    tt_stop = 0;
+    for (int i = 0; i < TT_PAIRS; i++)
+        if (tt_open(&tt_master[i], &tt_slave[i], 1)) { printf("  FAIL detail: cannot open a pty pair\n"); return 1; }
+    for (int k = 0; k < TT_PAIRS * 2; k++) {
+        pthread_create(&r[k], NULL, tt_reader, (void *)(intptr_t)k);
+        pthread_create(&w[k], NULL, tt_writer, (void *)(intptr_t)k);
+    }
+    pthread_create(&io, NULL, tt_ioctls, NULL);
+    pthread_create(&li, NULL, tt_lines, NULL);
+    pthread_create(&ch, NULL, tt_churn, NULL);
+    for (int k = 0; k < TT_PAIRS * 2; k++) { pthread_join(w[k], NULL); pthread_join(r[k], NULL); }
+    tt_stop = 1;
+    pthread_join(io, NULL);
+    pthread_join(li, NULL);
+    pthread_join(ch, NULL);
+    for (int i = 0; i < TT_PAIRS; i++) { close(tt_master[i]); close(tt_slave[i]); }
+    int bad = tt_sigint();
+    if (tt_errors) printf("  FAIL detail: %d failure(s); first: %s\n", tt_errors, tt_why);
+    return bad + tt_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -830,6 +1004,13 @@ int main(int argc, char **argv)
             CHECK(path_round("/tmp/smptest.d") == 0, "tmpfs path round");
         }
         printf("smptest paths: %d failure(s)\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "ttys")) {           /* smptest ttys N: only the terminal rounds */
+        setvbuf(stdout, NULL, _IONBF, 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) CHECK(tty_round() == 0, "terminal round");
+        printf("smptest ttys: %d failure(s)\n", failures);
         return failures ? 1 : 0;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -901,6 +1082,11 @@ int main(int argc, char **argv)
           "ext2: 4 threads x 300 create/stat/rename/symlink/readlink/unlink/mkdir/rmdir, listings, /proc and unlinked open files alongside");
     CHECK(path_round("/tmp/smptest.d") == 0,
           "tmpfs: the same");
+
+    printf("terminals from several CPUs:\n");
+    CHECK(tty_round() == 0,
+          "2 ptys x 256 KiB each way checked byte by byte, settings/window size/FIONREAD alongside, "
+          "400 canonical lines, 150 pairs opened and hung up, Ctrl-C to the foreground group");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;
