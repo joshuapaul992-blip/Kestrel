@@ -512,6 +512,7 @@ static int pci_bus_probe(struct device *dev)
         pdev->driver = NULL;
         put_device(dev);
         if (r > 0) r = -EINVAL;                         /* Linux treats positive as failure too */
+        lkpi_display_reclaim(pdev->lkpi_handle);        /* if it had taken the boot display over */
     }
     return r;
 }

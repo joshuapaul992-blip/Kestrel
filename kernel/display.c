@@ -9,8 +9,15 @@
  * A native GPU driver adds its monitors the same way, through
  * display_register(). With linuxkpi.drm=1 the DISPI adapters are left to
  * Linux's bochs driver instead: the Linux KPI registers their heads after
- * boot (linuxkpi/src/drm_client.c), and tty_add_monitor() gives each one a
- * terminal. */
+ * boot (linuxkpi/src/drm_kestrel.c), and tty_add_monitor() gives each one a
+ * terminal.
+ *
+ * linuxkpi.drm=1 also lets a Linux driver take over the adapter behind the
+ * boot frame buffer (nouveau on a primary NVIDIA card, bochs on QEMU's std
+ * VGA). When the driver claims it, display_handover() stops every write to
+ * the old frame buffer: the terminal and the panic screen keep drawing into
+ * RAM. The driver's first monitor then takes monitor 0's place
+ * (display_replace()), so tty1, the system console and /dev/fb0 move to it. */
 #include <kernel/display.h>
 #include <kernel/fb.h>
 #include <kernel/mm.h>
@@ -18,6 +25,7 @@
 #include <kernel/string.h>
 #include <kernel/gpu.h>
 #include <kernel/bootinfo.h>
+#include <kernel/tty.h>
 #include "pci.h"
 #include "edid.h"
 #include "bochs_dispi.h"
@@ -27,6 +35,32 @@
 
 static struct display_head heads[MAX_MONITORS];
 static int nheads;
+static int boot_head = -1;          /* the boot frame buffer's monitor, while it is one */
+static int handed_over = -1;        /* a monitor a Linux driver took over, until it replaces it */
+static const struct pci_device *handed_to;          /* ... the adapter            */
+static struct display_head boot_saved;              /* ... and how it was, for display_reclaim() */
+static struct framebuffer fb_saved;
+
+static bool head_valid(const struct display_head *h)
+{
+    if ((!h->vram && !(h->write_span && h->shadow)) || h->width <= 0 || h->height <= 0 || (h->bytes_pp != 3 && h->bytes_pp != 4) ||
+        h->pitch < h->width * h->bytes_pp) {
+        kprintf("display: %s ignored, bad geometry %dx%d pitch %d\n", h->name, h->width, h->height, h->pitch);
+        return false;
+    }
+    return true;
+}
+
+static void head_store(int index, const struct display_head *h)
+{
+    bool wc = h->vram && h->phys &&                 /* CPU-mapped VRAM: write-combining */
+              vmm_set_write_combining(h->phys, (uint64_t)h->pitch * (uint64_t)h->height);
+    heads[index] = *h;
+    __atomic_thread_fence(__ATOMIC_RELEASE);        /* late heads (Linux DRM drivers) are read by other threads */
+    kprintf("display: monitor %d: %dx%dx%d, pitch %d, VRAM %lx%s%s, %s%s%s%s\n", index, h->width, h->height,
+            h->bytes_pp * 8, h->pitch, h->phys, wc ? " (write-combining)" : "", h->shadow ? " + RAM shadow" : "", h->name,
+            h->monitor[0] ? " (\"" : "", h->monitor, h->monitor[0] ? "\")" : "");
+}
 
 int display_register(const struct display_head *h)
 {
@@ -34,18 +68,8 @@ int display_register(const struct display_head *h)
         kprintf("display: %s ignored, %d monitors already registered\n", h->name, MAX_MONITORS);
         return -1;
     }
-    if ((!h->vram && !(h->write_span && h->shadow)) || h->width <= 0 || h->height <= 0 || (h->bytes_pp != 3 && h->bytes_pp != 4) ||
-        h->pitch < h->width * h->bytes_pp) {
-        kprintf("display: %s ignored, bad geometry %dx%d pitch %d\n", h->name, h->width, h->height, h->pitch);
-        return -1;
-    }
-    bool wc = h->vram && h->phys &&                 /* CPU-mapped VRAM: write-combining */
-              vmm_set_write_combining(h->phys, (uint64_t)h->pitch * (uint64_t)h->height);
-    heads[nheads] = *h;
-    __atomic_thread_fence(__ATOMIC_RELEASE);        /* late heads (Linux DRM drivers) are read by other threads */
-    kprintf("display: monitor %d: %dx%dx%d, pitch %d, VRAM %lx%s%s, %s%s%s%s\n", nheads, h->width, h->height,
-            h->bytes_pp * 8, h->pitch, h->phys, wc ? " (write-combining)" : "", h->shadow ? " + RAM shadow" : "", h->name,
-            h->monitor[0] ? " (\"" : "", h->monitor, h->monitor[0] ? "\")" : "");
+    if (!head_valid(h)) return -1;
+    head_store(nheads, h);
     return nheads++;
 }
 
@@ -58,27 +82,138 @@ const struct display_head *display_get(int index)
 
 /* The head whose frame buffer lies in one of the device's memory BARs: that
  * adapter is driven here, so the Linux KPI does not offer it to its drivers. */
-const char *display_pci_owner(const struct pci_device *dev)
+static bool in_mem_bar(const struct pci_device *dev, uint64_t phys)
 {
-    for (int i = 0; i < nheads; i++) {
-        if (!heads[i].phys) continue;
-        for (int b = 0; b < dev->bar_count && b < 6; b++) {
-            const struct pci_bar *bar = &dev->bars[b];
-            if ((bar->kind == PCI_BAR_MEM32 || bar->kind == PCI_BAR_MEM64) && bar->size &&
-                heads[i].phys >= bar->base && heads[i].phys < bar->base + bar->size)
-                return heads[i].name;
-        }
+    for (int b = 0; b < dev->bar_count && b < 6; b++) {
+        const struct pci_bar *bar = &dev->bars[b];
+        if ((bar->kind == PCI_BAR_MEM32 || bar->kind == PCI_BAR_MEM64) && bar->size &&
+            phys >= bar->base && phys < bar->base + bar->size)
+            return true;
     }
-    return NULL;
+    return false;
 }
 
-/* linuxkpi.drm=1: secondary adapters are left to Linux DRM drivers */
+/* linuxkpi.drm=1: secondary adapters, and the boot adapter, are left to
+ * Linux DRM drivers */
 static bool linux_drm_wanted(void)
 {
     const char *o = strstr(g_boot.cmdline, "linuxkpi.drm");
     if (!o || (o != g_boot.cmdline && o[-1] != ' ')) return false;
     o += 12;
     return !*o || *o == ' ' || (*o == '=' && (o[1] == '1' || o[1] == 'y' || o[1] == 'Y'));
+}
+
+/* The firmware's frame buffer is not Kestrel driving the adapter: with
+ * linuxkpi.drm=1 a Linux driver may take it over (display_handover()). */
+const char *display_pci_owner(const struct pci_device *dev)
+{
+    for (int i = 0; i < nheads; i++) {
+        if (!heads[i].phys || (i == boot_head && linux_drm_wanted())) continue;
+        if (in_mem_bar(dev, heads[i].phys)) return heads[i].name;
+    }
+    return NULL;
+}
+
+/* A Linux driver claims `dev`. If the boot frame buffer lives in one of its
+ * BARs, nothing may write there any more (the driver is about to reprogram
+ * the card, and the old frame buffer's VRAM gets other uses): the terminal
+ * and the panic screen draw into RAM until display_replace(). Returns the
+ * monitor given up, or -1. */
+int display_handover(const struct pci_device *dev)
+{
+    if (boot_head < 0 || !in_mem_bar(dev, heads[boot_head].phys)) return -1;
+    int i = boot_head;
+    uint64_t size = (uint64_t)g_fb.pitch * g_fb.height;
+    void *ram = g_fb.double_buffered ? g_fb.back : (void *)(uintptr_t)pmm_alloc_contig((size + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (!ram) {
+        kprintf("display: no memory to give up monitor %d\n", i);
+        return -1;
+    }
+    if (!g_fb.double_buffered) memcpy(ram, g_fb.front, size);
+    if (tty_detach_monitor(i, ram) < 0) {
+        kprintf("display: the terminal on monitor %d is busy, not giving it up\n", i);
+        if (!g_fb.double_buffered) pmm_free_contig((uint64_t)(uintptr_t)ram, (size + PAGE_SIZE - 1) / PAGE_SIZE);
+        return -1;
+    }
+    boot_saved = heads[i];
+    fb_saved = g_fb;
+    g_fb.front = g_fb.back = ram;               /* the panic screen too */
+    g_fb.double_buffered = false;
+    heads[i].vram = NULL;
+    heads[i].shadow = ram;
+    heads[i].phys = 0;
+    boot_head = -1;
+    handed_over = i;
+    handed_to = dev;
+    kprintf("display: %02x:%02x.%x taken over by a Linux driver; monitor %d waits for its first monitor\n",
+            dev->bus, dev->device, dev->function, i);
+    return i;
+}
+
+bool display_handover_pending(void) { return __atomic_load_n(&handed_over, __ATOMIC_ACQUIRE) >= 0; }
+
+/* The driver that took the boot adapter over failed to probe: draw on the
+ * boot frame buffer again. It is the best there is, though the driver may
+ * have reprogrammed the card before giving up. Returns the monitor, or -1. */
+int display_reclaim(const struct pci_device *dev)
+{
+    int i = handed_over;
+    if (i < 0 || dev != handed_to) return -1;
+    void *ram = heads[i].shadow;
+    handed_over = -1;
+    boot_saved.shadow = ram;                    /* a RAM copy now, if it had none */
+    head_store(i, &boot_saved);
+    boot_head = i;
+    if (tty_replace_monitor(i) < 0) {
+        kprintf("display: monitor %d has no terminal any more\n", i);
+        return i;
+    }
+    g_fb = fb_saved;
+    g_fb.double_buffered = false;
+    g_fb.back = ram;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    g_fb.double_buffered = true;
+    kprintf("display: %02x:%02x.%x given back, monitor %d is the boot frame buffer again\n",
+            dev->bus, dev->device, dev->function, i);
+    return i;
+}
+
+/* The first monitor a driver lights after display_handover() takes the
+ * place of the monitor given up, with its terminal (tty_replace_monitor()).
+ * When the new frame buffer is CPU-mapped VRAM with a RAM shadow, the panic
+ * screen moves to it too and the old RAM copy is freed. Returns that monitor
+ * number, or -1 when nothing is waiting to be replaced. */
+int display_replace(const struct display_head *h)
+{
+    int i = handed_over;
+    if (i < 0 || !head_valid(h)) return -1;
+    handed_over = -1;
+    uint8_t *old = (uint8_t *)heads[i].shadow;
+    uint64_t old_frames = ((uint64_t)heads[i].pitch * (uint64_t)heads[i].height + PAGE_SIZE - 1) / PAGE_SIZE;
+    head_store(i, h);
+    if (tty_replace_monitor(i) < 0) {
+        kprintf("display: monitor %d has no terminal any more\n", i);
+        return i;                               /* the old copy may still be drawn into */
+    }
+    if (h->vram && h->shadow && h->bytes_pp == 4) {
+        g_fb.double_buffered = false;           /* the panic screen: see fb.h */
+        g_fb.phys = h->phys;
+        g_fb.front = (uint8_t *)h->vram;
+        g_fb.back = (uint8_t *)h->shadow;
+        g_fb.width = (uint32_t)h->width; g_fb.height = (uint32_t)h->height; g_fb.pitch = (uint32_t)h->pitch;
+        g_fb.bpp = 32; g_fb.bytes_pp = 4;
+        g_fb.r_pos = h->r_pos; g_fb.g_pos = h->g_pos; g_fb.b_pos = h->b_pos;
+        g_fb.r_size = g_fb.g_size = g_fb.b_size = 8;
+        const char *sp = strchr(h->name, ' ');         /* "nouveau 0000:01:00.0" -> "nouveaudrmfb", as Linux */
+        size_t n = sp ? (size_t)(sp - h->name) : strlen(h->name);
+        if (n > sizeof g_fb.driver - 6) n = sizeof g_fb.driver - 6;
+        memcpy(g_fb.driver, h->name, n);
+        strlcpy(g_fb.driver + n, "drmfb", sizeof g_fb.driver - n);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        g_fb.double_buffered = true;
+        if (old != (uint8_t *)h->shadow) pmm_free_contig((uint64_t)(uintptr_t)old, old_frames);
+    }
+    return i;
 }
 
 /* ---- head 0: the boot frame buffer ---------------------------------------- */
@@ -105,7 +240,8 @@ static void probe_boot_fb(void)
         .r_pos  = g_fb.r_pos, .g_pos = g_fb.g_pos, .b_pos = g_fb.b_pos,
     };
     strlcpy(h.name, g_fb.phys ? "boot frame buffer" : "frame buffer", sizeof h.name);
-    display_register(&h);
+    int i = display_register(&h);
+    if (i >= 0 && g_fb.phys) boot_head = i;
 }
 
 /* ---- secondary heads: Bochs/QEMU DISPI adapters --------------------------- */

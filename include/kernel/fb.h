@@ -35,6 +35,7 @@ struct framebuffer {
     uint8_t  r_pos, r_size, g_pos, g_size, b_pos, b_size;
     bool     double_buffered;
     bool     ready;
+    char     driver[32];        /* the driver that took it over (display.c), or "" */
 };
 
 extern struct framebuffer g_fb;

@@ -18,6 +18,12 @@ unsigned long lkpi_ram_total(void);
 unsigned long lkpi_ram_free(void);
 /* Make [phys, phys+size) usable as MMIO: uncached, or write-combining. */
 int           lkpi_map_mmio(unsigned long phys, unsigned long size, int wc);
+/* `n` frames at consecutive kernel addresses (Linux's vmap()); `cache` is
+ * 0 (write-back), 0x08 (write-combining) or 0x18 (uncached). NULL on
+ * failure. lkpi_vunmap() takes exactly the address returned. */
+void         *lkpi_vmap(const unsigned long *frames, unsigned long n, unsigned long cache);
+void          lkpi_vunmap(const void *addr);
+unsigned long lkpi_vmap_phys(const void *addr);              /* 0 if not a vmap address */
 
 /* ---- time ---------------------------------------------------------------- */
 unsigned long long lkpi_time_ns(void);                     /* monotonic, since boot          */
@@ -107,6 +113,13 @@ struct lkpi_display {
     const char    *monitor;                 /* EDID monitor name, or ""          */
 };
 int           lkpi_display_add(const struct lkpi_display *d);
+/* A Linux driver claims the adapter `handle` (sysfb_disable()): if Kestrel's
+ * boot frame buffer is on it, Kestrel stops drawing there, and the driver's
+ * first lkpi_display_add() takes that monitor's place. Returns the monitor
+ * given up, or -1. */
+int           lkpi_display_handover(void *handle);
+/* ... and its driver failed to probe: Kestrel draws on the boot frame buffer again. */
+void          lkpi_display_reclaim(void *handle);
 
 /* ---- files and device nodes ---------------------------------------------- */
 /* The whole file at `path` in a buffer from lkpi_heap_alloc: its size, or

@@ -47,6 +47,18 @@ const struct display_head *display_get(int index);
 struct pci_device;
 const char *display_pci_owner(const struct pci_device *dev);
 
+/* linuxkpi.drm=1: a Linux driver takes over the adapter behind the boot
+ * frame buffer. display_handover() stops all writes to its VRAM (returns
+ * the monitor given up, or -1 if the boot frame buffer is not on `dev`);
+ * the driver's first monitor then takes that monitor's place and terminal
+ * through display_replace() (returns its number, or -1 if nothing waits). */
+int display_handover(const struct pci_device *dev);
+int display_replace(const struct display_head *head);
+/* The driver failed after display_handover(): the boot frame buffer is
+ * monitor `index` again. Returns it, or -1 if `dev` was not handed over. */
+int display_reclaim(const struct pci_device *dev);
+bool display_handover_pending(void);     /* a monitor waits for display_replace() */
+
 /* Boot: head 0 from the boot frame buffer (g_fb), then every secondary
  * display adapter a driver knows how to program. Call after pci_init(). */
 void display_probe(void);

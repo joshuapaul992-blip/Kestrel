@@ -10,6 +10,8 @@
 #include <kernel/cpu.h>
 #include <kernel/klog.h>
 #include <kernel/uvm.h>
+#include <kernel/spinlock.h>
+#include <kernel/string.h>
 
 #define PTE_PRESENT 0x001
 #define PTE_WRITE   0x002
@@ -145,6 +147,10 @@ bool vmm_set_guard(uint64_t phys, bool guard)
 bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags)
 {
     uint64_t *pml4 = kpml4();
+    if (phys + size > VMM_VMAP_BASE && phys < VMM_VMAP_BASE + VMM_VMAP_SIZE) {
+        kprintf("vmm: %lx (+%lx) is in the vmap window, not identity-mapped\n", phys, size);
+        return false;
+    }
     uint64_t start = phys & ~0x1FFFFFull;
     uint64_t end = (phys + size + 0x1FFFFF) & ~0x1FFFFFull;
 
@@ -160,4 +166,92 @@ bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags)
         }
     }
     return true;
+}
+
+/* ---- vmap window: scattered frames at consecutive kernel addresses --------
+ * Linux drivers map buffers made of single pages (vmap()). The window is in
+ * the last shared kernel PML4 slot, so every address space sees it; 4 KiB
+ * pages, first fit. `used` marks pages in use and `head` the first page of
+ * each mapping, so vmm_vunmap() needs only the address. */
+#define VMAP_PAGES      (VMM_VMAP_SIZE / PAGE_SIZE)
+static uint64_t vmap_used[VMAP_PAGES / 64], vmap_head[VMAP_PAGES / 64];
+static struct spinlock vmap_lock;
+
+static bool vbit(const uint64_t *map, uint64_t i) { return map[i / 64] >> (i % 64) & 1; }
+static void vset(uint64_t *map, uint64_t i, bool on)
+{
+    if (on) map[i / 64] |= 1ull << (i % 64);
+    else map[i / 64] &= ~(1ull << (i % 64));
+}
+
+static uint64_t *vmap_pte(uint64_t va)
+{
+    uint64_t *pdpt = table_for(kpml4(), (va >> 39) & 511);
+    uint64_t *pd = pdpt ? table_for(pdpt, (va >> 30) & 511) : NULL;
+    uint64_t *pt = pd ? table_for(pd, (va >> 21) & 511) : NULL;
+    return pt ? &pt[(va >> 12) & 511] : NULL;
+}
+
+void *vmm_vmap(const uint64_t *frames, size_t n, uint64_t flags)
+{
+    if (!n || n > VMAP_PAGES) return NULL;
+    uint64_t f = spin_lock_irqsave(&vmap_lock);
+    uint64_t first = 0, run = 0;
+    for (uint64_t i = 0; i < VMAP_PAGES && run < n; i++) {
+        if (vbit(vmap_used, i)) { run = 0; continue; }
+        if (!run) first = i;
+        run++;
+    }
+    if (run < n) {
+        spin_unlock_irqrestore(&vmap_lock, f);
+        kprintf("vmm: vmap window full (%lu pages wanted)\n", (unsigned long)n);
+        return NULL;
+    }
+    for (uint64_t i = first; i < first + n; i++) vset(vmap_used, i, true);
+    vset(vmap_head, first, true);
+    spin_unlock_irqrestore(&vmap_lock, f);
+
+    uint64_t va = VMM_VMAP_BASE + first * PAGE_SIZE;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t *pte = vmap_pte(va + i * PAGE_SIZE);
+        if (!pte) {
+            kprintf("vmm: out of memory for vmap page tables\n");
+            vmm_vunmap((void *)(uintptr_t)va);
+            return NULL;
+        }
+        *pte = (frames[i] & ADDR_MASK) | PTE_PRESENT | (flags & (VMM_WRITE | VMM_PWT | VMM_PCD));
+    }
+    return (void *)(uintptr_t)va;
+}
+
+void vmm_vunmap(void *addr)
+{
+    uint64_t va = (uint64_t)(uintptr_t)addr;
+    if (va < VMM_VMAP_BASE || va >= VMM_VMAP_BASE + VMM_VMAP_SIZE || (va & (PAGE_SIZE - 1))) return;
+    uint64_t first = (va - VMM_VMAP_BASE) / PAGE_SIZE, i = first;
+    uint64_t f = spin_lock_irqsave(&vmap_lock);
+    if (!vbit(vmap_head, first)) {
+        spin_unlock_irqrestore(&vmap_lock, f);
+        kprintf("vmm: vunmap of %lx, which is not a mapping\n", va);
+        return;
+    }
+    spin_unlock_irqrestore(&vmap_lock, f);
+    for (i = first; i < VMAP_PAGES && vbit(vmap_used, i) && (i == first || !vbit(vmap_head, i)); i++) {
+        uint64_t *pte = vmap_pte(VMM_VMAP_BASE + i * PAGE_SIZE);
+        if (pte) *pte = 0;
+    }
+    tlb_shootdown_kernel(va, VMM_VMAP_BASE + i * PAGE_SIZE);
+    f = spin_lock_irqsave(&vmap_lock);
+    vset(vmap_head, first, false);
+    for (uint64_t j = first; j < i; j++) vset(vmap_used, j, false);
+    spin_unlock_irqrestore(&vmap_lock, f);
+}
+
+/* The frame behind a vmap address (for vmalloc_to_page()), or 0. */
+uint64_t vmm_vmap_phys(const void *addr)
+{
+    uint64_t va = (uint64_t)(uintptr_t)addr;
+    if (va < VMM_VMAP_BASE || va >= VMM_VMAP_BASE + VMM_VMAP_SIZE) return 0;
+    uint64_t *pte = vmap_pte(va & ~(uint64_t)(PAGE_SIZE - 1));
+    return pte && (*pte & PTE_PRESENT) ? (*pte & ADDR_MASK) | (va & (PAGE_SIZE - 1)) : 0;
 }

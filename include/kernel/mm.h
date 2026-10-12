@@ -59,4 +59,14 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size);
  * any access faults) or a normal page again. Splits its 2 MiB page. */
 bool vmm_set_guard(uint64_t phys, bool guard);
 
+/* The vmap window: `n` frames (any physical addresses) mapped at consecutive
+ * kernel addresses, 4 KiB pages, VMM_WRITE/PWT/PCD as given. In the last
+ * shared kernel PML4 slot, so no identity mapping may reach it. Returns the
+ * address or NULL; vmm_vunmap() takes exactly that address. */
+#define VMM_VMAP_BASE   0x3F8000000000ull
+#define VMM_VMAP_SIZE   (1ull << 30)
+void    *vmm_vmap(const uint64_t *frames, size_t n, uint64_t flags);
+void     vmm_vunmap(void *addr);
+uint64_t vmm_vmap_phys(const void *addr);       /* physical address, or 0 */
+
 #endif

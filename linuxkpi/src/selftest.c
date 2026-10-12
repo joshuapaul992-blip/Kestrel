@@ -427,6 +427,29 @@ static void test_memory(void)
     unsigned long gp = get_zeroed_page(GFP_KERNEL);
     CHECK(gp && !*(u8 *)gp);
     free_page(gp);
+
+    /* vmap: three pages out of order are one range; writes reach the pages */
+    struct page *vp[3] = { alloc_page(GFP_KERNEL | __GFP_ZERO), alloc_page(GFP_KERNEL | __GFP_ZERO),
+                           alloc_page(GFP_KERNEL | __GFP_ZERO) };
+    CHECK(vp[0] && vp[1] && vp[2]);
+    if (vp[0] && vp[1] && vp[2]) {
+        struct page *order[3] = { vp[2], vp[0], vp[1] };
+        u8 *m = vmap(order, 3, VM_MAP, PAGE_KERNEL);
+        CHECK(m != NULL);
+        if (m) {
+            memset(m, 0x11, PAGE_SIZE);
+            memset(m + PAGE_SIZE, 0x22, PAGE_SIZE);
+            memset(m + 2 * PAGE_SIZE, 0x33, PAGE_SIZE);
+            CHECK(*(u8 *)page_address(vp[2]) == 0x11 && *(u8 *)page_address(vp[0]) == 0x22 &&
+                  ((u8 *)page_address(vp[1]))[PAGE_SIZE - 1] == 0x33);
+            CHECK(is_vmalloc_addr(m) && vmalloc_to_page(m + PAGE_SIZE + 7) == vp[0]);
+            vunmap(m);
+            u8 *m2 = vmap(order, 3, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+            CHECK(m2 == m);                         /* the same window pages again */
+            if (m2) { CHECK(m2[2 * PAGE_SIZE] == 0x33); vunmap(m2); }
+        }
+    }
+    for (i = 0; i < 3; i++) if (vp[i]) __free_page(vp[i]);
 }
 
 /* ---- DMA through a platform device -------------------------------------------- */
