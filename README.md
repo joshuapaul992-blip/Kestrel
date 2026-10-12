@@ -9,7 +9,7 @@ Because I can.
 ### What made you think to do this?
 Because I want to prove that vibe-coding operating systems isn't always a bad idea, in fact, it can prove everything Claude Opus 5.5 is capable of, like coding a whole OS from scratch, and even getting Firefox to work.
 
-**Also, if you have any issues, feel free to open an issue ticket so I can take care of the problem.**
+**Also, if you have any issues, feel free to open an issue ticket so I can take care of whatever problem you're experiencing.**
 
 ## Overview
 
