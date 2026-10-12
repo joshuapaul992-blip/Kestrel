@@ -3,8 +3,9 @@
  * page at once), page faults on several CPUs at once (resolved without the
  * kernel lock), unix sockets used from several CPUs at once (also without
  * the kernel lock), regular files and names in the file tree shared by
- * several CPUs, terminals (ptys) driven from several CPUs, and the kernel
- * under concurrent system calls.
+ * several CPUs, terminals (ptys) driven from several CPUs, processes
+ * ending and collected on several CPUs, and the kernel under concurrent
+ * system calls.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -960,6 +961,169 @@ static int tty_round(void)
     return bad + tt_errors;
 }
 
+/* ---- processes ending on several CPUs ------------------------------------------------
+ * exit and wait4 run without the kernel lock. Four threads fork and wait
+ * for their own children by pid while others are collected by wait(-1)
+ * from four threads at once (each child exactly once, with its status);
+ * children end by exit(), by exit_group() from a thread while the others
+ * run, by a leader that leaves first and a thread that ends the process,
+ * by SIGKILL, by execve from a thread, and by _exit() after vfork(). Run
+ * often enough to fill the task table if a zombie were ever left behind. */
+#define PX_THREADS 4
+#define PX_KIDS    60
+static volatile int px_errors, px_sigchld;
+static char px_why[160];
+static void px_fail(const char *what, long a, long b)
+{
+    if (!px_errors++) snprintf(px_why, sizeof px_why, "%s (%ld, %ld)", what, a, b);
+}
+static void px_on_chld(int s) { (void)s; __atomic_add_fetch(&px_sigchld, 1, __ATOMIC_RELAXED); }
+
+static pid_t px_fork(void)
+{
+    for (int i = 0; i < 200; i++) {                     /* a busy table: try again, not forever */
+        pid_t p = fork();
+        if (p >= 0 || errno != EAGAIN) return p;
+        struct timespec ts = { 0, 2000000 };
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+static void *px_spin(void *a) { (void)a; for (;;) sched_yield(); return NULL; }
+static void *px_exit_group(void *a) { struct timespec ts = { 0, 300000 }; nanosleep(&ts, NULL); _exit((int)(intptr_t)a); }
+static void *px_last(void *a) { struct timespec ts = { 0, 2000000 }; nanosleep(&ts, NULL); exit((int)(intptr_t)a); }
+static void *px_exec(void *a)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof cmd, "exit %d", (int)(intptr_t)a);
+    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+}
+
+/* Child number k ends one of the ways above; returns the status the parent
+ * must see. */
+static void px_child(int k)
+{
+    int code = 1 + k % 200;
+    pthread_t t;
+    switch (k % 6) {
+    case 0: _exit(code);
+    case 1:                                             /* exit_group from a thread, two spinning */
+        pthread_create(&t, NULL, px_spin, NULL);
+        pthread_create(&t, NULL, px_spin, NULL);
+        pthread_create(&t, NULL, px_exit_group, (void *)(intptr_t)code);
+        for (;;) sched_yield();
+    case 2:                                             /* the leader leaves first */
+        pthread_create(&t, NULL, px_last, (void *)(intptr_t)code);
+        syscall(SYS_exit, 0);
+        for (;;) ;
+    case 3: for (;;) pause();                           /* killed */
+    case 4:                                             /* execve from a thread, one spinning */
+        pthread_create(&t, NULL, px_spin, NULL);
+        pthread_create(&t, NULL, px_exec, (void *)(intptr_t)code);
+        for (;;) sched_yield();
+    default: {                                          /* vfork, then _exit */
+        pid_t v = vfork();
+        if (v == 0) _exit(code);
+        int st;
+        if (v < 0 || waitpid(v, &st, 0) != v || !WIFEXITED(st) || WEXITSTATUS(st) != code) _exit(255);
+        _exit(code);
+    }
+    }
+}
+
+static int px_expect_ok(int k, int st)
+{
+    if (k % 6 == 3) return WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 1 + k % 200;
+}
+
+static void *px_own(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+    for (int i = 0; i < PX_KIDS; i++) {
+        int k = id * PX_KIDS + i;
+        pid_t p = px_fork();
+        if (p < 0) { px_fail("fork", errno, k); continue; }
+        if (p == 0) px_child(k);
+        if (k % 6 == 3) { struct timespec ts = { 0, 200000 }; nanosleep(&ts, NULL); kill(p, SIGKILL); }
+        int st = 0;
+        pid_t w = waitpid(p, &st, 0);
+        if (w != p) px_fail("waitpid by pid", w, errno);
+        else if (!px_expect_ok(k, st)) px_fail("status", k, st);
+    }
+    return NULL;
+}
+
+/* Children collected by whichever of four threads gets there first. */
+#define PX_POOL 48
+static pid_t px_pool[PX_POOL];
+static volatile int px_seen[PX_POOL], px_left;
+
+/* As many blocking waits in all as there are children: a wait that found
+ * none left would sleep for good, as on Linux (reaping wakes nobody). */
+static void *px_any(void *arg)
+{
+    (void)arg;
+    for (int n = 0; n < PX_POOL / PX_THREADS; n++) {
+        int st = 0;
+        pid_t w = waitpid(-1, &st, 0);
+        if (w < 0) { px_fail("wait(-1)", w, errno); break; }
+        int i = 0;
+        while (i < PX_POOL && px_pool[i] != w) i++;
+        if (i == PX_POOL) { px_fail("wait(-1): not a child of the pool", w, 0); continue; }
+        if (__atomic_add_fetch(&px_seen[i], 1, __ATOMIC_RELAXED) != 1) px_fail("collected twice", w, i);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 1 + i % 200) px_fail("wait(-1) status", i, st);
+        __atomic_sub_fetch(&px_left, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+static int proc_round(void)
+{
+    px_errors = 0;
+    px_sigchld = 0;
+    struct sigaction sa = { 0 };
+    sa.sa_handler = px_on_chld;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    pthread_t own[PX_THREADS];
+    for (int i = 0; i < PX_THREADS; i++) pthread_create(&own[i], NULL, px_own, (void *)(intptr_t)i);
+    for (int i = 0; i < PX_THREADS; i++) pthread_join(own[i], NULL);
+
+    /* wait(-1) from four threads: the pool alone, so nobody else's child */
+    px_left = PX_POOL;
+    for (int i = 0; i < PX_POOL; i++) {
+        px_seen[i] = 0;
+        pid_t p = px_fork();
+        if (p == 0) { struct timespec ts = { 0, (long)(i % 5) * 300000 }; nanosleep(&ts, NULL); _exit(1 + i % 200); }
+        px_pool[i] = p;
+        if (p < 0) { px_fail("fork (pool)", errno, i); return px_errors; }
+    }
+    pthread_t any[PX_THREADS];
+    for (int i = 0; i < PX_THREADS; i++) pthread_create(&any[i], NULL, px_any, NULL);
+    for (int i = 0; i < PX_THREADS; i++) pthread_join(any[i], NULL);
+    if (px_left) px_fail("children never collected", px_left, 0);
+    if (waitpid(-1, NULL, WNOHANG) != -1 || errno != ECHILD) px_fail("a child left over", 0, errno);
+
+    /* orphans: the kernel takes their grandchildren */
+    for (int i = 0; i < 20; i++) {
+        pid_t p = px_fork();
+        if (p == 0) {
+            if (px_fork() == 0) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); _exit(0); }
+            _exit(3);
+        }
+        int st;
+        if (p < 0 || waitpid(p, &st, 0) != p || !WIFEXITED(st) || WEXITSTATUS(st) != 3) px_fail("orphan's parent", p, st);
+    }
+    if (!px_sigchld) px_fail("no SIGCHLD", 0, 0);
+    signal(SIGCHLD, SIG_DFL);
+    if (px_errors) printf("  FAIL detail: %d failure(s); first: %s\n", px_errors, px_why);
+    return px_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -1011,6 +1175,13 @@ int main(int argc, char **argv)
         int n = atoi(argv[2]);
         for (int i = 0; i < n; i++) CHECK(tty_round() == 0, "terminal round");
         printf("smptest ttys: %d failure(s)\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "procs")) {          /* smptest procs N: only the process rounds */
+        setvbuf(stdout, NULL, _IONBF, 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) CHECK(proc_round() == 0, "process round");
+        printf("smptest procs: %d failure(s)\n", failures);
         return failures ? 1 : 0;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1087,6 +1258,11 @@ int main(int argc, char **argv)
     CHECK(tty_round() == 0,
           "2 ptys x 256 KiB each way checked byte by byte, settings/window size/FIONREAD alongside, "
           "400 canonical lines, 150 pairs opened and hung up, Ctrl-C to the foreground group");
+
+    printf("processes ending on several CPUs:\n");
+    CHECK(proc_round() == 0,
+          "4 threads x 60 children waited for by pid (exit, exit_group, leader first, SIGKILL, execve, vfork), "
+          "48 collected by wait(-1) from 4 threads once each, 20 orphans");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

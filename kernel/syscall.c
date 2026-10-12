@@ -3113,6 +3113,11 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_getuid:         case SYS_geteuid:        case SYS_getgid:        case SYS_getegid:
     case SYS_sched_getaffinity:
         return true;
+    /* the end of a thread or process, and waiting for a child's: the
+     * process tree's own lock (proc_lock, task.h). The last close of a
+     * process's files and the parent's SIGCHLD take the big lock there. */
+    case SYS_exit: case SYS_exit_group: case SYS_wait4: case SYS_waitid:
+        return true;
     /* data through a file that locks itself: a unix socket, a pipe, an
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
      * file's position lock) */
@@ -3205,8 +3210,12 @@ int syscall_dispatch(struct int_frame *f)
     }
     if (t->user && (f->cs & 3) == 3) {
         /* signals are delivered under the lock: a lock-free call that has
-         * one to deliver (or a wait's mask to restore) takes it now */
-        if (!locked && (signal_pending() || t->saved_mask_valid)) { bkl_enter(); locked = true; }
+         * one to deliver (or a wait's mask to restore) takes it now, and so
+         * does one a signal interrupted: another thread may have taken that
+         * signal meanwhile, and the call is then restarted (signal_deliver) */
+        int64_t ret = (int64_t)f->rax;
+        bool restart = ret == -ERESTARTSYS || ret == -ERESTARTNOHAND;
+        if (!locked && (signal_pending() || t->saved_mask_valid || restart)) { bkl_enter(); locked = true; }
         if (locked) signal_deliver(f, nr, true);
     }
     int iret = t->iret_return;

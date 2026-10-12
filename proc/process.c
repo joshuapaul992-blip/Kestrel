@@ -96,6 +96,7 @@ static struct tcb *process_of(int pid)
 bool process_zombie_kept(const struct tcb *t)
 {
     if (!t->user || !is_leader(t)) return false;        /* threads: reaped at once */
+    if (t->collected) return false;                     /* the parent has its status */
     if (t->signal && t->signal->nr_threads > 0) return true;    /* its threads still run */
     struct tcb *p = task_find(t->ppid);
     if (!proc_alive(p) || !p->user) return false;
@@ -105,10 +106,12 @@ bool process_zombie_kept(const struct tcb *t)
 
 static void vfork_release(struct tcb *t)
 {
+    uint64_t f = spin_lock_irqsave(&proc_lock);         /* the parent checks under it */
     if (t->vfork_parent) {
         t->vfork_parent = 0;
         wakeup(&t->vfork_parent);
     }
+    spin_unlock_irqrestore(&proc_lock, f);
 }
 
 /* Send a thread-directed signal to every other live thread of t's group. */
@@ -137,45 +140,61 @@ void process_thread_exit(struct tcb *t)
     }
 }
 
-/* t is exiting (interrupts off, files and memory already gone). */
+/* t is exiting (interrupts off, files and memory already gone), with or
+ * without the big kernel lock. The tree changes under proc_lock; the last
+ * thread of a process takes the big lock after, to signal its parent. */
 void process_exit(struct tcb *t)
 {
     vfork_release(t);
     struct signal_struct *g = t->signal;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
     g->nr_threads--;
     wakeup(&g->exit_wait);                              /* execve waiting for the others */
-    if (g->nr_threads > 0) return;
+    if (g->nr_threads > 0) { spin_unlock_irqrestore(&proc_lock, f); return; }
 
-    /* The last thread: the process is gone. */
+    /* The last thread: the process is gone, and wait4() may take its
+     * status from here on. */
     for (int i = 0; i < MAX_TASKS; i++) {               /* orphans: reaped by the kernel */
         struct tcb *c = task_slot(i);
         if (c->state != TASK_UNUSED && c->pid && c->ppid == t->tgid && !same_group(c, t)) c->ppid = 0;
     }
     struct tcb *lead = is_leader(t) ? t : task_find(t->tgid);
-    if (!lead) return;
+    if (!lead) { spin_unlock_irqrestore(&proc_lock, f); return; }
     if (g->group_exit) {                                /* exit_group() or a fatal signal */
         lead->exit_code = g->group_exit_code;
         lead->term_signal = g->group_term_signal;
     }
     wakeup(lead);                                       /* task_wait() */
-    if (!t->user) return;
-    struct tcb *p = task_find(lead->ppid);
-    if (proc_alive(p) && p->user) {
-        if (lead->exit_signal) {
-            struct ksig_info ci = { .code = lead->term_signal ? CLD_KILLED : CLD_EXITED, .pid = lead->pid,
-                                    .uid = lead->uid,
-                                    .status = lead->term_signal ? lead->term_signal : (lead->exit_code & 0xff) };
-            signal_send_info(p, lead->exit_signal, &ci);
-        }
+    int ppid = t->user ? lead->ppid : 0, sig = lead->exit_signal;
+    struct ksig_info ci = { .code = lead->term_signal ? CLD_KILLED : CLD_EXITED, .pid = lead->pid, .uid = lead->uid,
+                            .status = lead->term_signal ? lead->term_signal : (lead->exit_code & 0xff) };
+    spin_unlock_irqrestore(&proc_lock, f);              /* the zombie may be collected and freed now */
+    if (!ppid) return;
+
+    /* The parent: SIGCHLD, and the wake-up for its wait4(). Signals are
+     * sent under the big kernel lock, and nothing frees the parent while
+     * it is held (reaping takes it). */
+    sti();
+    bkl_enter();
+    struct tcb *p = task_find(ppid);
+    if (proc_alive(p) && p->user && p->tgid == ppid) {
+        if (sig) signal_send_info(p, sig, &ci);
         wakeup(p->signal);                              /* wait4() sleeps on its process */
     }
+    bkl_exit();
+    cli();
 }
 
-/* exit_group(): end every thread of the process with this status. */
+/* exit_group(): end every thread of the process with this status. Alone in
+ * its process, a thread needs no big kernel lock for that: only the
+ * process's own threads start threads or set group_exit (a fatal signal
+ * acts in the thread it kills). The other threads' SIGKILL needs it. */
 __attribute__((noreturn)) void proc_exit_group(int code)
 {
     struct tcb *t = current_task();
     struct signal_struct *g = t->signal;
+    bool lock = __atomic_load_n(&g->nr_threads, __ATOMIC_ACQUIRE) > 1;
+    if (lock) bkl_enter();
     uint64_t fl = irq_save();
     if (!g->group_exit) {                               /* a fatal signal may have come first */
         g->group_exit = true;
@@ -184,6 +203,7 @@ __attribute__((noreturn)) void proc_exit_group(int code)
         kill_other_threads(t);
     }
     irq_restore(fl);
+    if (lock) bkl_exit();
     task_exit(code & 0xff);
 }
 
@@ -252,8 +272,10 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     files_put(c->files); c->files = files;
     fs_put(c->fs); c->fs = fs;
     sighand_put(c->sighand); c->sighand = sh;
+    struct signal_struct *unused = NULL;
+    spin_lock_irqsave(&proc_lock);                      /* the tree: wait4() and exit() */
     if (thread) {                                       /* same process: share the group */
-        signal_put(c->signal);
+        unused = c->signal;
         c->signal = p->signal;
         __atomic_add_fetch(&p->signal->refs, 1, __ATOMIC_ACQ_REL);
         p->signal->nr_threads++;
@@ -267,6 +289,8 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->pgid = p->pgid;
     c->sid = p->sid;
     c->user = true;
+    spin_unlock_keep_irqs(&proc_lock);
+    signal_put(unused);
     c->mm = mm;
     c->pml4 = c->cr3 = mm->pml4;
     c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);   /* each thread: its own TLS block */
@@ -291,8 +315,12 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     task_start(c);
 
     /* vfork: the parent waits until the child has its own address space */
-    while ((flags & CLONE_VFORK) && c->pid == pid && c->vfork_parent == p->pid && c->state != TASK_UNUSED)
-        sleep_on(&c->vfork_parent);
+    if (flags & CLONE_VFORK) {
+        spin_lock_irqsave(&proc_lock);                  /* vfork_release() wakes under it */
+        while (c->pid == pid && c->vfork_parent == p->pid && c->state != TASK_UNUSED)
+            sleep_on_locked(&c->vfork_parent, &proc_lock);
+        spin_unlock_keep_irqs(&proc_lock);
+    }
     irq_restore(fl);
     return pid;
 
@@ -371,12 +399,17 @@ static int de_thread(struct tcb *t)
         if (g->group_exit || g->exec_kill) { irq_restore(fl); return -EAGAIN; }
         g->exec_kill = true;
         kill_other_threads(t);
+        spin_lock_irqsave(&proc_lock);                  /* exiting threads count down under it */
+        bool intr = false;
         while (g->nr_threads > 1) {
-            if (g->group_exit) { g->exec_kill = false; irq_restore(fl); return -EINTR; }
-            sleep_on(&g->exit_wait);
+            if (g->group_exit) { intr = true; break; }
+            sleep_on_locked(&g->exit_wait, &proc_lock);
         }
+        spin_unlock_keep_irqs(&proc_lock);
         g->exec_kill = false;
+        if (intr) { irq_restore(fl); return -EINTR; }
     }
+    spin_lock_irqsave(&proc_lock);                      /* the pid and parent move */
     if (!is_leader(t)) {
         struct tcb *lead = task_find(t->tgid);          /* exited: a zombie kept for the pid */
         int old = t->pid;
@@ -391,6 +424,7 @@ static int de_thread(struct tcb *t)
             wakeup(lead);
         }
     }
+    spin_unlock_keep_irqs(&proc_lock);
     irq_restore(fl);
     return 0;
 }
@@ -499,10 +533,15 @@ out:
     return rc;
 }
 
-/* ---- wait4 ----------------------------------------------------------------- */
+/* ---- wait4 -----------------------------------------------------------------
+ * Without the big kernel lock: the children are found, and their statuses
+ * taken, under proc_lock. A process's status is there once its last thread
+ * has passed process_exit() (it may still be on its way off a CPU); the
+ * collected zombie is freed when the big lock is free (task_reap). */
 static bool wait_matches(const struct tcb *self, const struct tcb *c, int64_t pid)
 {
-    if (c->state == TASK_UNUSED || !c->user || !is_leader(c) || c->ppid != self->tgid || same_group(c, self))
+    if (c->state == TASK_UNUSED || !c->user || !is_leader(c) || c->ppid != self->tgid || same_group(c, self) ||
+        c->collected)
         return false;
     if (pid > 0) return c->pid == pid;
     if (pid == -1) return true;
@@ -516,7 +555,7 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
     if (!self->user) return -ECHILD;
     if (ustatus && !user_range_ok(ustatus, 4)) return -EFAULT;
     if (rusage && !user_range_ok(rusage, 144)) return -EFAULT;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (;;) {
         bool any = false;
         struct tcb *z = NULL;
@@ -524,21 +563,22 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
             struct tcb *c = task_slot(i);
             if (!wait_matches(self, c, pid)) continue;
             any = true;
-            if (c->state == TASK_ZOMBIE && c->signal->nr_threads == 0) z = c;   /* every thread gone */
+            if (c->signal && c->signal->nr_threads == 0) z = c;     /* every thread gone */
         }
-        if (!any) { irq_restore(fl); return -ECHILD; }
+        if (!any) { spin_unlock_irqrestore(&proc_lock, fl); return -ECHILD; }
         if (z) {
             int status = z->term_signal ? (z->term_signal & 0x7f) : ((z->exit_code & 0xff) << 8);
             int zpid = z->pid;
+            z->collected = true;
+            spin_unlock_irqrestore(&proc_lock, fl);
             task_reap(z);
-            irq_restore(fl);
             if (ustatus && put_user_u32((void *)ustatus, (uint32_t)status)) return -EFAULT;
             if (rusage && clear_user((void *)rusage, 144)) return -EFAULT;
             return zpid;
         }
-        if (options & WNOHANG) { irq_restore(fl); return 0; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(self->signal);                         /* a child's exit wakes the process */
+        if (options & WNOHANG) { spin_unlock_irqrestore(&proc_lock, fl); return 0; }
+        if (signal_pending()) { spin_unlock_irqrestore(&proc_lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(self->signal, &proc_lock);      /* a child's exit wakes the process */
     }
 }
 
@@ -565,7 +605,7 @@ int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options
     default:     return -EINVAL;                        /* P_PIDFD: no pidfds */
     }
     if (infop && !user_range_ok(infop, 128)) return -EFAULT;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (;;) {
         bool any = false;
         struct tcb *z = NULL;
@@ -573,9 +613,9 @@ int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options
             struct tcb *c = task_slot(i);
             if (!wait_matches(self, c, pid)) continue;
             any = true;
-            if ((options & WEXITED) && c->state == TASK_ZOMBIE && c->signal->nr_threads == 0) z = c;
+            if ((options & WEXITED) && c->signal && c->signal->nr_threads == 0) z = c;
         }
-        if (!any) { irq_restore(fl); return -ECHILD; }
+        if (!any) { spin_unlock_irqrestore(&proc_lock, fl); return -ECHILD; }
         if (z) {
             int32_t info[32] = { 0 };
             info[0] = SIGCHLD;                          /* si_signo; si_errno 0 */
@@ -583,18 +623,19 @@ int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options
             info[4] = z->pid;                           /* si_pid */
             info[5] = (int32_t)z->uid;                  /* si_uid */
             info[6] = z->term_signal ? (z->term_signal & 0x7f) : (z->exit_code & 0xff);  /* si_status */
+            if (!(options & WNOWAIT)) z->collected = true;
+            spin_unlock_irqrestore(&proc_lock, fl);
             if (!(options & WNOWAIT)) task_reap(z);
-            irq_restore(fl);
             if (infop && copy_to_user((void *)infop, info, sizeof info)) return -EFAULT;
             return 0;
         }
         if (options & WNOHANG) {
-            irq_restore(fl);
+            spin_unlock_irqrestore(&proc_lock, fl);
             if (infop && clear_user((void *)infop, 128)) return -EFAULT;    /* si_pid 0: nothing yet */
             return 0;
         }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(self->signal);
+        if (signal_pending()) { spin_unlock_irqrestore(&proc_lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(self->signal, &proc_lock);
     }
 }
 

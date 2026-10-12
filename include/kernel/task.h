@@ -109,6 +109,7 @@ struct tcb {
     uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
     int       waiters;          /* task_wait() callers: not reaped yet   */
+    bool      collected;        /* its parent's wait4() took the status    */
 
     /* POSIX process state (shared between threads per the clone flags) */
     struct files_struct   *files;
@@ -177,6 +178,12 @@ struct tcb *current_task(void);
 struct tcb *task_create(const char *name, int (*entry)(void *), void *arg);
 struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg);
 void        task_start(struct tcb *t);  /* a paused task: runnable from now on */
+/* The process tree: parent links (ppid), thread counts, a thread taking
+ * over its process id, exit statuses and their collection, and the waits
+ * for them (wait4, task_wait, vfork, execve's de_thread). exit() and
+ * wait4() keep to this lock, not the big kernel lock. Taken after the big
+ * lock, before the scheduler's. */
+extern struct spinlock proc_lock;
 __attribute__((noreturn)) void task_exit(int code);
 void        schedule(void);             /* call with interrupts disabled */
 void        sched_switch_tail(void);    /* the arriving task: its kernel lock back */
@@ -243,7 +250,7 @@ int         task_wait(int pid);         /* exit status, or -ECHILD        */
 int         task_snapshot(struct tcb *out, int max);
 struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
-void        task_reap(struct tcb *t);   /* free a zombie now (wait4)        */
+void        task_reap(struct tcb *t);   /* free a collected zombie (wait4)   */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
 /* Futex-style sleep: mark the current task asleep on `chan` (until
  * task_wake, a signal, or deadline_ms of time_ms() if non-zero); it stops
