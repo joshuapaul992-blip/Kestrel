@@ -624,3 +624,14 @@ int seq_buf_puts(struct seq_buf *s, const char *str)
 {
     return seq_buf_printf(s, "%s", str);
 }
+
+bool refcount_dec_and_mutex_lock(refcount_t *r, struct mutex *lock)
+{
+    if (refcount_dec_not_one(r)) return false;
+    mutex_lock(lock);
+    if (!refcount_dec_and_test(r)) {
+        mutex_unlock(lock);
+        return false;
+    }
+    return true;
+}

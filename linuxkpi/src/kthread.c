@@ -70,6 +70,7 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data), void *da
     refcount_set(&ts->usage, 1);
     ts->lkpi_owned = true;
     ts->lkpi_kthread = k;
+    ts->group_leader = ts;
     k->threadfn = threadfn;
     k->data = data;
     init_completion(&k->exited);

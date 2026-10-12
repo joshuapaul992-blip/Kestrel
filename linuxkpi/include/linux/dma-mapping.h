@@ -99,4 +99,11 @@ static inline void dma_unmap_sgtable(struct device *dev, struct sg_table *sgt, e
 #define DEFINE_DMA_UNMAP_ADDR(ADDR_NAME)        dma_addr_t ADDR_NAME
 #define DEFINE_DMA_UNMAP_LEN(LEN_NAME)          __u32 LEN_NAME
 
+/* Kestrel's DMA is cache coherent: non-coherent buffers are coherent ones */
+static inline void *dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle,
+                                          enum dma_data_direction dir, gfp_t gfp)
+{ return dma_alloc_attrs(dev, size, handle, gfp, 0); }
+static inline void dma_free_noncoherent(struct device *dev, size_t size, void *vaddr, dma_addr_t handle,
+                                        enum dma_data_direction dir)
+{ dma_free_attrs(dev, size, vaddr, handle, 0); }
 #endif

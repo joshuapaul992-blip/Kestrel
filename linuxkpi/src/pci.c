@@ -635,8 +635,105 @@ static struct pci_bus *get_bus(unsigned int number)
     if (!b) return NULL;
     INIT_LIST_HEAD(&b->devices);
     b->number = (unsigned char)number;
+    b->max_bus_speed = b->cur_bus_speed = PCI_SPEED_UNKNOWN;
     list_add_tail(&b->node, &pci_buses);
     return b;
+}
+
+/* A bus behind a PCIe bridge runs at the bridge's link speed (Link
+ * Capabilities) at most, and at its current speed (Link Status) now. */
+static unsigned char pcie_link_speed(u16 code)
+{
+    return code >= 1 && code <= 6 ? PCIE_SPEED_2_5GT + code - 1 : PCI_SPEED_UNKNOWN;
+}
+
+static void set_bus_speeds(void)
+{
+    struct pci_bus *b;
+    list_for_each_entry(b, &pci_buses, node) {
+        u32 cap;
+        u16 sta;
+        if (!b->self || !b->self->pcie_cap) continue;
+        pci_read_config_dword(b->self, b->self->pcie_cap + PCI_EXP_LNKCAP, &cap);
+        pci_read_config_word(b->self, b->self->pcie_cap + PCI_EXP_LNKSTA, &sta);
+        b->max_bus_speed = pcie_link_speed(cap & PCI_EXP_LNKCAP_SLS);
+        b->cur_bus_speed = pcie_link_speed(sta & 0xf);
+    }
+}
+
+/* ---- the expansion ROM ---------------------------------------------------------- */
+int pci_enable_rom(struct pci_dev *pdev)
+{
+    u32 bar;
+    pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &bar);
+    if (!(bar & PCI_ROM_ADDRESS_MASK)) return -ENODEV;          /* the firmware assigned no address */
+    pci_write_config_dword(pdev, PCI_ROM_ADDRESS, bar | PCI_ROM_ADDRESS_ENABLE);
+    return 0;
+}
+
+void pci_disable_rom(struct pci_dev *pdev)
+{
+    u32 bar;
+    pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &bar);
+    pci_write_config_dword(pdev, PCI_ROM_ADDRESS, bar & ~(u32)PCI_ROM_ADDRESS_ENABLE);
+}
+
+/* the size the BAR decodes: write all ones to the address bits, read back */
+static size_t rom_bar_size(struct pci_dev *pdev, u32 bar)
+{
+    u32 probe;
+    u16 cmd;
+    pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+    pci_write_config_word(pdev, PCI_COMMAND, cmd & ~PCI_COMMAND_MEMORY);
+    pci_write_config_dword(pdev, PCI_ROM_ADDRESS, PCI_ROM_ADDRESS_MASK);
+    pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &probe);
+    pci_write_config_dword(pdev, PCI_ROM_ADDRESS, bar);
+    pci_write_config_word(pdev, PCI_COMMAND, cmd);
+    probe &= PCI_ROM_ADDRESS_MASK;
+    return probe ? (size_t)(~probe + 1) : 0;
+}
+
+/* The images' total length: each starts 55 AA, points at its "PCIR" data
+ * structure at 0x18, which gives its length in 512-byte units at 0x10 and
+ * marks the last image with bit 7 of 0x15. */
+static size_t rom_images_size(void __iomem *rom, size_t size)
+{
+    size_t off = 0;
+    while (off + 0x1a <= size) {
+        u8 __iomem *img = (u8 __iomem *)rom + off;
+        if (readw(img) != 0xaa55) break;
+        u16 pcir = readw(img + 0x18);
+        if (off + pcir + 0x18 > size || readl(img + pcir) != 0x52494350) break;     /* "PCIR" */
+        size_t len = (size_t)readw(img + pcir + 0x10) * 512;
+        if (!len) break;
+        off += len;
+        if (readb(img + pcir + 0x15) & 0x80) break;
+    }
+    return off > size ? size : off;
+}
+
+void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size)
+{
+    u32 bar;
+    pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &bar);
+    phys_addr_t base = bar & PCI_ROM_ADDRESS_MASK;
+    size_t decoded = base ? rom_bar_size(pdev, bar) : 0;
+    if (!decoded || pci_enable_rom(pdev)) return NULL;
+    void __iomem *rom = ioremap(base, decoded);
+    size_t len = rom ? rom_images_size(rom, decoded) : 0;
+    if (!len) {
+        if (rom) iounmap(rom);
+        pci_disable_rom(pdev);
+        return NULL;
+    }
+    *size = len;
+    return rom;
+}
+
+void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
+{
+    iounmap(rom);
+    pci_disable_rom(pdev);
 }
 
 static void pci_release_dev(struct device *dev) { }    /* devices stay for the life of the system */
@@ -694,6 +791,7 @@ void lkpi_pci_core_init(void)
         pdev->msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
         pdev->msix_cap = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
         pdev->pcie_cap = pci_find_capability(pdev, PCI_CAP_ID_EXP);
+        pdev->pm_cap = pci_find_capability(pdev, PCI_CAP_ID_PM);
         if (pdev->pcie_cap) pci_read_config_word(pdev, pdev->pcie_cap + PCI_EXP_FLAGS, &pdev->pcie_flags_reg);
         if (info.parent) {
             struct pci_dev *bridge = find_handle(info.parent);
@@ -719,5 +817,6 @@ void lkpi_pci_core_init(void)
         list_add_tail(&node->node, &all_devs);
         if (device_add(&pdev->dev) == 0) made++;
     }
+    set_bus_speeds();
     printk(KERN_INFO "linuxkpi: pci: %d devices from Kestrel's scan\n", made);
 }

@@ -26,6 +26,8 @@
 #define CONFIG_DRM                  1           /* phase 2: the DRM core, TTM and bochs */
 #define CONFIG_APERTURE_HELPERS     1
 #define CONFIG_DRM_FBDEV_EMULATION  1           /* drm_fbdev_ttm_setup(): Kestrel's display client, not fbdev */
+#define CONFIG_NOUVEAU_DEBUG        5           /* nouveau: log levels compiled in, and the default */
+#define CONFIG_NOUVEAU_DEBUG_DEFAULT 3
 #define CONFIG_PM_SLEEP             1
 #define CONFIG_PAGE_OFFSET          0
 

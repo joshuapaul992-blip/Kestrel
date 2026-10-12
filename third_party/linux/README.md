@@ -35,6 +35,10 @@ the combination is distributed under GPLv3.
   by file. `MODULE_LICENSE("GPL")` means "GPL v2 or later" in Linux's own
   convention, but the SPDX line is what counts.
 
+## Phase 2: nouveau
+
+Nouveau, the DisplayPort helpers, the GPU scheduler, `drm_exec`, `drm_gpuvm`, `i2c-algo-bit` and the maple tree are listed with their licenses and SHA-256 sums in `NOUVEAU.md`. That file also lists the nouveau headers that carry no license notice and are therefore written in the KPI.
+
 ## Phase 2: DRM, TTM and bochs
 
 These are the DRM core, the KMS helpers, TTM, the VRAM helper and the

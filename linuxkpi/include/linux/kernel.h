@@ -30,6 +30,7 @@
 #include <linux/sizes.h>
 #include <linux/bitmap.h>
 #include <linux/math64.h>
+#include <linux/ratelimit.h>
 
 #define STACK_MAGIC             0xdeadbeef
 #define u64_to_user_ptr(x)      ((void __user *)(uintptr_t)(x))

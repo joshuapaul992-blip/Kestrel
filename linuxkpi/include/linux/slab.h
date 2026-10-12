@@ -78,6 +78,22 @@ static inline void *kmem_cache_zalloc(struct kmem_cache *s, gfp_t gfp) { return 
     kmem_cache_create(#__struct, sizeof(struct __struct), __alignof__(struct __struct), (__flags), NULL)
 
 #define kmem_cache_alloc_lru(c, lru, gfp)       kmem_cache_alloc(c, gfp)
+/* all `size` objects or none: returns size, or 0 */
+static inline int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t gfp, size_t size, void **p)
+{
+    for (size_t i = 0; i < size; i++) {
+        p[i] = kmem_cache_alloc(s, gfp);
+        if (!p[i]) {
+            while (i--) kmem_cache_free(s, p[i]);
+            return 0;
+        }
+    }
+    return (int)size;
+}
+static inline void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
+{
+    for (size_t i = 0; i < size; i++) kmem_cache_free(s, p[i]);
+}
 struct list_lru;
 
 #endif

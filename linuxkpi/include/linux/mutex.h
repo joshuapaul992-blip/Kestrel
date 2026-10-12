@@ -15,7 +15,7 @@ struct mutex {
 #define DEFINE_MUTEX(name)              struct mutex name = __MUTEX_INITIALIZER(name)
 
 static inline void mutex_init(struct mutex *m) { m->owner = NULL; init_waitqueue_head(&m->wait); }
-#define __mutex_init(m, name, key)      mutex_init(m)
+#define __mutex_init(m, name, key)      ((void)(key), mutex_init(m))     /* lockdep classes are not tracked */
 static inline void mutex_destroy(struct mutex *m) { }
 static inline bool mutex_is_locked(struct mutex *m) { return READ_ONCE(m->owner) != NULL; }
 

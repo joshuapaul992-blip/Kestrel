@@ -44,4 +44,8 @@ static inline bool refcount_dec_and_test(refcount_t *r) { return refcount_sub_an
 static inline void refcount_dec(refcount_t *r) { if (refcount_dec_and_test(r)) WARN_ONCE(1, "refcount_t: decrement hit 0\n"); }
 static inline bool refcount_dec_not_one(refcount_t *r) { return atomic_add_unless(&r->refs, -1, 1); }
 
+/* true, with `lock` held, when the count dropped to zero (src/lib.c) */
+struct mutex;
+bool refcount_dec_and_mutex_lock(refcount_t *r, struct mutex *lock);
+
 #endif

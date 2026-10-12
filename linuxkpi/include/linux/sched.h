@@ -58,6 +58,8 @@ struct task_struct {
     int                     lkpi_uaccess_kernel;/* user copies are kernel copies  */
     bool                    lkpi_owned;         /* freed at the last put          */
     struct lkpi_kthread    *lkpi_kthread;
+    struct task_struct     *group_leader;       /* itself: the KPI has no thread groups */
+    int                     exit_code;          /* never set: signals do not kill Linux code here */
 };
 
 struct task_struct *lkpi_get_current(void);
@@ -90,6 +92,9 @@ int  lkpi_cond_resched(void);
 #define cond_resched_lock(l)    0
 #define need_resched()          0
 
+#ifndef SIGKILL
+#define SIGKILL                 9
+#endif
 int  lkpi_signal_pending(struct task_struct *t);
 static inline int signal_pending(struct task_struct *t) { return lkpi_signal_pending(t); }
 static inline int fatal_signal_pending(struct task_struct *t) { return lkpi_signal_pending(t); }

@@ -102,6 +102,7 @@ void kfree_const(const void *x);
 void *kmemdup(const void *src, size_t len, gfp_t gfp);
 char *kmemdup_nul(const char *s, size_t len, gfp_t gfp);
 void *memdup_user(const void __user *src, size_t len);
+#define vmemdup_user(src, len)          memdup_user(src, len)   /* kvfree() frees either */
 char *strndup_user(const char __user *s, long n);
 void *memdup_user_nul(const void __user *src, size_t len);
 

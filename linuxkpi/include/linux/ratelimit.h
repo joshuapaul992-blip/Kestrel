@@ -10,5 +10,6 @@ struct ratelimit_state { int interval, burst, printed, missed; unsigned long beg
 #define DEFINE_RATELIMIT_STATE(name, i, b) struct ratelimit_state name = RATELIMIT_STATE_INIT(name, i, b)
 static inline void ratelimit_state_init(struct ratelimit_state *rs, int interval, int burst)
 { rs->interval = interval; rs->burst = burst; rs->printed = rs->missed = 0; rs->begin = 0; }
-#define __ratelimit(state)      1
+static inline int ___ratelimit(struct ratelimit_state *rs, const char *func) { return 1; }
+#define __ratelimit(state)      ___ratelimit(state, __func__)
 #endif
