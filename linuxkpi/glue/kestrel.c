@@ -18,6 +18,8 @@
 #include <kernel/msi.h>
 #include <kernel/vfs.h>
 #include <kernel/posix.h>
+#include <kernel/display.h>
+#include <kernel/tty.h>
 #include "pci.h"
 #include "../include/lkpi/glue.h"
 
@@ -157,7 +159,29 @@ int lkpi_pci_get(int index, struct lkpi_pci_info *out)
         out->bar[i].prefetch = d->bars[i].prefetchable;
     }
     out->parent = d->parent;
+    out->native = display_pci_owner(d);
     return 0;
+}
+
+/* ---- displays ------------------------------------------------------------- */
+int lkpi_display_add(const struct lkpi_display *d)
+{
+    struct display_head h = {
+        .phys = d->phys, .vram = d->vram, .width = d->width, .height = d->height, .pitch = d->pitch,
+        .bytes_pp = 4, .r_pos = 16, .g_pos = 8, .b_pos = 0,                 /* x8r8g8b8 */
+        .write_span = d->write_span, .write_ctx = d->ctx,
+    };
+    if (d->width <= 0 || d->height <= 0 || d->pitch < d->width * 4) return -1;
+    size_t frames = ((size_t)d->pitch * (size_t)d->height + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t shadow = pmm_alloc_contig(frames);          /* zeroed, identity mapped */
+    if (!shadow) return -1;
+    h.shadow = (uint32_t *)(uintptr_t)shadow;
+    strlcpy(h.name, d->name, sizeof h.name);
+    strlcpy(h.monitor, d->monitor ? d->monitor : "", sizeof h.monitor);
+    int idx = display_register(&h);
+    if (idx < 0) { pmm_free_contig(shadow, frames); return -1; }
+    if (tty_add_monitor(idx) < 0) kprintf("linuxkpi: monitor %d has no terminal\n", idx);
+    return idx;
 }
 
 unsigned int lkpi_pci_read(void *handle, int off, int size)

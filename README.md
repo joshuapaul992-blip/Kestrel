@@ -642,8 +642,14 @@ linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see 
   src/notifier.c idr.c       notifier chains, panic and reboot hooks; IDR/IDA
   src/printk.c vsprintf.c    printk, dev_*, hex dumps; vsprintf with %p extensions, sscanf
   src/lib.c selftest.c       strings, kstrto*, bitmaps; the linuxkpi.selftest=1 self-test
-third_party/linux/           unmodified Linux v6.12 drivers built through the KPI (pvpanic,
-                             i6300esb), with their upstream paths and licenses in README.md
+  src/ww_mutex.c dma-fence.c wound/wait mutexes and SRCU; DMA fences, fence arrays and chains
+  src/sort.c                 sort, sort_r, list_sort
+  src/drm.c                  what DRM needs beyond its MIT files: drm_managed, sysfs and PRIME
+                             stubs, anonymous files, boot_cpu_data; the linuxkpi.drm=1 switch
+  src/drm_kestrel.c          drm_fbdev_ttm_setup(): Kestrel's terminals on DRM drivers
+third_party/linux/           unmodified Linux v6.12 code built through the KPI (pvpanic,
+                             i6300esb; the DRM core, TTM and bochs), with their upstream
+                             paths and licenses in README.md
 include/kernel/posix.h       errno, O_* flags, struct stat, dirent64, utsname (Linux ABI layout)
 include/kernel/usyscall.h    int 0x80 wrappers used by init
 ```
@@ -1137,6 +1143,7 @@ Kestrel can build unmodified Linux driver source files into the kernel, the way 
 - `MODULE.PARAM=VALUE` sets a module parameter, for example `i6300esb.heartbeat=10`. `-` and `_` are the same in names. The types are int, uint, long, ulong, short, ushort, byte, bool, invbool, charp, hexint and string; arrays are not parsed yet.
 - `linuxkpi.selftest=1` runs the self-test.
 - `linuxkpi.debug=1` shows `KERN_DEBUG` messages and each initcall as it is called.
+- `linuxkpi.drm=1` lets Linux DRM drivers drive displays (phase 2, below).
 
 A boot with QEMU's two devices logs:
 
@@ -1240,7 +1247,7 @@ BARs are the ones the firmware assigned. *Stubs:* power states are recorded only
 
 The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNNING`), or whose limit is shorter than the timeout asked for. *Stubs:* there are no pretimeout governors and no sysfs attributes.
 
-**Not there at all.** Networking (`net_device`, NAPI, sk_buff), block devices and the block layer, input, DRM/KMS, USB, ACPI and device tree, sysfs, debugfs, procfs entries, hrtimers, per-CPU variables, the full radix-tree IDR, `struct file` beyond the fields above, and `mmap` of device memory.
+**Not there at all.** Networking (`net_device`, NAPI, sk_buff), block devices and the block layer, input, DRM for user space (ioctls, PRIME, `mmap` of buffers), USB, ACPI and device tree, sysfs, debugfs, procfs entries, hrtimers, per-CPU variables, the full radix-tree IDR, `struct file` beyond the fields above, and `mmap` of device memory.
 
 ### Testing
 
@@ -1273,15 +1280,16 @@ The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNN
 
 ### Phase 2: DRM, the bochs driver, then nouveau
 
-**Step 1, enough DRM for `drivers/gpu/drm/tiny/bochs.c`.** That file is GPL-2.0-or-later. It drives QEMU's `-device bochs-display` and `-vga std`, whose register interface Kestrel already drives natively (`drivers/video/bochs_dispi.c`), so the results can be compared directly. The KPI needs:
-- the DRM device and driver structures (`drm_device`, `drm_driver`, `devm_drm_dev_alloc`, `drm_dev_register`);
-- `drm_mode_config` with the CRTC, plane, encoder and connector objects;
-- the simple display pipe or atomic helpers that bochs uses (`drm_atomic_helper_*` and the GEM shadow-plane helpers);
-- `drm_gem_vram_helper` (GPL-2.0-or-later), since bochs keeps its buffers in VRAM;
-- EDID parsing, which Kestrel already has in `drivers/video/edid.c`;
-- `drm_fbdev_generic` emulation, and the aperture helpers (`aperture_remove_conflicting_pci_devices`).
+**Step 1, bochs (done).** `drivers/gpu/drm/tiny/bochs.c` (GPL-2.0-or-later) drives QEMU's `-device bochs-display` and `-vga std`, whose register interface Kestrel also drives natively (`drivers/video/bochs_dispi.c`), so the two can be compared directly. Built in with it, unmodified from v6.12 (`third_party/linux/README.md` lists each file and its license):
+- the DRM core and the KMS helpers: modes, EDID, the atomic helpers, the simple display pipe, `drm_client`, GEM and the aperture helpers;
+- TTM and `drm_gem_vram_helper`, since bochs keeps its buffers in VRAM;
+- `dma-resv.c`, `lib/rbtree.c` and `lib/xarray.c`.
 
-Kestrel's side is a display backend that calls `display_register()` for each DRM connector that comes up, so the multi-monitor terminals use it like any other head. User space gets no DRM ioctls in step 1.
+What Linux keeps under GPL-2.0 is written in the KPI: `ww_mutex`, `dma-fence` (with arrays and chains), SRCU, `drm_managed`, `drm_device.h`, seqlocks, `iosys-map`, `sort`/`list_sort`, `kthread_worker`, and stubs for DRM's sysfs, PRIME and sync objects.
+
+**Kestrel's display client** (`linuxkpi/src/drm_kestrel.c`) stands in for fbdev: drivers call `drm_fbdev_ttm_setup()`, which here is an in-kernel DRM client. It lights each connected monitor at its preferred mode, gives each CRTC an XRGB8888 frame buffer and hands it to Kestrel through `lkpi_display_add()`, which calls `display_register()`; `tty_add_monitor()` then gives the monitor a terminal and its `/dev/ttyN` and `/dev/fbN`. VRAM that scans out as it is written is drawn directly; other buffers get Kestrel's changed lines through `write_span()`, and a worker reports the damage to the driver.
+
+**Who drives which adapter.** Linux DRM drivers only bind with `linuxkpi.drm=1`. Without it `video_firmware_drivers_only()` is true, and bochs declines every device. With it, `display_probe()` leaves secondary DISPI adapters to Linux's bochs. An adapter that holds a frame buffer Kestrel already draws on (the boot frame buffer, head 0) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (boot frame buffer), not offered to bochs-drm`. With `-vga std -device bochs-display`, monitor 2 then comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under the native driver, and the same pixels on screen. User space gets no DRM ioctls yet.
 
 **Licensing.** DRM's licenses differ file by file, so each one is checked when it is vendored. Most of the core modesetting code carries MIT terms; those files may be vendored, and the rest is written in the KPI. Some neighbours are GPL-2.0-only and must be written from scratch: for example `drivers/dma-buf/dma-fence.c` and the GEM shmem helpers.
 

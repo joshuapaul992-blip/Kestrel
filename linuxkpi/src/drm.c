@@ -375,7 +375,12 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
 }
 
 /* ---- the firmware frame buffer ----------------------------------------------------------- */
-/* a DRM driver takes over the display behind Kestrel's boot frame buffer */
+/* Linux drivers call this (through aperture_remove_conflicting_*) before
+ * they take over an adapter, so the firmware frame buffer's driver lets go.
+ * Kestrel's boot frame buffer (head 0) and every adapter Kestrel drives are
+ * never offered to Linux drivers (pci_dev->lkpi_native), so there is nothing
+ * here to let go of yet. Taking head 0 over (a primary NVIDIA card under
+ * nouveau) will need it. */
 void sysfb_disable(struct device *dev)
 {
 }

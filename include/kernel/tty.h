@@ -144,6 +144,9 @@ extern volatile int active_keyboard_tty;    /* index of the TTY with keyboard fo
 /* One TTY per registered display head, all cleared; starts the cursor blink
  * and routes keyboard input to the TTYs. Returns the number of TTYs. */
 int  tty_init_all(void);
+/* A terminal for monitor `index`, registered after boot; it must be the next
+ * one (index == tty_count). Returns index, or -1. */
+int  tty_add_monitor(int index);
 bool tty_ready(void);                   /* at least one TTY is up                   */
 struct kestrel_tty *tty_get(int index); /* NULL if out of range                     */
 struct kestrel_tty *tty_current(void);  /* the calling task's TTY (NULL if none)    */

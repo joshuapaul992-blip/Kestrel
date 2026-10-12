@@ -86,7 +86,11 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
         uint64_t *pdpt = (uint64_t *)(pml4[(a >> 39) & 511] & ADDR_MASK);
         uint64_t *pd = (uint64_t *)(pdpt[(a >> 30) & 511] & ADDR_MASK);
         uint64_t *pde = &pd[(a >> 21) & 511];
-        if (!(*pde & PTE_HUGE) || (*pde & VMM_PCD)) continue;   /* MMIO made uncached stays so */
+        /* MMIO made uncached stays so, unless the whole 2 MiB page is inside
+         * the range asked for: a frame buffer a driver mapped both ways
+         * (Linux's bochs ioremaps VRAM, then TTM ioremap_wc's it). */
+        bool inside = a >= phys && a + 0x200000 <= phys + size;
+        if (!(*pde & PTE_HUGE) || ((*pde & VMM_PCD) && !inside)) continue;
         *pde = (*pde & ~(uint64_t)VMM_PCD) | VMM_PWT;
         tlb_shootdown_kernel(a, a + PAGE_SIZE);
         pages++;

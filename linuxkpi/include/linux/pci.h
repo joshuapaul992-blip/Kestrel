@@ -103,6 +103,7 @@ struct pci_dev {
     /* the KPI's own */
     void               *lkpi_handle;            /* Kestrel's struct pci_device */
     int                 lkpi_vector;            /* MSI vector, or -1 */
+    const char         *lkpi_native;            /* Kestrel drives it (e.g. the boot display): no Linux driver binds */
     bool                lkpi_managed;           /* pcim_enable_device */
     bool                lkpi_irq_managed;       /* vectors freed at unbind */
     u32                 lkpi_regions;           /* BARs requested */

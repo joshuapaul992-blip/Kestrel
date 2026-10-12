@@ -487,7 +487,14 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids, struct
 static int pci_bus_match(struct device *dev, const struct device_driver *drv)
 {
     const struct pci_driver *pdrv = to_pci_driver(drv);
-    return pci_match_id(pdrv->id_table, to_pci_dev(dev)) != NULL;
+    struct pci_dev *pdev = to_pci_dev(dev);
+    if (!pci_match_id(pdrv->id_table, pdev)) return 0;
+    if (pdev->lkpi_native) {
+        printk(KERN_INFO "linuxkpi: pci %s: Kestrel drives it (%s), not offered to %s\n",
+               pci_name(pdev), pdev->lkpi_native, pdrv->name);
+        return 0;
+    }
+    return 1;
 }
 
 static int pci_bus_probe(struct device *dev)
@@ -658,6 +665,7 @@ void lkpi_pci_core_init(void)
 
         pdev->lkpi_handle = info.handle;
         pdev->lkpi_vector = -1;
+        pdev->lkpi_native = info.native;
         pdev->bus = bus;
         pdev->devfn = PCI_DEVFN(info.dev, info.fn);
         pdev->vendor = info.vendor;

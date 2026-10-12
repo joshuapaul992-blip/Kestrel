@@ -7,13 +7,17 @@
  *              each set to its monitor's EDID-preferred resolution
  *
  * A native GPU driver adds its monitors the same way, through
- * display_register(). */
+ * display_register(). With linuxkpi.drm=1 the DISPI adapters are left to
+ * Linux's bochs driver instead: the Linux KPI registers their heads after
+ * boot (linuxkpi/src/drm_client.c), and tty_add_monitor() gives each one a
+ * terminal. */
 #include <kernel/display.h>
 #include <kernel/fb.h>
 #include <kernel/mm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/gpu.h>
+#include <kernel/bootinfo.h>
 #include "pci.h"
 #include "edid.h"
 #include "bochs_dispi.h"
@@ -38,6 +42,7 @@ int display_register(const struct display_head *h)
     bool wc = h->vram && h->phys &&                 /* CPU-mapped VRAM: write-combining */
               vmm_set_write_combining(h->phys, (uint64_t)h->pitch * (uint64_t)h->height);
     heads[nheads] = *h;
+    __atomic_thread_fence(__ATOMIC_RELEASE);        /* late heads (Linux DRM drivers) are read by other threads */
     kprintf("display: monitor %d: %dx%dx%d, pitch %d, VRAM %lx%s%s, %s%s%s%s\n", nheads, h->width, h->height,
             h->bytes_pp * 8, h->pitch, h->phys, wc ? " (write-combining)" : "", h->shadow ? " + RAM shadow" : "", h->name,
             h->monitor[0] ? " (\"" : "", h->monitor, h->monitor[0] ? "\")" : "");
@@ -49,6 +54,31 @@ int display_count(void) { return nheads; }
 const struct display_head *display_get(int index)
 {
     return index >= 0 && index < nheads ? &heads[index] : NULL;
+}
+
+/* The head whose frame buffer lies in one of the device's memory BARs: that
+ * adapter is driven here, so the Linux KPI does not offer it to its drivers. */
+const char *display_pci_owner(const struct pci_device *dev)
+{
+    for (int i = 0; i < nheads; i++) {
+        if (!heads[i].phys) continue;
+        for (int b = 0; b < dev->bar_count && b < 6; b++) {
+            const struct pci_bar *bar = &dev->bars[b];
+            if ((bar->kind == PCI_BAR_MEM32 || bar->kind == PCI_BAR_MEM64) && bar->size &&
+                heads[i].phys >= bar->base && heads[i].phys < bar->base + bar->size)
+                return heads[i].name;
+        }
+    }
+    return NULL;
+}
+
+/* linuxkpi.drm=1: secondary adapters are left to Linux DRM drivers */
+static bool linux_drm_wanted(void)
+{
+    const char *o = strstr(g_boot.cmdline, "linuxkpi.drm");
+    if (!o || (o != g_boot.cmdline && o[-1] != ' ')) return false;
+    o += 12;
+    return !*o || *o == ' ' || (*o == '=' && (o[1] == '1' || o[1] == 'y' || o[1] == 'Y'));
 }
 
 /* ---- head 0: the boot frame buffer ---------------------------------------- */
@@ -85,6 +115,11 @@ static void probe_dispi(struct pci_device *dev)
     if ((lfb->kind != PCI_BAR_MEM32 && lfb->kind != PCI_BAR_MEM64) || !lfb->base || !lfb->size) return;
     /* The adapter GRUB already drives is head 0. */
     if (g_fb.phys >= lfb->base && g_fb.phys < lfb->base + lfb->size) return;
+    if (linux_drm_wanted()) {
+        kprintf("display: %02x:%02x.%x left to Linux's bochs driver (linuxkpi.drm=1)\n",
+                dev->bus, dev->device, dev->function);
+        return;
+    }
     if ((mmio_bar->kind != PCI_BAR_MEM32 && mmio_bar->kind != PCI_BAR_MEM64) || !mmio_bar->base) {
         kprintf("display: %02x:%02x.%x has no MMIO BAR2 (ISA-style VGA), skipped\n",
                 dev->bus, dev->device, dev->function);
