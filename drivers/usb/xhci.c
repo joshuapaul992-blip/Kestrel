@@ -49,7 +49,10 @@ void *memcpy(void *dst, const void *src, size_t n)
 #endif
 
 static void mem_zero(void *p, size_t n) { volatile uint8_t *b = p; while (n--) *b++ = 0; }
-static void mem_copy(void *d, const void *s, size_t n) { uint8_t *a = d; const uint8_t *b = s; while (n--) *a++ = *b++; }
+/* Bulk data goes through here (up to a megabyte at a time): rep movsb,
+ * which current CPUs run a cache line at a time. */
+static void mem_copy(void *d, const void *s, size_t n)
+{ __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) :: "memory"); }
 
 /* ---- default platform hooks ---------------------------------------------- */
 static uint8_t g_pool[XHCI_STATIC_POOL] __attribute__((aligned(4096)));
@@ -125,6 +128,8 @@ struct msc_if {
     volatile uint32_t residual;
     uint64_t wait_trb;
     uint8_t  wait_dci;
+    volatile uint64_t ev_trb;                   /* the TRB the completion names   */
+    uint64_t td_trb[XHCI_BULK_MAX / XHCI_TRB_MAX];  /* the current TD's TRBs      */
 };
 
 struct usb_dev {
@@ -304,7 +309,10 @@ bool xhci_ring_init(struct xhci_ring *r, uint32_t trbs)
 /* Write one TRB; returns its physical address (events refer to TRBs by
  * address). When the next slot is the Link TRB, hand the Link TRB to the
  * controller with the current cycle bit and flip the producer cycle. */
-uint64_t xhci_ring_enqueue(struct xhci_ring *r, uint64_t param, uint32_t status, uint32_t control)
+/* held: the TRB is written still owned by software (the other cycle
+ * bit); the caller hands it over by flipping TRB_CYCLE once the rest of
+ * its TD is written. */
+static uint64_t ring_put(struct xhci_ring *r, uint64_t param, uint32_t status, uint32_t control, bool held)
 {
     irqstate_t s = irq_off();
     struct xhci_trb *t = &r->trbs[r->enq];
@@ -312,7 +320,7 @@ uint64_t xhci_ring_enqueue(struct xhci_ring *r, uint64_t param, uint32_t status,
     t->param = param;
     t->status = status;
     wmb();                                      /* body before the cycle bit */
-    REG(t->control) = (control & ~TRB_CYCLE) | r->cycle;
+    REG(t->control) = (control & ~TRB_CYCLE) | (r->cycle ^ (held ? 1u : 0u));
 
     if (++r->enq == r->size - 1) {
         struct xhci_trb *link = &r->trbs[r->size - 1];
@@ -324,6 +332,11 @@ uint64_t xhci_ring_enqueue(struct xhci_ring *r, uint64_t param, uint32_t status,
     }
     irq_restore(s);
     return phys;
+}
+
+uint64_t xhci_ring_enqueue(struct xhci_ring *r, uint64_t param, uint32_t status, uint32_t control)
+{
+    return ring_put(r, param, status, control, false);
 }
 
 /* Consumer side of the event ring: an event is valid when its cycle bit
@@ -391,6 +404,7 @@ static void handle_transfer_event(const struct xhci_trb *ev)
         if (dci == d->msc.wait_dci && (ev->param == d->msc.wait_trb || cc != CC_SUCCESS)) {
             d->msc.code = cc;
             d->msc.residual = TRB_GET_LEN(ev->status);
+            d->msc.ev_trb = ev->param;
             d->msc.done = true;
             wake(&d->msc.done);
         }
@@ -918,7 +932,7 @@ static int configure_endpoints(struct usb_dev *d)
         if (!xhci_ring_init(&m->in_ring, XHCI_EP_RING_TRBS) || !xhci_ring_init(&m->out_ring, XHCI_EP_RING_TRBS))
             return XHCI_ERR_NOMEM;
         /* 64 KiB-aligned: one Normal TRB may not cross a 64 KiB boundary */
-        if (!m->bounce && !(m->bounce = dma(XHCI_BULK_MAX, XHCI_BULK_MAX, &m->bounce_phys))) return XHCI_ERR_NOMEM;
+        if (!m->bounce && !(m->bounce = dma(XHCI_BULK_MAX, XHCI_TRB_MAX, &m->bounce_phys))) return XHCI_ERR_NOMEM;
         for (int dir = 0; dir < 2; dir++) {
             uint8_t dci = dir ? m->in_dci : m->out_dci;
             struct xhci_ep_ctx *ep = in_ep(d, dci);
@@ -1272,10 +1286,25 @@ int xhci_bulk_transfer(uint8_t slot, bool in, void *buf, uint32_t len, uint32_t 
     uint8_t dci = in ? m->in_dci : m->out_dci;
     if (!in && len) mem_copy(m->bounce, buf, len);
 
+    /* One TD: a Normal TRB per 64 KiB of the bounce buffer, chained, the
+     * last one interrupting. The first TRB is written owned by us and
+     * handed over last, so the controller never starts a half-built TD.
+     * TD Size: the packets still to come after each TRB (at most 31). */
     m->done = false;
     m->wait_dci = dci;
-    m->wait_trb = xhci_ring_enqueue(r, m->bounce_phys, len,
-                                    TRB_TYPE(TRB_NORMAL) | TRB_IOC | (in ? TRB_ISP : 0));
+    m->ev_trb = 0;
+    uint32_t ntrb = len ? (len + XHCI_TRB_MAX - 1) / XHCI_TRB_MAX : 1;
+    uint32_t mps = in ? m->in_mps : m->out_mps;
+    struct xhci_trb *first = &r->trbs[r->enq];
+    for (uint32_t i = 0; i < ntrb; i++) {
+        uint32_t off = i * XHCI_TRB_MAX, part = len - off < XHCI_TRB_MAX ? len - off : XHCI_TRB_MAX;
+        uint32_t left = len - off - part, pkts = mps ? (left + mps - 1) / mps : 0;
+        if (pkts > 31) pkts = 31;
+        uint32_t ctl = TRB_TYPE(TRB_NORMAL) | (in ? TRB_ISP : 0) | (i + 1 == ntrb ? TRB_IOC : TRB_CH);
+        m->td_trb[i] = ring_put(r, m->bounce_phys + off, part | (pkts << 17), ctl, i == 0 && ntrb > 1);
+    }
+    if (ntrb > 1) { wmb(); REG(first->control) ^= TRB_CYCLE; }   /* the whole TD is the controller's */
+    m->wait_trb = m->td_trb[ntrb - 1];
     ring_doorbell(d->slot, dci);
 
     uint64_t end = now_ms() + timeout_ms;
@@ -1300,7 +1329,14 @@ int xhci_bulk_transfer(uint8_t slot, bool in, void *buf, uint32_t len, uint32_t 
         uint8_t cc = m->code;
         X.last_xfer_code = cc;
         if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
-            uint32_t got = m->residual <= len ? len - m->residual : 0;
+            /* a short packet ends the TD at the TRB the event names */
+            uint32_t got = 0;
+            for (uint32_t i = 0; i < ntrb; i++) {
+                uint32_t off = i * XHCI_TRB_MAX, part = len - off < XHCI_TRB_MAX ? len - off : XHCI_TRB_MAX;
+                if (m->td_trb[i] != m->ev_trb && i + 1 < ntrb) { got += part; continue; }
+                got += m->residual <= part ? part - m->residual : 0;
+                break;
+            }
             if (actual) *actual = got;
             if (in && got) mem_copy(buf, m->bounce, got);
         } else {

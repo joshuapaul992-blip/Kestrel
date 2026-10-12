@@ -990,6 +990,7 @@ static int64_t sys_mremap(uint64_t old, uint64_t olen, uint64_t nlen, uint64_t f
     return mm ? vm_mremap(mm, old, olen, nlen, (int)flags, naddr) : -ENOSYS;
 }
 
+#define MADV_WILLNEED 3
 #define MADV_DONTNEED 4
 #define MADV_FREE     8
 static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -999,6 +1000,7 @@ static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice, uint64_
     if (!mm) return -ENOSYS;
     if (addr & (UVM_PAGE - 1)) return -EINVAL;
     if (advice == MADV_DONTNEED || advice == MADV_FREE) return vm_madvise_dontneed(mm, addr, len);
+    if (advice == MADV_WILLNEED) vm_madvise_willneed(mm, addr, len);
     return 0;                                           /* hints: accepted */
 }
 
@@ -2576,23 +2578,37 @@ static int64_t sys_time(uint64_t tp, uint64_t a2, uint64_t a3, uint64_t a4, uint
     return v;
 }
 
-/* Advice only: the file must be open, nothing else happens. */
+/* Bytes [off, off + len) of f will be needed (len 0: to the end): the file
+ * system reads a small range into the page cache now, and reads a large
+ * one in larger pieces as it is used (vnode_ops.readahead). A hint: errors
+ * are not reported. */
+static void file_readahead(struct file *f, uint64_t off, uint64_t len)
+{
+    struct vnode *vn = f->vn;
+    if (!vn || vn->type != VREG || !vn->ops || !vn->ops->readahead) return;
+    uint64_t first = off / PAGE_SIZE, end = len && off + len > off ? (off + len + PAGE_SIZE - 1) / PAGE_SIZE : UINT64_MAX;
+    vn->ops->readahead(vn, first, end - first);
+}
+
+#define POSIX_FADV_WILLNEED 3
 static int64_t sys_fadvise64(uint64_t fd, uint64_t off, uint64_t len, uint64_t advice, uint64_t a5, uint64_t a6)
 {
-    (void)off; (void)len; (void)a5; (void)a6;
+    (void)a5; (void)a6;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
+    if (advice == POSIX_FADV_WILLNEED) file_readahead(f, off, len);
     fput(f);
     return advice > 5 ? -EINVAL : 0;
 }
 
-/* readahead(fd, off, count): a hint; regular files only, as on Linux. */
+/* readahead(fd, off, count): regular files only, as on Linux. */
 static int64_t sys_readahead(uint64_t fd, uint64_t off, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)off; (void)len; (void)a4; (void)a5; (void)a6;
+    (void)a4; (void)a5; (void)a6;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     int r = f->vn->type == VREG && (f->flags & O_ACCMODE) != O_WRONLY ? 0 : -EINVAL;
+    if (!r && len) file_readahead(f, off, len);
     fput(f);
     return r;
 }
@@ -3122,7 +3138,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
      * file's position lock) */
     case SYS_read: case SYS_write: case SYS_readv: case SYS_writev:
-    case SYS_pread64: case SYS_pwrite64: case SYS_lseek:
+    case SYS_pread64: case SYS_pwrite64: case SYS_lseek: case SYS_readahead: case SYS_fadvise64:
     case SYS_fstat: case SYS_fsync: case SYS_fdatasync:
     case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
     /* ioctl on such a file, a terminal or the sound card: their ioctls lock

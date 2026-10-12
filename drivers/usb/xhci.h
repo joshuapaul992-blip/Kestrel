@@ -311,7 +311,9 @@ bool     xhci_event_dequeue(struct xhci_event_ring *er, struct xhci_trb *out);
 #define XHCI_ERR_STALL      -8      /* endpoint stalled (host side recovered)   */
 #define XHCI_ERR_BUSY       -9      /* another thread holds the controller      */
 
-#define XHCI_BULK_MAX       65536   /* largest single bulk transfer (one TRB)   */
+#define XHCI_TRB_MAX        65536   /* one Normal TRB (never crosses 64 KiB)    */
+#define XHCI_BULK_MAX       (1024 * 1024)   /* largest bulk transfer: one TD of
+                                     * chained TRBs through the bounce buffer   */
 
 struct usb_key_event {
     uint8_t usage;              /* HID usage ID (page 0x07)                     */
@@ -401,7 +403,8 @@ int  xhci_msc_lookup(uint8_t slot, struct xhci_msc_info *out); /* still there?  
 int  xhci_control_transfer(uint8_t slot, uint8_t reqtype, uint8_t request, uint16_t value,
                            uint16_t index, uint16_t length, void *data);
 /* One bulk transfer of up to XHCI_BULK_MAX bytes through the device's DMA
- * bounce buffer (`buf` may be any memory). On timeout the TD is cancelled
+ * bounce buffer (`buf` may be any memory): one TD, a chain of Normal TRBs
+ * of up to 64 KiB each, and one wait. On timeout the TD is cancelled
  * (Stop Endpoint + Set TR Dequeue); on stall the host endpoint is reset and
  * XHCI_ERR_STALL returned so the caller can clear the device-side halt. */
 int  xhci_bulk_transfer(uint8_t slot, bool in, void *buf, uint32_t len,

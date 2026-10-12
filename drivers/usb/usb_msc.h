@@ -73,6 +73,7 @@ struct usb_msc_dev {
     uint64_t blocks;                    /* number of logical blocks            */
     uint32_t block_size;                /* bytes per block                     */
     bool     use_16;                    /* READ(16)/READ CAPACITY(16) needed   */
+    uint32_t max_blocks;                /* blocks per READ or WRITE command    */
 
     /* transport state */
     uint32_t tag;
