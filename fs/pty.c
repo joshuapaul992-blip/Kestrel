@@ -22,7 +22,14 @@
  * output) and the slave is /dev/ttyN itself. Its sessions end with
  * pty_console_hangup() instead of a master close.
  *
- * Locking: single CPU, interrupts off around queue updates. */
+ * Locking: each pty has its own spinlock over its queues, settings and
+ * open counts, so reads, writes, polls and the common ioctls (settings,
+ * window size, bytes waiting) run without the big kernel lock. What reaches
+ * other processes takes the big lock, never inside the pty's: the signals
+ * of the line discipline (collected in `sigs` and sent after the pty's lock
+ * is let go), the controlling terminal and foreground group (TIOCSCTTY,
+ * TIOCNOTTY, TIOCSPGRP, opening a slave) and the last close of a side.
+ * Slots are claimed and freed under alloc_lock. */
 #include <kernel/vfs.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
@@ -34,6 +41,8 @@
 #include <kernel/uvm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
+#include <kernel/smp.h>
 
 #define PTY_MAX     16
 #define IN_BUF      4096            /* like N_TTY's read buffer               */
@@ -42,6 +51,8 @@
 #define LINEQ       64
 
 struct pty {
+    struct spinlock lock;
+    uint32_t sigs;                  /* for the foreground group, not sent yet  */
     bool     used, locked;
     int      index;
     int      masters, slaves;       /* open files on each side                */
@@ -66,6 +77,7 @@ struct pty {
 };
 
 static struct pty ptys[PTY_MAX];
+static struct spinlock alloc_lock;  /* ptys[].used                            */
 static struct vnode *pts_nodes[PTY_MAX];
 static const struct vnode_ops master_ops, slave_ops;
 
@@ -130,6 +142,7 @@ static void erase_one(struct pty *p)
     }
 }
 
+/* The big lock is held: these reach other processes. */
 static void group_signal(struct pty *p, int sig)
 {
     if (!p->fg_pgrp) return;
@@ -157,7 +170,7 @@ static void input_char(struct pty *p, uint8_t c)
         if (sig && c) {
             if (!(t->c_lflag & TL_NOFLSH)) flush_input(p);
             if (t->c_lflag & TL_ECHO) echo_char(p, c);
-            group_signal(p, sig);
+            p->sigs |= 1u << sig;                       /* sent once p->lock is let go */
             return;
         }
     }
@@ -196,6 +209,28 @@ static void set_termios(struct pty *p, const struct ktermios *n)
     }
 }
 
+/* The line discipline's signals, collected under p->lock (take_sigs),
+ * sent after it is let go, with the big lock. */
+static uint32_t take_sigs(struct pty *p) { uint32_t s = p->sigs; p->sigs = 0; return s; }
+
+static void send_sigs(struct pty *p, uint32_t sigs)
+{
+    if (!sigs) return;
+    bkl_enter();
+    for (int sig = 1; sig < 32; sig++) if (sigs & (1u << sig)) group_signal(p, sig);
+    bkl_exit();
+}
+
+/* The session loses its terminal: SIGHUP for its foreground group and its
+ * leader. The big lock is held. */
+static void hangup_session(struct pty *p)
+{
+    if (!p->session) return;
+    group_signal(p, SIGHUP);
+    struct tcb *lead = task_find(p->session);
+    if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
+}
+
 static size_t slave_readable(const struct pty *p)
 {
     if (canon(p)) return p->lq_count ? (size_t)p->lineq[p->lq_head] + 1 : 0;  /* +1: an empty EOF line counts */
@@ -220,31 +255,36 @@ static void pty_defaults(struct pty *p)
     p->ws.ws_col = 80;
 }
 
+/* The big lock is held, so no slave can be opened meanwhile. */
 static void pty_free_if_unused(struct pty *p)
 {
-    if (p->used && !p->masters && !p->slaves) {
-        p->used = false;
-        for (int i = 0; i < MAX_TASKS; i++) {           /* nobody's controlling tty any more */
-            struct tcb *t = task_slot(i);
-            if (t->state != TASK_UNUSED && t->ctty == p->index + 1) t->ctty = 0;
-        }
+    uint64_t fl = spin_lock_irqsave(&p->lock);
+    bool unused = p->used && !p->masters && !p->slaves;
+    spin_unlock_irqrestore(&p->lock, fl);
+    if (!unused) return;
+    for (int i = 0; i < MAX_TASKS; i++) {               /* nobody's controlling tty any more */
+        struct tcb *t = task_slot(i);
+        if (t->state != TASK_UNUSED && t->ctty == p->index + 1) t->ctty = 0;
     }
+    fl = spin_lock_irqsave(&alloc_lock);
+    p->used = false;
+    spin_unlock_irqrestore(&alloc_lock, fl);
 }
 
 static int ptmx_open(struct vnode *vn, int flags, struct file **out)
 {
     (void)vn;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&alloc_lock);
     struct pty *p = NULL;
     for (int i = 0; i < PTY_MAX; i++) if (!ptys[i].used) { p = &ptys[i]; break; }
-    if (!p) { irq_restore(fl); return -ENOSPC; }
+    if (!p) { spin_unlock_irqrestore(&alloc_lock, fl); return -ENOSPC; }
     int idx = (int)(p - ptys);
-    memset(p, 0, __builtin_offsetof(struct pty, master_vn));
+    memset(p, 0, __builtin_offsetof(struct pty, master_vn));   /* nobody holds an unused pty's lock */
     p->used = true;
     p->locked = true;
     p->index = idx;
     pty_defaults(p);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&alloc_lock, fl);
 
     struct vnode *m = &p->master_vn;
     memset(m, 0, sizeof *m);
@@ -256,13 +296,19 @@ static int ptmx_open(struct vnode *vn, int flags, struct file **out)
     m->data = p;
     m->fs = vn->fs;
     struct file *f = vfs_file_new(m, flags);
-    if (!f) { p->used = false; return -ENOMEM; }
+    if (!f) {
+        fl = spin_lock_irqsave(&alloc_lock);
+        p->used = false;
+        spin_unlock_irqrestore(&alloc_lock, fl);
+        return -ENOMEM;
+    }
     p->masters = 1;
     *out = f;
     return 0;
 }
 
-/* The calling process takes `p` as its session's controlling terminal. */
+/* The calling process takes `p` as its session's controlling terminal.
+ * The big lock is held. */
 static void acquire_ctty(struct pty *p)
 {
     struct tcb *t = current_task();
@@ -275,15 +321,24 @@ static int slave_open(struct vnode *vn, int flags, struct file **out)
 {
     int idx = (int)(intptr_t)vn->ctx;
     struct pty *p = &ptys[idx];
-    if (!p->used || p->locked || !p->masters) return -EIO;
-    struct file *f = vfs_file_new(vn, flags);
-    if (!f) return -ENOMEM;
-    p->slaves++;
-    p->slave_seen = true;
-    struct tcb *t = current_task();
-    if (!(flags & O_NOCTTY) && t->user && t->sid == t->pid && !t->ctty && !p->session) acquire_ctty(p);
-    *out = f;
-    return 0;
+    bkl_enter();                                        /* the slot, and the session it may join */
+    int r = -EIO;
+    if (p->used && !p->locked && p->masters) {
+        struct file *f = vfs_file_new(vn, flags);
+        r = -ENOMEM;
+        if (f) {
+            uint64_t fl = spin_lock_irqsave(&p->lock);
+            p->slaves++;
+            p->slave_seen = true;
+            spin_unlock_irqrestore(&p->lock, fl);
+            struct tcb *t = current_task();
+            if (!(flags & O_NOCTTY) && t->user && t->sid == t->pid && !t->ctty && !p->session) acquire_ctty(p);
+            *out = f;
+            r = 0;
+        }
+    }
+    bkl_exit();
+    return r;
 }
 
 static struct pty *pty_of(struct file *f)
@@ -296,19 +351,21 @@ static struct pty *pty_of(struct file *f)
 static ssize_t out_read(struct pty *p, void *buf, size_t len, bool nonblock)
 {
     if (!len) return 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     while (!p->out_count) {
-        if (!p->console && p->slave_seen && !p->slaves) { irq_restore(fl); return -EIO; }   /* slave side closed */
-        if (nonblock) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(&p->out);
+        ssize_t r = 0;
+        if (!p->console && p->slave_seen && !p->slaves) r = -EIO;  /* slave side closed */
+        else if (nonblock) r = -EAGAIN;
+        else if (signal_pending()) r = -ERESTARTSYS;
+        if (r) { spin_unlock_irqrestore(&p->lock, fl); return r; }
+        sleep_on_locked(&p->out, &p->lock);
     }
     size_t n = len < p->out_count ? len : p->out_count;
     for (size_t i = 0; i < n; i++) ((uint8_t *)buf)[i] = p->out[(p->out_head + i) % OUT_BUF];
     p->out_head = (p->out_head + n) % OUT_BUF;
     p->out_count -= n;
     wakeup(&p->out);                                    /* slave writers waiting for room */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
     return (ssize_t)n;
 }
 
@@ -319,21 +376,33 @@ static ssize_t master_read(struct file *f, void *buf, size_t len)
 
 static ssize_t in_write(struct pty *p, const void *buf, size_t len, bool nonblock)
 {
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     size_t done = 0;
+    ssize_t err = -EAGAIN;
     while (done < len) {
         if (!canon(p) && p->in_count >= IN_BUF) {      /* canonical input is dropped when full */
             if (nonblock) break;
-            if (signal_pending()) { irq_restore(fl); return done ? (ssize_t)done : -ERESTARTSYS; }
-            sleep_on(&p->in);
+            if (signal_pending()) { err = -ERESTARTSYS; break; }
+            wakeup(&p->in);                             /* what is queued so far */
+            wakeup(&p->out);
+            uint32_t sigs = take_sigs(p);
+            if (sigs) {                                 /* not held back while waiting for room */
+                spin_unlock_irqrestore(&p->lock, fl);
+                send_sigs(p, sigs);
+                fl = spin_lock_irqsave(&p->lock);
+                continue;
+            }
+            sleep_on_locked(&p->in, &p->lock);
             continue;
         }
         input_char(p, ((const uint8_t *)buf)[done++]);
     }
     wakeup(&p->in);                                     /* slave readers */
     wakeup(&p->out);                                    /* echo for master readers */
-    irq_restore(fl);
-    return done ? (ssize_t)done : -EAGAIN;
+    uint32_t sigs = take_sigs(p);
+    spin_unlock_irqrestore(&p->lock, fl);
+    send_sigs(p, sigs);
+    return done ? (ssize_t)done : err;
 }
 
 static ssize_t master_write(struct file *f, const void *buf, size_t len)
@@ -347,27 +416,26 @@ static int master_poll(struct file *f, int events)
     int r = 0;
     poll_wait(&p->in);
     poll_wait(&p->out);
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     if (p->out_count) r |= POLLIN;
     if (p->slave_seen && !p->slaves) r |= POLLHUP | POLLIN;
     if (p->in_count < IN_BUF) r |= POLLOUT;
+    spin_unlock_irqrestore(&p->lock, fl);
     return r & (events | POLLHUP | POLLERR);
 }
 
 static void master_release(struct file *f)
 {
     struct pty *p = pty_of(f);
-    uint64_t fl = irq_save();
+    bkl_enter();                                        /* the session's processes, the slot */
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     p->masters = 0;
-    /* hang-up: the session's foreground group and its leader get SIGHUP */
-    if (p->session) {
-        group_signal(p, SIGHUP);
-        struct tcb *lead = task_find(p->session);
-        if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
-    }
     wakeup(&p->in);
     wakeup(&p->out);
+    spin_unlock_irqrestore(&p->lock, fl);
+    hangup_session(p);                                  /* its foreground group and leader: SIGHUP */
     pty_free_if_unused(p);
-    irq_restore(fl);
+    bkl_exit();
 }
 
 /* ---- slave side ------------------------------------------------------------ */
@@ -375,7 +443,7 @@ static ssize_t slave_read(struct file *f, void *buf, size_t len)
 {
     struct pty *p = pty_of(f);
     if (!len) return 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     uint8_t vmin = p->tio.c_cc[VMIN], vtime = p->tio.c_cc[VTIME];
     uint64_t deadline = (!canon(p) && vtime) ? time_ms() + (uint64_t)vtime * 100 : 0;
     for (;;) {
@@ -383,21 +451,23 @@ static ssize_t slave_read(struct file *f, void *buf, size_t len)
         if (canon(p) ? avail > 0 : (avail >= (vmin ? (vmin < len ? vmin : len) : 1) ||
                                     (avail && vtime) || (!vmin && !vtime)))
             break;
-        if (!p->masters) { irq_restore(fl); return 0; } /* hung up: EOF */
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
+        ssize_t r = 1;
+        if (!p->masters) r = 0;                         /* hung up: EOF */
+        else if (f->flags & O_NONBLOCK) r = -EAGAIN;
+        else if (signal_pending()) r = -ERESTARTSYS;
+        if (r <= 0) { spin_unlock_irqrestore(&p->lock, fl); return r; }
         if (deadline) {                                 /* VTIME: poll the clock */
             if (time_ms() >= deadline) break;
-            irq_restore(fl);
+            spin_unlock_irqrestore(&p->lock, fl);
             task_sleep_ms(10);
-            fl = irq_save();
+            fl = spin_lock_irqsave(&p->lock);
         } else {
-            sleep_on(&p->in);
+            sleep_on_locked(&p->in, &p->lock);
         }
     }
     size_t n;
     if (canon(p)) {
-        if (!p->lq_count) { irq_restore(fl); return 0; }
+        if (!p->lq_count) { spin_unlock_irqrestore(&p->lock, fl); return 0; }
         size_t line = p->lineq[p->lq_head];
         n = len < line ? len : line;
         if (n == line) { p->lq_head = (p->lq_head + 1) % LINEQ; p->lq_count--; }
@@ -409,29 +479,30 @@ static ssize_t slave_read(struct file *f, void *buf, size_t len)
     p->in_head = (p->in_head + n) % IN_BUF;
     p->in_count -= n;
     wakeup(&p->in);                                     /* master writers waiting for room */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
     return (ssize_t)n;
 }
 
 static ssize_t slave_write(struct file *f, const void *buf, size_t len)
 {
     struct pty *p = pty_of(f);
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     size_t done = 0;
+    ssize_t err = -EAGAIN;
     while (done < len) {
-        if (!p->masters) { irq_restore(fl); return done ? (ssize_t)done : -EIO; }
+        if (!p->masters) { err = -EIO; break; }
         if (p->out_count + 2 > OUT_BUF) {               /* room for "\r\n" */
             if (f->flags & O_NONBLOCK) break;
-            if (signal_pending()) { irq_restore(fl); return done ? (ssize_t)done : -ERESTARTSYS; }
+            if (signal_pending()) { err = -ERESTARTSYS; break; }
             wakeup(&p->out);
-            sleep_on(&p->out);
+            sleep_on_locked(&p->out, &p->lock);
             continue;
         }
         out_char(p, ((const uint8_t *)buf)[done++]);
     }
     wakeup(&p->out);
-    irq_restore(fl);
-    return done ? (ssize_t)done : -EAGAIN;
+    spin_unlock_irqrestore(&p->lock, fl);
+    return done ? (ssize_t)done : err;
 }
 
 static int slave_poll(struct file *f, int events)
@@ -440,20 +511,24 @@ static int slave_poll(struct file *f, int events)
     int r = 0;
     poll_wait(&p->in);
     poll_wait(&p->out);
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     if (slave_readable(p)) r |= POLLIN;
     if (!p->masters) r |= POLLHUP | POLLIN;
     if (p->out_count + 2 <= OUT_BUF) r |= POLLOUT;
+    spin_unlock_irqrestore(&p->lock, fl);
     return r & (events | POLLHUP | POLLERR);
 }
 
 static void slave_release(struct file *f)
 {
     struct pty *p = pty_of(f);
-    uint64_t fl = irq_save();
+    bkl_enter();                                        /* the slot */
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     if (p->slaves) p->slaves--;
     wakeup(&p->out);                                    /* master readers see EIO/HUP */
+    spin_unlock_irqrestore(&p->lock, fl);
     pty_free_if_unused(p);
-    irq_restore(fl);
+    bkl_exit();
 }
 
 /* ---- ioctls (both sides) ------------------------------------------------- */
@@ -461,67 +536,12 @@ static void slave_release(struct file *f)
  * (see ioctl_args in kernel/syscall.c), so only NULL needs refusing here. */
 static bool uptr(void *arg, size_t len) { (void)len; return arg != NULL; }
 
-static int pty_ioctl(struct file *f, unsigned long req, void *arg)
+/* Who owns the terminal: these change other processes' view of it, so they
+ * run with the big lock (pty_ioctl takes it). */
+static int pty_ioctl_owner(struct pty *p, bool master, unsigned long req, void *arg)
 {
-    struct pty *p = pty_of(f);
-    bool master = f->vn->ops == &master_ops;
     struct tcb *t = current_task();
     switch (req) {
-    case TCGETS:
-        if (!uptr(arg, sizeof(struct ktermios))) return -EFAULT;
-        *(struct ktermios *)arg = p->tio;
-        return 0;
-    case TCSETS: case TCSETSW: case TCSETSF: {
-        if (!uptr(arg, sizeof(struct ktermios))) return -EFAULT;
-        struct ktermios n = *(const struct ktermios *)arg;
-        uint64_t fl = irq_save();
-        if (req == TCSETSF) flush_input(p);
-        set_termios(p, &n);
-        wakeup(&p->in);
-        irq_restore(fl);
-        return 0;
-    }
-    case TIOCGWINSZ:
-        if (!uptr(arg, sizeof(struct kwinsize))) return -EFAULT;
-        *(struct kwinsize *)arg = p->ws;
-        return 0;
-    case TIOCSWINSZ: {
-        if (!uptr(arg, sizeof(struct kwinsize))) return -EFAULT;
-        struct kwinsize w = *(const struct kwinsize *)arg;
-        bool changed = memcmp(&w, &p->ws, sizeof w) != 0;
-        p->ws = w;
-        if (changed) group_signal(p, SIGWINCH);
-        return 0;
-    }
-    case TIOCGPTN:
-        if (!master) return -ENOTTY;
-        if (!uptr(arg, 4)) return -EFAULT;
-        *(uint32_t *)arg = (uint32_t)p->index;
-        return 0;
-    case TIOCSPTLCK:
-        if (!master) return -ENOTTY;
-        if (!uptr(arg, 4)) return -EFAULT;
-        p->locked = *(const int32_t *)arg != 0;
-        return 0;
-    case FIONREAD_T:
-        if (!uptr(arg, 4)) return -EFAULT;
-        *(int32_t *)arg = (int32_t)(master ? p->out_count : (canon(p) ? (p->lq_count ? p->lineq[p->lq_head] : 0) : p->in_count));
-        return 0;
-    case TIOCOUTQ:
-        if (!uptr(arg, 4)) return -EFAULT;
-        *(int32_t *)arg = master ? 0 : (int32_t)p->out_count;
-        return 0;
-    case TCFLSH: {
-        long q = (long)arg;                             /* 0 input, 1 output, 2 both */
-        uint64_t fl = irq_save();
-        if (q == 0 || q == 2) flush_input(p);
-        if (q == 1 || q == 2) p->out_head = p->out_count = 0;
-        wakeup(&p->in); wakeup(&p->out);
-        irq_restore(fl);
-        return 0;
-    }
-    case TCSBRK: case TCSBRKP: case TCXONC:
-        return 0;                                       /* nothing is ever pending */
     case TIOCSCTTY:
         if (master) return -ENOTTY;
         if (t->ctty == p->index + 1) return 0;
@@ -534,11 +554,6 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         t->ctty = 0;
         if (t->sid == t->pid) { group_signal(p, SIGHUP); p->session = p->fg_pgrp = 0; }
         return 0;
-    case TIOCGPGRP:
-        if (!uptr(arg, 4)) return -EFAULT;
-        if (!master && t->ctty != p->index + 1) return -ENOTTY;
-        *(int32_t *)arg = p->fg_pgrp;
-        return 0;
     case TIOCSPGRP: {
         if (!uptr(arg, 4)) return -EFAULT;
         if (master || t->ctty != p->index + 1) return -ENOTTY;
@@ -547,10 +562,102 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         p->fg_pgrp = g;
         return 0;
     }
+    default:
+        return -ENOTTY;
+    }
+}
+
+static int pty_ioctl(struct file *f, unsigned long req, void *arg)
+{
+    struct pty *p = pty_of(f);
+    bool master = f->vn->ops == &master_ops;
+    struct tcb *t = current_task();
+    if (req == TIOCSCTTY || req == TIOCNOTTY || req == TIOCSPGRP) {
+        bkl_enter();
+        int r = pty_ioctl_owner(p, master, req, arg);
+        bkl_exit();
+        return r;
+    }
+    uint64_t fl;
+    switch (req) {
+    case TCGETS:
+        if (!uptr(arg, sizeof(struct ktermios))) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        *(struct ktermios *)arg = p->tio;
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case TCSETS: case TCSETSW: case TCSETSF: {
+        if (!uptr(arg, sizeof(struct ktermios))) return -EFAULT;
+        struct ktermios n = *(const struct ktermios *)arg;
+        fl = spin_lock_irqsave(&p->lock);
+        if (req == TCSETSF) flush_input(p);
+        set_termios(p, &n);
+        wakeup(&p->in);
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    }
+    case TIOCGWINSZ:
+        if (!uptr(arg, sizeof(struct kwinsize))) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        *(struct kwinsize *)arg = p->ws;
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case TIOCSWINSZ: {
+        if (!uptr(arg, sizeof(struct kwinsize))) return -EFAULT;
+        struct kwinsize w = *(const struct kwinsize *)arg;
+        fl = spin_lock_irqsave(&p->lock);
+        bool changed = memcmp(&w, &p->ws, sizeof w) != 0;
+        p->ws = w;
+        spin_unlock_irqrestore(&p->lock, fl);
+        if (changed) send_sigs(p, 1u << SIGWINCH);
+        return 0;
+    }
+    case TIOCGPTN:
+        if (!master) return -ENOTTY;
+        if (!uptr(arg, 4)) return -EFAULT;
+        *(uint32_t *)arg = (uint32_t)p->index;
+        return 0;
+    case TIOCSPTLCK:
+        if (!master) return -ENOTTY;
+        if (!uptr(arg, 4)) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        p->locked = *(const int32_t *)arg != 0;
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case FIONREAD_T:
+        if (!uptr(arg, 4)) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        *(int32_t *)arg = (int32_t)(master ? p->out_count : (canon(p) ? (p->lq_count ? p->lineq[p->lq_head] : 0) : p->in_count));
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case TIOCOUTQ:
+        if (!uptr(arg, 4)) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        *(int32_t *)arg = master ? 0 : (int32_t)p->out_count;
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case TCFLSH: {
+        long q = (long)arg;                             /* 0 input, 1 output, 2 both */
+        fl = spin_lock_irqsave(&p->lock);
+        if (q == 0 || q == 2) flush_input(p);
+        if (q == 1 || q == 2) p->out_head = p->out_count = 0;
+        wakeup(&p->in); wakeup(&p->out);
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    }
+    case TCSBRK: case TCSBRKP: case TCXONC:
+        return 0;                                       /* nothing is ever pending */
+    /* reading who owns it: single words, set with the big lock */
+    case TIOCGPGRP:
+        if (!uptr(arg, 4)) return -EFAULT;
+        if (!master && t->ctty != p->index + 1) return -ENOTTY;
+        *(int32_t *)arg = __atomic_load_n(&p->fg_pgrp, __ATOMIC_RELAXED);
+        return 0;
     case TIOCGSID:
         if (!uptr(arg, 4)) return -EFAULT;
-        if (!p->session) return -ENOTTY;
-        *(int32_t *)arg = p->session;
+        int32_t sid = __atomic_load_n(&p->session, __ATOMIC_RELAXED);
+        if (!sid) return -ENOTTY;
+        *(int32_t *)arg = sid;
         return 0;
     case TIOCGETD:
         if (!uptr(arg, 4)) return -EFAULT;
@@ -560,7 +667,8 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         return 0;
     case FIONBIO:
         if (!uptr(arg, 4)) return -EFAULT;
-        if (*(const int32_t *)arg) f->flags |= O_NONBLOCK; else f->flags &= ~O_NONBLOCK;
+        if (*(const int32_t *)arg) __atomic_or_fetch(&f->flags, O_NONBLOCK, __ATOMIC_RELAXED);
+        else __atomic_and_fetch(&f->flags, ~O_NONBLOCK, __ATOMIC_RELAXED);
         return 0;
     default:
         return -ENOTTY;
@@ -569,15 +677,16 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
 
 static const struct vnode_ops master_ops = {
     .fread = master_read, .fwrite = master_write, .poll = master_poll, .release = master_release,
-    .fioctl = pty_ioctl,
+    .fioctl = pty_ioctl, .nolock = true,
 };
 static const struct vnode_ops slave_ops = {
     .open = slave_open, .fread = slave_read, .fwrite = slave_write, .poll = slave_poll,
-    .release = slave_release, .fioctl = pty_ioctl,
+    .release = slave_release, .fioctl = pty_ioctl, .nolock = true,
 };
 static const struct vnode_ops ptmx_ops = { .open = ptmx_open };
 
-/* /dev/tty for a process whose controlling terminal is a pty. */
+/* /dev/tty for a process whose controlling terminal is a pty. The big lock
+ * is held (devfs's open). */
 int pty_open_ctty(int flags, struct file **out)
 {
     struct tcb *t = current_task();
@@ -586,7 +695,9 @@ int pty_open_ctty(int flags, struct file **out)
     if (!p->used || !p->masters) return -EIO;
     struct file *f = vfs_file_new(slave_node(p), flags);
     if (!f) return -ENOMEM;
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     p->slaves++;
+    spin_unlock_irqrestore(&p->lock, fl);
     *out = f;
     return 0;
 }
@@ -594,10 +705,10 @@ int pty_open_ctty(int flags, struct file **out)
 /* ---- console ptys (kernel/vt.c) ------------------------------------------ */
 int pty_console_create(struct vnode *tty_node, int rows, int cols)
 {
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&alloc_lock);
     struct pty *p = NULL;
     for (int i = PTY_MAX - 1; i >= 0; i--) if (!ptys[i].used) { p = &ptys[i]; break; }   /* /dev/pts/0 stays for xterm */
-    if (!p) { irq_restore(fl); return -ENOSPC; }
+    if (!p) { spin_unlock_irqrestore(&alloc_lock, fl); return -ENOSPC; }
     int idx = (int)(p - ptys);
     memset(p, 0, __builtin_offsetof(struct pty, master_vn));
     p->used = true;
@@ -610,7 +721,7 @@ int pty_console_create(struct vnode *tty_node, int rows, int cols)
     p->slave_vn = tty_node;
     tty_node->ops = &slave_ops;                         /* /dev/ttyN is now this pty's slave */
     tty_node->ctx = (void *)(intptr_t)idx;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&alloc_lock, fl);
     return idx;
 }
 
@@ -623,25 +734,24 @@ void pty_console_input(int idx, const void *buf, size_t len) { in_write(&ptys[id
 void pty_console_hangup(int idx)
 {
     struct pty *p = &ptys[idx];
-    uint64_t fl = irq_save();
-    if (p->session) {
-        group_signal(p, SIGHUP);
-        struct tcb *lead = task_find(p->session);
-        if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
-    }
+    bkl_enter();                                        /* the session's processes */
+    hangup_session(p);
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
         if (t->state != TASK_UNUSED && t->ctty == idx + 1) t->ctty = 0;
     }
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     struct kwinsize ws = p->ws;
     pty_defaults(p);
     p->ws = ws;
     p->session = p->fg_pgrp = 0;
     p->slave_seen = false;
     flush_input(p);
+    p->sigs = 0;
     wakeup(&p->in);
     wakeup(&p->out);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
+    bkl_exit();
 }
 
 void pty_init(struct vnode *devroot)

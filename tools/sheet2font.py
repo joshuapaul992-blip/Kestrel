@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """
-tools/sheet2font.py -- turn a 16 x 16 glyph sheet image into the C array
-`unsigned char kestrel_font[256][16]` (8 x 16 pixels, one byte per row,
-bit 7 = leftmost pixel).
+tools/sheet2font.py -- turn a 16 x 16 glyph sheet image into a terminal font
+for kernel/tty.c (struct kfont, include/kernel/kestrel_font.h).
 
-    python3 tools/sheet2font.py sheet.png drivers/kestrel_font.c [--preview out.png]
+    python3 tools/sheet2font.py sheet.bmp drivers/kfont_12.c kfont_12 [--preview out.png]
 
-The sheet must hold 256 glyphs in a 16 x 16 grid (code point = row * 16 +
-column), light glyphs on a dark background. Any cell size works:
+The sheet holds 256 glyphs in a 16 x 16 grid (code point = row * 16 +
+column, Windows-1252 order), light glyphs on a dark background, every cell
+the same whole number of pixels. Glyphs are copied pixel for pixel: nothing
+is scaled, moved or thresholded beyond light/dark.
 
-  * an exact 128 x 256 sheet (8 x 16 cells) converts losslessly;
-  * a sheet with larger cells whose ink fits in 8 x 16 pixels everywhere
-    (e.g. 256 x 256 = 16 x 16 cells drawn in the middle 8 columns) is
-    cropped losslessly: the same 8 x 16 window is cut out of every cell,
-    pixel for pixel, with no scaling;
-  * any other larger or scaled sheet (e.g. 240 x 368 = 15 x 23 cells) is resampled:
-    each cell is cropped to its ink bounding box across the whole font
-    (so baselines stay aligned), area-averaged down to 8 x 16 and
-    thresholded. JPEG noise is removed by the threshold.
+The terminal cell is the box that holds the ink of every glyph, plus a
+one-pixel margin on each side, cut out of the same place in every sheet
+cell, so all glyphs keep their baseline and their position. When the sheet's
+own cells are already that tight (Kestrel_12: 13 x 18), the cell is the
+sheet's cell. At most 16 pixels wide.
 
 Requires Pillow.
 """
 import sys
 from PIL import Image
-
-W, H = 8, 16
 
 
 def main():
@@ -34,83 +29,69 @@ def main():
         i = argv.index("--preview")
         preview = argv[i + 1]
         del argv[i:i + 2]
-    if len(argv) != 2:
+    if len(argv) != 3:
         sys.exit(__doc__)
-    src, dst = argv
+    src, dst, name = argv
 
     img = Image.open(src).convert("L")
-    cw, ch = img.size[0] / 16.0, img.size[1] / 16.0
-    exact = (cw, ch) == (W, H)
+    if img.size[0] % 16 or img.size[1] % 16:
+        sys.exit("%s: %dx%d is not a 16 x 16 grid of whole cells" % (src, img.size[0], img.size[1]))
+    cw, ch = img.size[0] // 16, img.size[1] // 16
     px = img.load()
+    ink = lambda x, y: px[x, y] > 128
 
-    # Common ink box across all cells keeps every glyph on the same baseline.
     x0, y0, x1, y1 = cw, ch, 0, 0
-    if not exact:
-        for code in range(256):
-            cx, cy = (code % 16) * cw, (code // 16) * ch
-            for y in range(int(ch)):
-                for x in range(int(cw)):
-                    if px[int(cx + x), int(cy + y)] > 128:
-                        x0, y0 = min(x0, x), min(y0, y)
-                        x1, y1 = max(x1, x + 1), max(y1, y + 1)
-    # Whole-pixel cells whose ink fits in W x H: cut out a W x H window
-    # around the ink, the same for every cell, without resampling.
-    crop = (not exact and cw == int(cw) and ch == int(ch) and cw >= W and ch >= H
-            and x1 - x0 <= W and y1 - y0 <= H)
-    if crop:
-        ox = min(max(0, x0 - (W - (x1 - x0)) // 2), int(cw) - W)
-        oy = min(max(0, y0 - (H - (y1 - y0)) // 2), int(ch) - H)
-    elif not exact:
-        # pad the box to the 1:2 cell aspect with a 1-pixel margin
-        x0, y0 = max(0, x0 - 1), max(0, y0 - 1)
-        x1, y1 = min(int(cw), x1 + 1), min(int(ch), y1 + 1)
+    for code in range(256):
+        cx, cy = (code % 16) * cw, (code // 16) * ch
+        for y in range(ch):
+            for x in range(cw):
+                if ink(cx + x, cy + y):
+                    x0, y0 = min(x0, x), min(y0, y)
+                    x1, y1 = max(x1, x + 1), max(y1, y + 1)
+    x0, y0 = max(0, x0 - 1), max(0, y0 - 1)
+    x1, y1 = min(cw, x1 + 1), min(ch, y1 + 1)
+    W, H = x1 - x0, y1 - y0
+    if W > 16:
+        sys.exit("%s: glyphs %d pixels wide, at most 16" % (src, W))
 
     font = []
     for code in range(256):
-        cx, cy = (code % 16) * cw, (code // 16) * ch
-        if exact:
-            cell = img.crop((int(cx), int(cy), int(cx) + W, int(cy) + H))
-        elif crop:
-            cell = img.crop((int(cx) + ox, int(cy) + oy, int(cx) + ox + W, int(cy) + oy + H))
-        else:
-            cell = img.crop((int(cx + x0), int(cy + y0), int(cx + x1), int(cy + y1)))
-            cell = cell.resize((W, H), Image.BOX)
-        cp = cell.load()
+        cx, cy = (code % 16) * cw + x0, (code // 16) * ch + y0
         rows = []
         for y in range(H):
             v = 0
             for x in range(W):
-                if cp[x, y] > (128 if exact or crop else 96):
-                    v |= 0x80 >> x
+                if ink(cx + x, cy + y):
+                    v |= 0x8000 >> x
             rows.append(v)
         font.append(rows)
 
     with open(dst, "w") as f:
-        f.write("/* Generated by tools/sheet2font.py from %s -- 256 glyphs, 8x16, MSB = left. */\n"
-                % src.split("/")[-1])
+        f.write("/* Generated by tools/sheet2font.py from %s: 256 glyphs, %dx%d,\n"
+                " * cut pixel for pixel from the sheet's %dx%d cells at +%d,+%d. */\n"
+                % (src.split("/")[-1], W, H, cw, ch, x0, y0))
         f.write("#include <kernel/kestrel_font.h>\n\n")
-        f.write("unsigned char kestrel_font[256][16] = {\n")
+        f.write("static const uint16_t %s_rows[256 * %d] = {\n" % (name, H))
         for code, rows in enumerate(font):
             label = chr(code) if 0x20 < code < 0x7F and chr(code) not in "\\*/" else ""
-            f.write("    /* 0x%02X %-1s */ { %s },\n" % (code, label, ", ".join("0x%02X" % r for r in rows)))
-        f.write("};\n")
+            f.write("    /* 0x%02X %-1s */ %s,\n" % (code, label, ", ".join("0x%04X" % r for r in rows)))
+        f.write("};\n\n")
+        f.write("const struct kfont %s = { %d, %d, %s_rows };\n" % (name, W, H, name))
 
     if preview:
-        out = Image.new("L", (16 * W * 4, 16 * H * 4), 0)
+        s = 4
+        out = Image.new("L", (16 * W * s, 16 * H * s), 0)
         op = out.load()
         for code, rows in enumerate(font):
-            gx, gy = (code % 16) * W * 4, (code // 16) * H * 4
+            gx, gy = (code % 16) * W * s, (code // 16) * H * s
             for y, r in enumerate(rows):
                 for x in range(W):
-                    if r & (0x80 >> x):
-                        for dy in range(4):
-                            for dx in range(4):
-                                op[gx + x * 4 + dx, gy + y * 4 + dy] = 255
+                    if r & (0x8000 >> x):
+                        for dy in range(s):
+                            for dx in range(s):
+                                op[gx + x * s + dx, gy + y * s + dy] = 255
         out.save(preview)
-    how = ("exact" if exact else
-           "cropped losslessly from %.0fx%.0f cells at +%d,+%d" % (cw, ch, ox, oy) if crop else
-           "resampled from %.0fx%.0f cells" % (cw, ch))
-    print("%s: %d glyphs written (%s)" % (dst, len(font), how))
+    print("%s: %s, %dx%d glyphs cut from %dx%d cells at +%d,+%d" % (dst, name, W, H, cw, ch, x0, y0))
 
 
 if __name__ == "__main__":

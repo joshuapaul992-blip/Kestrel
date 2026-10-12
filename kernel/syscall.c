@@ -472,16 +472,21 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
     if ((uint32_t)req == FIONBIO) {                     /* every kind of file, as on Linux */
         uint32_t on;
         if (get_user_u32(&on, (const void *)arg)) { r = -EFAULT; goto out; }
-        if (on) f->flags |= O_NONBLOCK; else f->flags &= ~O_NONBLOCK;
+        if (on) __atomic_or_fetch(&f->flags, O_NONBLOCK, __ATOMIC_RELAXED);
+        else __atomic_and_fetch(&f->flags, ~O_NONBLOCK, __ATOMIC_RELAXED);
         r = 0;
         goto out;
     }
     if ((uint32_t)req == 0x5451 || (uint32_t)req == 0x5450) {   /* FIOCLEX, FIONCLEX */
-        current_task()->files->cloexec[fd] = (uint32_t)req == 0x5451;
+        struct files_struct *fs = current_task()->files;
+        uint64_t fl = spin_lock_irqsave(&fs->lock);
+        if (fs->fd[fd] == f) fs->cloexec[fd] = (uint32_t)req == 0x5451;
+        spin_unlock_irqrestore(&fs->lock, fl);
         r = 0;
         goto out;
     }
     if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
+        if (!bkl_depth()) bkl_enter();                  /* a unix socket's fget let it be; kept to the end */
         r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
     } else if (size < 0) {
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
@@ -3115,6 +3120,10 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_pread64: case SYS_pwrite64: case SYS_lseek:
     case SYS_fstat: case SYS_fsync: case SYS_fdatasync:
     case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
+    /* ioctl on such a file, a terminal or the sound card: their ioctls lock
+     * what they touch (a pty's ownership requests and the network ones
+     * take the big lock themselves) */
+    case SYS_ioctl:
         return fd_nolock(f->rdi);
     /* waiting on descriptors: fget takes the kernel lock at the first file
      * that needs it, and the call keeps it from then on */

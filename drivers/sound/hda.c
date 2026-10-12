@@ -935,7 +935,7 @@ static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg)
         return copy_to_user(arg, info, sizeof info) ? -EFAULT : 0;
     }
     case 0x500E:                                        /* SNDCTL_DSP_NONBLOCK */
-        f->flags |= O_NONBLOCK;
+        __atomic_or_fetch(&f->flags, O_NONBLOCK, __ATOMIC_RELAXED);
         return 0;
     case 0x8004500F:                                    /* SNDCTL_DSP_GETCAPS: trigger, realtime */
         return put_int(arg, 0x00001000 | 0x00000200);

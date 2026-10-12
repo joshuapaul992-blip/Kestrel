@@ -146,9 +146,17 @@ static int kinput_poll(struct file *f, int events)
     return (q_head != q_tail) ? (events & POLLIN) : 0;
 }
 
-static void set_grab(struct file *f, bool on)
+/* Grab for f (on), or let go if f holds it (off): false if another file
+ * holds it. Tested and set under qlock: two grabs can race (ioctl runs
+ * without the big kernel lock). */
+static bool set_grab(struct file *f, bool on)
 {
     uint64_t fl = spin_lock_irqsave(&qlock);
+    if (grabbed && grab_file != f) {
+        spin_unlock_irqrestore(&qlock, fl);
+        return !on;
+    }
+    if (!on && !grabbed) { spin_unlock_irqrestore(&qlock, fl); return true; }
     if (on) {
         q_head = q_tail = 0;
         mouse_buttons = 0;
@@ -162,6 +170,7 @@ static void set_grab(struct file *f, bool on)
     spin_unlock_irqrestore(&qlock, fl);
     kprintf("kinput: %s by pid %d\n", on ? "grabbed" : "released", current_task()->pid);
     if (dropped) { kprintf("kinput: %u event(s) dropped (queue full)\n", dropped); dropped = 0; }
+    return true;
 }
 
 /* The argument is a kernel copy (sys_ioctl). */
@@ -172,19 +181,10 @@ static int kinput_ioctl(struct file *f, unsigned long req, void *arg)
     if (req != KINPUT_GRAB) return -ENOTTY;
     if (bad_user_ptr(arg, sizeof(int))) return -EFAULT;
     int on = *(int *)arg;
-    if (on) {
-        if (grabbed && grab_file != f) return -EBUSY;
-        set_grab(f, true);
-    } else if (grabbed && grab_file == f) {
-        set_grab(NULL, false);
-    }
-    return 0;
+    return set_grab(f, on != 0) ? 0 : -EBUSY;
 }
 
-static void kinput_release(struct file *f)
-{
-    if (grabbed && grab_file == f) set_grab(NULL, false);
-}
+static void kinput_release(struct file *f) { set_grab(f, false); }
 
 static const struct vnode_ops kinput_ops = {
     .fread = kinput_fread, .poll = kinput_poll, .fioctl = kinput_ioctl, .release = kinput_release,
