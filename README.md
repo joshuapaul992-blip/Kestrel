@@ -8,6 +8,8 @@ Because I can.
 ### What made you think to do this?
 Because I want to prove that vibe-coding operating systems isn't always a bad idea, in fact, it can prove everything Claude Opus 5.5 is capable of, like coding a whole OS from scratch, and even getting Firefox to work.
 
+**Also, if you have any issues, feel free to open an issue ticket so I can take care of the problem.**
+
 ## Overview
 
 Kestrel (0.3.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
