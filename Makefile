@@ -157,7 +157,7 @@ LKPI_NV_SRC := third_party/linux/drivers/gpu/drm/display/drm_display_helper_mod.
                third_party/linux/drivers/gpu/drm/scheduler/sched_entity.c \
                third_party/linux/drivers/gpu/drm/scheduler/sched_fence.c \
                third_party/linux/drivers/i2c/algos/i2c-algo-bit.c third_party/linux/lib/maple_tree.c \
-               $(addprefix $(LKPI_NV_DIR)/,$(LKPI_NV_FILES))
+               $(addprefix $(LKPI_NV_DIR)/,$(LKPI_NV_FILES)) linuxkpi/nouveau/kestrel.c
 LKPI_NV_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_NV_SRC))
 LKPI_NV_CFLAGS := $(LKPI_DRM_CFLAGS) -Wno-address-of-packed-member -Wno-format-security -Wno-array-bounds -Ilinuxkpi/nouveau/include -Ilinuxkpi/nouveau/include/nvkm \
                   -Ilinuxkpi/nouveau/nvkm -Ilinuxkpi/nouveau \

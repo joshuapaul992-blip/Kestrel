@@ -48,6 +48,7 @@
 struct kdrm_head {
     struct kdrm_client       *kc;
     struct drm_client_buffer *buffer;
+    struct drm_crtc          *crtc;
     struct iosys_map          map;
     int                       width, height, pitch;
     int                       monitor;          /* Kestrel's monitor number */
@@ -131,6 +132,30 @@ static int kdrm_vmap(struct drm_client_buffer *buffer, struct iosys_map *map)
     return ret;
 }
 
+/* The driver's own account of a frame buffer (nouveau: linuxkpi/nouveau/kestrel.c) */
+void __weak lkpi_drm_fb_where(struct drm_crtc *crtc, struct drm_framebuffer *fb, size_t last) { }
+
+/* A frame buffer drawn in place must take what is written: write a pattern
+ * to its first and last words and read it back, so a mapping that drops
+ * writes shows in the log rather than as a blank monitor. */
+static void kdrm_probe_vram(struct kdrm_head *h)
+{
+    struct drm_device *dev = h->kc->client.dev;
+    size_t last = (size_t)h->pitch * h->height - 4;
+    u32 a, b;
+
+    iosys_map_wr(&h->map, 0, u32, 0x00a5c35a);
+    iosys_map_wr(&h->map, last, u32, 0x005ac3a5);
+    a = iosys_map_rd(&h->map, 0, u32);
+    b = iosys_map_rd(&h->map, last, u32);
+    lkpi_drm_fb_where(h->crtc, h->buffer->fb, last);
+    iosys_map_wr(&h->map, 0, u32, 0);
+    iosys_map_wr(&h->map, last, u32, 0);
+    drm_info(dev, "kestrel: %dx%d frame buffer at %lx (GEM %zu KiB): read back %08x %08x%s\n", h->width,
+             h->height, (unsigned long)h->map.vaddr_iomem, h->buffer->gem->size >> 10, a, b,
+             a == 0x00a5c35a && b == 0x005ac3a5 ? "" : ", WRITES ARE LOST");
+}
+
 /* Light every CRTC the probe gave a mode, then hand each one to Kestrel. */
 static int kdrm_setup(struct kdrm_client *kc)
 {
@@ -157,6 +182,7 @@ static int kdrm_setup(struct kdrm_client *kc)
         struct kdrm_head *h = &kc->heads[n];
         h->kc = kc;
         h->buffer = buffer;
+        h->crtc = ms->crtc;
         h->width = ms->mode->hdisplay;
         h->height = ms->mode->vdisplay;
         h->pitch = buffer->fb->pitches[0];
@@ -204,6 +230,7 @@ static int kdrm_setup(struct kdrm_client *kc)
             .name = name, .monitor = monitors[i],
         };
         if (!direct) iosys_map_memset(&h->map, 0, 0, (size_t)h->pitch * h->height);
+        else kdrm_probe_vram(h);
         h->monitor = lkpi_display_add(&d);
         if (h->monitor < 0) drm_err(dev, "kestrel: Kestrel took no monitor for %s\n", name);
         else drm_info(dev, "kestrel: monitor %d (%s)\n", h->monitor, direct ? "drawn in VRAM" : "damage flushed");
