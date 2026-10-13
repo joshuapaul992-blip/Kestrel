@@ -24,6 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/iosys-map.h>
+#include <linux/dma-resv.h>
 #include <drm/drm_client.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_connector.h>
@@ -34,11 +35,13 @@
 #include <drm/drm_fbdev_ttm.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 #include <drm/drm_rect.h>
 #include <lkpi/glue.h>
+#include "../../third_party/linux/drivers/gpu/drm/drm_internal.h"   /* drm_gem_vmap() */
 
 #define KDRM_MAX_HEADS  4
 
@@ -57,6 +60,7 @@ struct kdrm_client {
     struct drm_client_dev client;
     struct kdrm_head      heads[KDRM_MAX_HEADS];
     int                   nheads;
+    bool                  lit;                  /* frame buffers are on screen */
     bool                  gone;                 /* the driver unbound          */
 };
 
@@ -110,6 +114,23 @@ static void kdrm_monitor_name(struct drm_mode_set *ms, char *name, int size)
     mutex_unlock(&connector->dev->mode_config.mutex);
 }
 
+/* Map a frame buffer for good, where it is. drm_client_buffer_vmap() pins
+ * the buffer first through the driver's PRIME pin, which nouveau places in
+ * GART: a buffer the mode set already pinned in VRAM for scan-out then
+ * fails with "pinned elsewhere". Being on screen keeps it pinned, so map it
+ * in place. */
+static int kdrm_vmap(struct drm_client_buffer *buffer, struct iosys_map *map)
+{
+    struct drm_gem_object *gem = buffer->gem;
+    int ret;
+
+    dma_resv_lock(gem->resv, NULL);
+    ret = drm_gem_vmap(gem, &buffer->map);
+    dma_resv_unlock(gem->resv);
+    if (!ret) *map = buffer->map;
+    return ret;
+}
+
 /* Light every CRTC the probe gave a mode, then hand each one to Kestrel. */
 static int kdrm_setup(struct kdrm_client *kc)
 {
@@ -159,10 +180,11 @@ static int kdrm_setup(struct kdrm_client *kc)
         drm_err(dev, "kestrel: mode set failed: %d\n", ret);
         goto err_delete;
     }
+    kc->lit = true;
 
     for (int i = 0; i < n; i++) {
         struct kdrm_head *h = &kc->heads[i];
-        ret = drm_client_buffer_vmap(h->buffer, &h->map);
+        ret = kdrm_vmap(h->buffer, &h->map);
         if (ret) {
             drm_err(dev, "kestrel: cannot map the frame buffer of %dx%d: %d\n", h->width, h->height, ret);
             continue;
@@ -200,14 +222,14 @@ static int kdrm_hotplug(struct drm_client_dev *client)
 {
     struct kdrm_client *kc = container_of(client, struct kdrm_client, client);
 
-    if (kc->nheads) return drm_client_modeset_commit(client);    /* keep what Kestrel draws on */
+    if (kc->lit) return drm_client_modeset_commit(client);       /* keep what Kestrel draws on */
     return kdrm_setup(kc);
 }
 
 static int kdrm_restore(struct drm_client_dev *client)
 {
     struct kdrm_client *kc = container_of(client, struct kdrm_client, client);
-    return kc->nheads ? drm_client_modeset_commit(client) : 0;
+    return kc->lit ? drm_client_modeset_commit(client) : 0;
 }
 
 static void kdrm_unregister(struct drm_client_dev *client)
