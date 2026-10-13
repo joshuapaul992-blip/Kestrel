@@ -290,7 +290,8 @@ static int kdrm_setup(struct kdrm_client *kc)
         kc->nheads = i + 1;
 
         char name[32];
-        snprintf(name, sizeof name, "%s %s", dev->driver->name, dev_name(dev->dev));
+        snprintf(name, sizeof name, "%s %s %s", dev->driver->name, dev_name(dev->dev),  /* "nouveau 0000:01:00.0 DP-1" */
+                 h->connector ? h->connector->name : "");
         kdrm_list_modes(h);
         struct lkpi_display d = kdrm_display(h, name, monitors[i]);
         bool direct = d.vram != NULL;
