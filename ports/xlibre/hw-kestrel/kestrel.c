@@ -1,14 +1,22 @@
 /*
  * hw/kestrel/kestrel.c -- XLibre display server backend (DDX) for Kestrel
  *
- * One X screen per Kestrel monitor (/dev/fb0, /dev/fb1, ...). Each screen is
- * rendered in software by fb/ into an ordinary memory buffer; damage
- * tracking collects what changed, and before the server goes idle (block
- * handler) the changed boxes are handed to the kernel with KFB_BLIT, which
- * draws them on the monitor whatever its driver (boot frame buffer, Bochs
- * DISPI, NVIDIA through PRAMIN). KDSETMODE(KD_GRAPHICS) stops the kernel
- * terminal on that monitor while the server runs; it comes back by itself
- * when the server exits.
+ * One X screen for all of Kestrel's monitors (/dev/fb0, /dev/fb1, ...), with
+ * RandR 1.2+: each monitor is an output driven by its own CRTC, which shows
+ * a rectangle of the screen. xrandr places, mirrors, rotates, reflects,
+ * switches off and (where the kernel driver can) changes the mode of each
+ * monitor, and grows or shrinks the screen to match. The screen starts with
+ * the monitors side by side, left to right in /dev/fbN order, tops aligned,
+ * and the first as the primary one.
+ *
+ * The screen is rendered in software by fb/ into an ordinary memory buffer;
+ * damage tracking collects what changed, and before the server goes idle
+ * (block handler) each changed box is handed, per monitor showing it, to the
+ * kernel with KFB_BLIT, which draws it whatever the monitor's driver (boot
+ * frame buffer, Bochs DISPI, NVIDIA). Rotated and reflected monitors get the
+ * box turned in a scratch buffer first. KDSETMODE(KD_GRAPHICS) stops the
+ * kernel terminal on each monitor while the server runs; it comes back by
+ * itself when the server exits.
  *
  * Input comes from /dev/kinput: Linux-style key and relative-pointer events
  * (struct kinput_event), keycodes in the evdev numbering, so the default
@@ -22,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -54,6 +63,7 @@
 #include "micmap.h"
 #include "damage.h"
 #include "dixstruct.h"
+#include "randrstr.h"
 #include "xkbsrv.h"
 #include "xserver-properties.h"
 #include "exevents.h"
@@ -62,6 +72,8 @@
 /* ---- kernel interfaces (Kestrel include/kernel/kfb.h, kinput.h) ---------- */
 #define KFB_GET_INFO    0x4b00
 #define KFB_BLIT        0x4b01
+#define KFB_GET_MODES   0x4b02
+#define KFB_SET_MODE    0x4b03
 #define KDSETMODE       0x4b3a
 #define KD_TEXT         0x00
 #define KD_GRAPHICS     0x01
@@ -79,6 +91,21 @@ struct kfb_blit {
     uint32_t src_pitch, reserved;
 };
 
+#define KFB_MAX_MODES       32
+#define KFB_MODE_PREFERRED  1
+#define KFB_MODE_CURRENT    2
+struct kfb_mode {
+    uint32_t width, height;
+    uint32_t refresh_mhz;       /* 0 = unknown */
+    uint32_t flags;
+};
+struct kfb_modes {
+    uint32_t count;
+    uint32_t width_mm, height_mm;   /* 0 = unknown */
+    uint32_t reserved;
+    struct kfb_mode mode[KFB_MAX_MODES];
+};
+
 struct kinput_event {
     uint64_t time_us;
     uint16_t type, code;
@@ -94,74 +121,221 @@ struct kinput_event {
 #define KI_BTN_RIGHT    0x111
 #define KI_BTN_MIDDLE   0x112
 
-/* ---- screens ---------------------------------------------------------------- */
-#define KMAX_SCREENS    4
+/* ---- monitors ------------------------------------------------------------- */
+#define KMAX_MONITORS   4
+#define KMAX_SIZE       8192    /* largest screen xrandr may ask for */
+#define KROTATIONS      (RR_Rotate_0 | RR_Rotate_90 | RR_Rotate_180 | RR_Rotate_270 | \
+                         RR_Reflect_X | RR_Reflect_Y)
 
 typedef struct {
     int         fd;
     struct kfb_info info;
+    struct kfb_modes modes;     /* what the kernel can switch this monitor to */
+    char        name[24];       /* RandR output name: the connector, else "fbN" */
+    RRCrtcPtr   crtc;
+    RROutputPtr output;
+    Bool        on;             /* showing part of the screen */
+    int         mw, mh;         /* its current mode */
+    int         x, y, w, h;     /* the screen rectangle it shows (w, h swapped when turned) */
+    Rotation    rotation;
+    uint64_t    blits, pixels;
+} KMonitor;
+
+static KMonitor kmon[KMAX_MONITORS];
+static int knum;
+static int kwant = KMAX_MONITORS;       /* -screens N */
+
+static struct {
     uint8_t    *bits;           /* the screen pixmap, 32 bpp */
     int         stride;         /* bytes */
     DamagePtr   damage;
     CloseScreenProcPtr closeScreen;
     CreateScreenResourcesProcPtr createScreenResources;
     ScreenBlockHandlerProcPtr blockHandler;
-    uint64_t    blits, pixels;
-} KScreen;
+    uint32_t   *turn;           /* scratch for rotated and reflected monitors */
+    size_t      turnsize;       /* pixels */
+} kscr;
 
-static KScreen kscreens[KMAX_SCREENS];
-static int knum;
-static int kwant = KMAX_SCREENS;        /* -screens N */
+/* "GP106 head 1 DP-2" -> "DP-2": the connector, when the driver names one. */
+static void
+kOutputName(KMonitor *m, int i)
+{
+    const char *sp = strrchr(m->info.name, ' ');
+    const char *c = sp ? sp + 1 : m->info.name;
+    const char *dash = strchr(c, '-');
+
+    if (dash && dash > c && isupper((unsigned char)c[0]) && isdigit((unsigned char)dash[1]))
+        snprintf(m->name, sizeof(m->name), "%s", c);
+    else
+        snprintf(m->name, sizeof(m->name), "fb%d", i);
+    for (int j = 0; j < knum; j++)          /* names must be unique */
+        if (&kmon[j] != m && strcmp(kmon[j].name, m->name) == 0)
+            snprintf(m->name, sizeof(m->name), "fb%d", i);
+}
 
 static void
-kOpenScreens(void)
+kOpenMonitors(void)
 {
     if (knum)
         return;
-    for (int i = 0; i < KMAX_SCREENS && knum < kwant; i++) {
+    for (int i = 0; i < KMAX_MONITORS && knum < kwant; i++) {
         char path[32];
         snprintf(path, sizeof(path), "/dev/fb%d", i);
         int fd = open(path, O_RDWR | O_CLOEXEC);
         if (fd < 0)
             break;
-        KScreen *k = &kscreens[knum];
-        if (ioctl(fd, KFB_GET_INFO, &k->info) < 0 || k->info.bpp != 32) {
+        KMonitor *m = &kmon[knum];
+        if (ioctl(fd, KFB_GET_INFO, &m->info) < 0 || m->info.bpp != 32) {
             ErrorF("kestrel: %s: unusable (%s)\n", path, strerror(errno));
             close(fd);
             continue;
         }
-        k->fd = fd;
-        LogMessage(X_INFO, "kestrel: %s: %ux%u, R/G/B at bits %u/%u/%u, %s%s%s\n", path,
-                   k->info.width, k->info.height, k->info.r_pos, k->info.g_pos, k->info.b_pos,
-                   k->info.name, k->info.monitor[0] ? ", monitor " : "", k->info.monitor);
+        m->fd = fd;
+        /* a kernel without mode lists: the current mode is the only one */
+        if (ioctl(fd, KFB_GET_MODES, &m->modes) < 0 || !m->modes.count ||
+            m->modes.count > KFB_MAX_MODES) {
+            memset(&m->modes, 0, sizeof(m->modes));
+            m->modes.count = 1;
+            m->modes.mode[0] = (struct kfb_mode) { m->info.width, m->info.height, 0,
+                                                   KFB_MODE_PREFERRED | KFB_MODE_CURRENT };
+        }
+        m->mw = (int)m->info.width;
+        m->mh = (int)m->info.height;
+        kOutputName(m, i);
+        LogMessage(X_INFO, "kestrel: %s (%s): %ux%u, %u mode(s), R/G/B at bits %u/%u/%u, %s%s%s\n",
+                   path, m->name, m->info.width, m->info.height, m->modes.count,
+                   m->info.r_pos, m->info.g_pos, m->info.b_pos,
+                   m->info.name, m->info.monitor[0] ? ", monitor " : "", m->info.monitor);
         knum++;
     }
     if (!knum)
         FatalError("kestrel: no monitor (/dev/fb0) available\n");
 }
 
-/* Hand every changed box to the kernel, then forget the damage. */
+/* Where a monitor pixel comes from: screen pixel (u, v) relative to the
+ * monitor's rectangle. RandR's rotation first, then its reflection, as in
+ * RRTransformCompute(). */
 static void
-kFlush(KScreen *k)
+kToScreen(const KMonitor *m, int mx, int my, int *u, int *v)
 {
-    RegionPtr r = DamageRegion(k->damage);
+    switch (m->rotation & 0xf) {
+    default:            *u = mx;             *v = my;             break;
+    case RR_Rotate_90:  *u = m->mh - 1 - my; *v = mx;             break;
+    case RR_Rotate_180: *u = m->mw - 1 - mx; *v = m->mh - 1 - my; break;
+    case RR_Rotate_270: *u = my;             *v = m->mw - 1 - mx; break;
+    }
+    if (m->rotation & RR_Reflect_X) *u = m->w - 1 - *u;
+    if (m->rotation & RR_Reflect_Y) *v = m->h - 1 - *v;
+}
+
+static void
+kToMonitor(const KMonitor *m, int u, int v, int *mx, int *my)
+{
+    if (m->rotation & RR_Reflect_X) u = m->w - 1 - u;
+    if (m->rotation & RR_Reflect_Y) v = m->h - 1 - v;
+    switch (m->rotation & 0xf) {
+    default:            *mx = u;             *my = v;             break;
+    case RR_Rotate_90:  *mx = v;             *my = m->mh - 1 - u; break;
+    case RR_Rotate_180: *mx = m->mw - 1 - u; *my = m->mh - 1 - v; break;
+    case RR_Rotate_270: *mx = m->mw - 1 - v; *my = u;             break;
+    }
+}
+
+static void
+kBlit(KMonitor *m, int x, int y, int w, int h, const void *src, int pitch)
+{
+    struct kfb_blit bl = {
+        .x = x, .y = y, .w = w, .h = h,
+        .src = (uint64_t)(uintptr_t)src, .src_pitch = (uint32_t)pitch,
+    };
+    if (ioctl(m->fd, KFB_BLIT, &bl) < 0)
+        ErrorF("kestrel: %s: blit %dx%d+%d+%d failed: %s\n", m->name, w, h, x, y, strerror(errno));
+    m->blits++;
+    m->pixels += (uint64_t)w * h;
+}
+
+/* Show screen box b (inside the monitor's rectangle) on the monitor. */
+static void
+kShow(KMonitor *m, const BoxRec *b)
+{
+    if (m->rotation == RR_Rotate_0) {
+        kBlit(m, b->x1 - m->x, b->y1 - m->y, b->x2 - b->x1, b->y2 - b->y1,
+              kscr.bits + (size_t)b->y1 * kscr.stride + (size_t)b->x1 * 4, kscr.stride);
+        return;
+    }
+    int ax, ay, bx, by;
+    kToMonitor(m, b->x1 - m->x, b->y1 - m->y, &ax, &ay);
+    kToMonitor(m, b->x2 - 1 - m->x, b->y2 - 1 - m->y, &bx, &by);
+    int mx0 = min(ax, bx), my0 = min(ay, by);
+    int w = max(ax, bx) - mx0 + 1, h = max(ay, by) - my0 + 1;
+    if ((size_t)w * h > kscr.turnsize) {
+        uint32_t *t = realloc(kscr.turn, (size_t)w * h * 4);
+        if (!t)
+            return;
+        kscr.turn = t;
+        kscr.turnsize = (size_t)w * h;
+    }
+    /* the source address moves by a fixed step per monitor pixel */
+    for (int y = 0; y < h; y++) {
+        int u0, v0, u1, v1;
+        kToScreen(m, mx0, my0 + y, &u0, &v0);
+        kToScreen(m, mx0 + 1, my0 + y, &u1, &v1);
+        const uint32_t *s = (const uint32_t *)(kscr.bits + (size_t)(m->y + v0) * kscr.stride) + m->x + u0;
+        ptrdiff_t step = (ptrdiff_t)(v1 - v0) * (kscr.stride / 4) + (u1 - u0);
+        uint32_t *d = kscr.turn + (size_t)y * w;
+        for (int x = 0; x < w; x++, s += step)
+            d[x] = *s;
+    }
+    kBlit(m, mx0, my0, w, h, kscr.turn, w * 4);
+}
+
+/* A monitor no CRTC drives any more goes black. */
+static void
+kBlank(KMonitor *m)
+{
+    void *zero = calloc((size_t)m->mw * 4, m->mh);
+    if (zero) {
+        kBlit(m, 0, 0, m->mw, m->mh, zero, m->mw * 4);
+        free(zero);
+    }
+}
+
+/* Hand every changed box to each monitor that shows it, then forget the damage. */
+static void
+kFlush(ScreenPtr pScreen)
+{
+    RegionPtr r = DamageRegion(kscr.damage);
     int n = RegionNumRects(r);
     BoxPtr b = RegionRects(r);
 
     for (int i = 0; i < n; i++, b++) {
-        struct kfb_blit bl = {
-            .x = b->x1, .y = b->y1, .w = b->x2 - b->x1, .h = b->y2 - b->y1,
-            .src = (uint64_t)(uintptr_t)(k->bits + (size_t)b->y1 * k->stride + (size_t)b->x1 * 4),
-            .src_pitch = (uint32_t)k->stride,
-        };
-        if (bl.w <= 0 || bl.h <= 0)
-            continue;
-        if (ioctl(k->fd, KFB_BLIT, &bl) < 0)
-            ErrorF("kestrel: blit %dx%d+%d+%d failed: %s\n", bl.w, bl.h, bl.x, bl.y, strerror(errno));
-        k->blits++;
-        k->pixels += (uint64_t)bl.w * bl.h;
+        for (int j = 0; j < knum; j++) {
+            KMonitor *m = &kmon[j];
+            if (!m->on)
+                continue;
+            BoxRec c = {
+                max(b->x1, max(m->x, 0)), max(b->y1, max(m->y, 0)),
+                min(b->x2, min(m->x + m->w, pScreen->width)),
+                min(b->y2, min(m->y + m->h, pScreen->height)),
+            };
+            if (c.x1 < c.x2 && c.y1 < c.y2)
+                kShow(m, &c);
+        }
     }
-    DamageEmpty(k->damage);
+    DamageEmpty(kscr.damage);
+}
+
+/* Everything again, on every monitor: after the layout changed. */
+static void
+kDamageAll(ScreenPtr pScreen)
+{
+    if (!kscr.damage)
+        return;
+    RegionRec all;
+    BoxRec box = { 0, 0, (short)pScreen->width, (short)pScreen->height };
+    RegionInit(&all, &box, 1);
+    DamageReportDamage(kscr.damage, &all);
+    RegionUninit(&all);
 }
 
 /* Push damage to the display just before the server sleeps. This wraps the
@@ -172,75 +346,62 @@ kFlush(KScreen *k)
 static void
 kBlockHandler(ScreenPtr pScreen, void *timeout)
 {
-    KScreen *k = &kscreens[pScreen->myNum];
-
-    pScreen->BlockHandler = k->blockHandler;
+    pScreen->BlockHandler = kscr.blockHandler;
     if (pScreen->BlockHandler)
         pScreen->BlockHandler(pScreen, timeout);
-    k->blockHandler = pScreen->BlockHandler;
+    kscr.blockHandler = pScreen->BlockHandler;
     pScreen->BlockHandler = kBlockHandler;
 
-    if (k->damage)
-        kFlush(k);
+    if (kscr.damage)
+        kFlush(pScreen);
 }
 
 static Bool
 kCreateScreenResources(ScreenPtr pScreen)
 {
-    KScreen *k = &kscreens[pScreen->myNum];
-
-    pScreen->CreateScreenResources = k->createScreenResources;
+    pScreen->CreateScreenResources = kscr.createScreenResources;
     if (!pScreen->CreateScreenResources(pScreen))
         return FALSE;
     PixmapPtr root = pScreen->GetScreenPixmap(pScreen);
-    k->damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, root);
-    if (!k->damage)
+    kscr.damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, root);
+    if (!kscr.damage)
         return FALSE;
-    DamageRegister(&root->drawable, k->damage);
-    /* the whole screen once: the server starts with its root weave */
-    RegionRec all;
-    BoxRec box = { 0, 0, (short)k->info.width, (short)k->info.height };
-    RegionInit(&all, &box, 1);
-    DamageReportDamage(k->damage, &all);
-    RegionUninit(&all);
+    DamageRegister(&root->drawable, kscr.damage);
+    kDamageAll(pScreen);        /* the whole screen once: the server starts with its root weave */
     return TRUE;
 }
 
 static Bool
 kCloseScreen(ScreenPtr pScreen)
 {
-    KScreen *k = &kscreens[pScreen->myNum];
-
-    pScreen->CloseScreen = k->closeScreen;
-    pScreen->BlockHandler = k->blockHandler;
-    if (k->damage) {
-        DamageUnregister(k->damage);
-        DamageDestroy(k->damage);
-        k->damage = NULL;
+    pScreen->CloseScreen = kscr.closeScreen;
+    pScreen->BlockHandler = kscr.blockHandler;
+    if (kscr.damage) {
+        DamageUnregister(kscr.damage);
+        DamageDestroy(kscr.damage);
+        kscr.damage = NULL;
     }
     dixDestroyPixmap(pScreen->devPrivate, 0);
     pScreen->devPrivate = NULL;
-    LogMessage(X_INFO, "kestrel: screen %d: %llu blits, %llu pixels sent\n", pScreen->myNum,
-               (unsigned long long)k->blits, (unsigned long long)k->pixels);
-    return pScreen->CloseScreen(pScreen);
+    for (int i = 0; i < knum; i++) {
+        LogMessage(X_INFO, "kestrel: %s: %llu blits, %llu pixels sent\n", kmon[i].name,
+                   (unsigned long long)kmon[i].blits, (unsigned long long)kmon[i].pixels);
+        kmon[i].crtc = NULL;
+        kmon[i].output = NULL;
+    }
+    Bool ret = pScreen->CloseScreen(pScreen);
+    free(kscr.bits);
+    kscr.bits = NULL;
+    free(kscr.turn);
+    kscr.turn = NULL;
+    kscr.turnsize = 0;
+    return ret;
 }
 
-/* The pointer moves from monitor to monitor left to right, in /dev/fbN order. */
+/* One screen: the pointer never leaves it (RandR keeps it on the monitors). */
 static Bool
 kCursorOffScreen(ScreenPtr *ppScreen, int *x, int *y)
 {
-    int n = (*ppScreen)->myNum;
-
-    if (*x < 0 && n > 0) {
-        *ppScreen = screenInfo.screens[n - 1];
-        *x += (*ppScreen)->width;
-        return TRUE;
-    }
-    if (*x >= (*ppScreen)->width && n + 1 < screenInfo.numScreens) {
-        *x -= (*ppScreen)->width;
-        *ppScreen = screenInfo.screens[n + 1];
-        return TRUE;
-    }
     return FALSE;
 }
 
@@ -255,50 +416,256 @@ static miPointerScreenFuncRec kPointerCursorFuncs = {
     miPointerWarpCursor
 };
 
+/* ---- RandR ------------------------------------------------------------------ */
+static int
+kMmFromPixels(int px, uint32_t mm)
+{
+    return mm ? (int)mm : (int)(px * 25.4 / monitorResolution + 0.5);
+}
+
+static RRModePtr
+kModeGet(const struct kfb_mode *km)
+{
+    xRRModeInfo info = { 0 };
+    char name[32];
+    uint32_t hz = km->refresh_mhz ? km->refresh_mhz : 60000;
+
+    snprintf(name, sizeof(name), "%ux%u", km->width, km->height);
+    info.width = km->width;
+    info.height = km->height;
+    /* no real timings: totals equal to the visible size, a clock that
+     * gives the refresh rate (what xrandr prints) */
+    info.hSyncStart = info.hSyncEnd = info.hTotal = km->width;
+    info.vSyncStart = info.vSyncEnd = info.vTotal = km->height;
+    info.dotClock = (CARD32)((uint64_t)km->width * km->height * hz / 1000);
+    info.nameLength = strlen(name);
+    return RRModeGet(&info, name);
+}
+
+static Bool
+kRRGetInfo(ScreenPtr pScreen, Rotation *rotations)
+{
+    *rotations = KROTATIONS;
+    return TRUE;
+}
+
+static const struct kfb_mode *
+kFindMode(KMonitor *m, RRModePtr mode)
+{
+    const struct kfb_mode *best = NULL;
+    for (uint32_t i = 0; i < m->modes.count; i++) {
+        const struct kfb_mode *km = &m->modes.mode[i];
+        if (km->width != mode->mode.width || km->height != mode->mode.height)
+            continue;
+        if (!best)
+            best = km;
+        /* the refresh rate xrandr asked for, when there is a choice */
+        if (mode->mode.hTotal && mode->mode.vTotal) {
+            uint64_t want = (uint64_t)mode->mode.dotClock * 1000 / ((uint64_t)mode->mode.hTotal * mode->mode.vTotal);
+            uint32_t hz = km->refresh_mhz ? km->refresh_mhz : 60000;
+            uint32_t bhz = best->refresh_mhz ? best->refresh_mhz : 60000;
+            if (llabs((long long)hz - (long long)want) < llabs((long long)bhz - (long long)want))
+                best = km;
+        }
+    }
+    return best;
+}
+
+static Bool
+kRROutputValidateMode(ScreenPtr pScreen, RROutputPtr output, RRModePtr mode)
+{
+    return kFindMode(output->devPrivate, mode) != NULL;
+}
+
+static Bool
+kRRCrtcSet(ScreenPtr pScreen, RRCrtcPtr crtc, RRModePtr mode, int x, int y,
+           Rotation rotation, int numOutputs, RROutputPtr *outputs)
+{
+    KMonitor *m = crtc->devPrivate;
+
+    if (mode && numOutputs) {
+        const struct kfb_mode *km = kFindMode(m, mode);
+        if (!km)
+            return FALSE;
+        if ((int)km->width != m->mw || (int)km->height != m->mh ||
+            !(km->flags & KFB_MODE_CURRENT)) {
+            struct kfb_mode want = *km;
+            if (ioctl(m->fd, KFB_SET_MODE, &want) < 0) {
+                ErrorF("kestrel: %s: cannot switch to %ux%u: %s\n", m->name, km->width, km->height,
+                       strerror(errno));
+                return FALSE;
+            }
+            for (uint32_t i = 0; i < m->modes.count; i++)
+                m->modes.mode[i].flags &= ~KFB_MODE_CURRENT;
+            ((struct kfb_mode *)km)->flags |= KFB_MODE_CURRENT;
+            m->mw = (int)km->width;
+            m->mh = (int)km->height;
+            LogMessage(X_INFO, "kestrel: %s: now %dx%d\n", m->name, m->mw, m->mh);
+        }
+        m->on = TRUE;
+        m->x = x;
+        m->y = y;
+        m->rotation = rotation;
+        Bool turned = (rotation & (RR_Rotate_90 | RR_Rotate_270)) != 0;
+        m->w = turned ? m->mh : m->mw;
+        m->h = turned ? m->mw : m->mh;
+    }
+    else if (m->on) {
+        m->on = FALSE;
+        kBlank(m);
+    }
+    kDamageAll(pScreen);
+    return RRCrtcNotify(crtc, m->on ? mode : NULL, x, y, rotation, NULL, numOutputs, outputs);
+}
+
+/* A new screen size: a new buffer, the old picture copied into its corner. */
+static Bool
+kRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height, CARD32 mmWidth, CARD32 mmHeight)
+{
+    int stride = (int)PixmapBytePad(width, 24);
+    uint8_t *bits = calloc((size_t)stride, height);
+    PixmapPtr pix = pScreen->GetScreenPixmap(pScreen);
+
+    if (!bits)
+        return FALSE;
+    for (int y = 0; y < min((int)height, pScreen->height); y++)
+        memcpy(bits + (size_t)y * stride, kscr.bits + (size_t)y * kscr.stride,
+               (size_t)min((int)width, pScreen->width) * 4);
+
+    SetRootClip(pScreen, ROOT_CLIP_NONE);       /* no drawing while things move */
+    pScreen->ModifyPixmapHeader(pix, width, height, -1, -1, stride, bits);
+    free(kscr.bits);
+    kscr.bits = bits;
+    kscr.stride = stride;
+    pScreen->width = width;
+    pScreen->height = height;
+    pScreen->mmWidth = (int)mmWidth;
+    pScreen->mmHeight = (int)mmHeight;
+    SetRootClip(pScreen, ROOT_CLIP_FULL);
+    kDamageAll(pScreen);
+
+    RRScreenSizeNotify(pScreen);
+    RRTellChanged(pScreen);
+    LogMessage(X_INFO, "kestrel: screen now %ux%u\n", width, height);
+    return TRUE;
+}
+
+static Bool
+kRandRInit(ScreenPtr pScreen)
+{
+    if (!RRScreenInit(pScreen))
+        return FALSE;
+    rrScrPrivPtr pScrPriv = rrGetScrPriv(pScreen);
+    pScrPriv->rrGetInfo = kRRGetInfo;
+    pScrPriv->rrCrtcSet = kRRCrtcSet;
+    pScrPriv->rrScreenSetSize = kRRScreenSetSize;
+    pScrPriv->rrOutputSetProperty = NULL;
+#if RANDR_13_INTERFACE
+    pScrPriv->rrOutputGetProperty = NULL;
+#endif
+    pScrPriv->rrOutputValidateMode = kRROutputValidateMode;
+    pScrPriv->rrModeDestroy = NULL;
+    RRScreenSetSizeRange(pScreen, 320, 200, KMAX_SIZE, KMAX_SIZE);
+
+    for (int i = 0; i < knum; i++) {
+        KMonitor *m = &kmon[i];
+        RRModePtr modes[KFB_MAX_MODES], current = NULL;
+        int n = 0, npreferred = 0;
+
+        m->crtc = RRCrtcCreate(pScreen, m);
+        if (!m->crtc)
+            return FALSE;
+        RRCrtcSetRotations(m->crtc, KROTATIONS);
+        RRCrtcGammaSetSize(m->crtc, 256);       /* xrandr complains without one */
+        m->output = RROutputCreate(pScreen, m->name, strlen(m->name), m);
+        if (!m->output)
+            return FALSE;
+        if (!RROutputSetClones(m->output, NULL, 0) ||
+            !RROutputSetCrtcs(m->output, &m->crtc, 1) ||
+            !RROutputSetConnection(m->output, RR_Connected) ||
+            !RROutputSetPhysicalSize(m->output, kMmFromPixels(m->mw, m->modes.width_mm),
+                                     kMmFromPixels(m->mh, m->modes.height_mm)))
+            return FALSE;
+        RROutputSetSubpixelOrder(m->output, SubPixelUnknown);
+
+        /* preferred modes first, as RandR expects */
+        for (int pass = 0; pass < 2; pass++)
+            for (uint32_t j = 0; j < m->modes.count; j++) {
+                const struct kfb_mode *km = &m->modes.mode[j];
+                if ((km->flags & KFB_MODE_PREFERRED) ? pass : !pass)
+                    continue;
+                RRModePtr mode = kModeGet(km);
+                if (!mode)
+                    return FALSE;
+                modes[n++] = mode;
+                npreferred += !pass;
+                if ((km->flags & KFB_MODE_CURRENT) && !current)
+                    current = mode;
+            }
+        if (!RROutputSetModes(m->output, modes, n, npreferred))
+            return FALSE;
+        if (!current)
+            current = modes[0];
+        if (!RRCrtcNotify(m->crtc, current, m->x, m->y, RR_Rotate_0, NULL, 1, &m->output))
+            return FALSE;
+    }
+    pScrPriv->primaryOutput = kmon[0].output;
+    return TRUE;
+}
+
 static bool
 kScreenInit(ScreenPtr pScreen, int argc, char **argv, void *closure)
 {
-    KScreen *k = closure;
     int dpi = monitorResolution ? monitorResolution : 96;
+    int width = 0, height = 0;
 
-    k->stride = (int)PixmapBytePad((int)k->info.width, 24);
-    k->bits = calloc((size_t)k->stride, k->info.height);
-    if (!k->bits)
+    /* monitors side by side, left to right in /dev/fbN order, tops aligned */
+    for (int i = 0; i < knum; i++) {
+        KMonitor *m = &kmon[i];
+        m->on = TRUE;
+        m->rotation = RR_Rotate_0;
+        m->x = width;
+        m->y = 0;
+        m->w = m->mw;
+        m->h = m->mh;
+        width += m->mw;
+        height = max(height, m->mh);
+    }
+    kscr.stride = (int)PixmapBytePad(width, 24);
+    kscr.bits = calloc((size_t)kscr.stride, height);
+    if (!kscr.bits)
         return FALSE;
 
+    const struct kfb_info *fmt = &kmon[0].info;
     if (!miSetVisualTypesAndMasks(24, (1 << TrueColor) | (1 << DirectColor), 8, TrueColor,
-                                  0xffu << k->info.r_pos, 0xffu << k->info.g_pos, 0xffu << k->info.b_pos))
+                                  0xffu << fmt->r_pos, 0xffu << fmt->g_pos, 0xffu << fmt->b_pos))
         return FALSE;
     miSetPixmapDepths();
 
-    if (!fbScreenInit(pScreen, k->bits, (int)k->info.width, (int)k->info.height, dpi, dpi,
-                      k->stride / 4, 32))
+    if (!fbScreenInit(pScreen, kscr.bits, width, height, dpi, dpi, kscr.stride / 4, 32))
         return FALSE;
     if (!noRenderExtension)
         fbPictureInit(pScreen, 0, 0);
 
-    /* Monitors side by side, left to right in /dev/fbN order, tops aligned:
-     * the layout Xinerama (+xinerama) joins into one desktop. */
-    pScreen->x = pScreen->myNum ? screenInfo.screens[pScreen->myNum - 1]->x +
-                                  screenInfo.screens[pScreen->myNum - 1]->width : 0;
-    pScreen->y = 0;
-
     miDCInitialize(pScreen, &kPointerCursorFuncs);
     pScreen->blackPixel = 0;
-    pScreen->whitePixel = (0xffu << k->info.r_pos) | (0xffu << k->info.g_pos) | (0xffu << k->info.b_pos);
+    pScreen->whitePixel = (0xffu << fmt->r_pos) | (0xffu << fmt->g_pos) | (0xffu << fmt->b_pos);
 
-    k->createScreenResources = pScreen->CreateScreenResources;
+    kscr.createScreenResources = pScreen->CreateScreenResources;
     pScreen->CreateScreenResources = kCreateScreenResources;
-    k->closeScreen = pScreen->CloseScreen;
+    kscr.closeScreen = pScreen->CloseScreen;
     pScreen->CloseScreen = kCloseScreen;
-    k->blockHandler = pScreen->BlockHandler;
+    kscr.blockHandler = pScreen->BlockHandler;
     pScreen->BlockHandler = kBlockHandler;
 
     if (!fbCreateDefColormap(pScreen))
         return FALSE;
+    if (!kRandRInit(pScreen))
+        return FALSE;
 
-    if (ioctl(k->fd, KDSETMODE, KD_GRAPHICS) < 0)
-        ErrorF("kestrel: KD_GRAPHICS on screen %d: %s\n", pScreen->myNum, strerror(errno));
+    for (int i = 0; i < knum; i++)
+        if (ioctl(kmon[i].fd, KDSETMODE, KD_GRAPHICS) < 0)
+            ErrorF("kestrel: KD_GRAPHICS on %s: %s\n", kmon[i].name, strerror(errno));
     return TRUE;
 }
 
@@ -309,7 +676,7 @@ InitOutput(int argc, char **argv)
     static const int depths[] = { 1, 4, 8, 15, 16, 24, 32 };
     int n = 0;
 
-    kOpenScreens();
+    kOpenMonitors();
     if (!monitorResolution)
         monitorResolution = 96;
 
@@ -326,19 +693,18 @@ InitOutput(int argc, char **argv)
     screenInfo.bitmapBitOrder = BITMAP_BIT_ORDER;
     screenInfo.numPixmapFormats = n;
 
-    for (int i = 0; i < knum; i++)
-        if (AddScreen(kScreenInit, argc, argv, &kscreens[i]) == -1)
-            FatalError("kestrel: couldn't add screen %d\n", i);
+    if (AddScreen(kScreenInit, argc, argv, NULL) == -1)
+        FatalError("kestrel: couldn't add the screen\n");
 }
 
 void
 ddxGiveUp(enum ExitCode error)
 {
     for (int i = 0; i < knum; i++) {
-        if (kscreens[i].fd > 0) {
-            ioctl(kscreens[i].fd, KDSETMODE, KD_TEXT);
-            close(kscreens[i].fd);
-            kscreens[i].fd = -1;
+        if (kmon[i].fd > 0) {
+            ioctl(kmon[i].fd, KDSETMODE, KD_TEXT);
+            close(kmon[i].fd);
+            kmon[i].fd = -1;
         }
     }
 }
@@ -365,7 +731,7 @@ ddxProcessArgument(int argc, char *argv[], int i)
     if (strcmp(argv[i], "-screens") == 0) {
         CHECK_FOR_REQUIRED_ARGUMENTS(1);
         kwant = atoi(argv[i + 1]);
-        if (kwant < 1 || kwant > KMAX_SCREENS)
+        if (kwant < 1 || kwant > KMAX_MONITORS)
             UseMsg();
         return 2;
     }
