@@ -250,7 +250,7 @@ __attribute__((noreturn)) static void kernel_exception(struct int_frame *f)
                 (f->error & 2) ? "write" : "read", (f->error & 16) ? ", instruction fetch" : "");
     if (f->vector == 18) machine_check_report();
     dump_frame(f);
-    panic("%s (vector %lu) at RIP=%016lx, error=%lx", exc_names[f->vector], f->vector, f->rip, f->error);
+    panic("%s at 0x%lx (vector %lu, error 0x%lx)", exc_names[f->vector], f->rip, f->vector, f->error);
 }
 
 static void nmi(struct int_frame *f)

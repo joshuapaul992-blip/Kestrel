@@ -3,7 +3,8 @@
  *
  * The text is set in the Kestrel 10 font (11 x 15 cells) into an 800x600
  * canvas, word wrapped to 71 columns, with the panic message on the
- * "*** STOP:" line. Then the screen itself goes to 800x600 where that can
+ * "*** STOP:" line, which always stays one line: a longer message is cut
+ * short with "...". Then the screen itself goes to 800x600 where that can
  * be done safely with every other CPU stopped:
  *
  *   - the boot frame buffer of a BIOS boot, through the video BIOS
@@ -95,8 +96,10 @@ static void render(const char *msg)
 {
     const int cols = (STOP_W - 2 * MARGIN_X) / kfont_10.width;
     const int rows = (STOP_H - 2 * MARGIN_Y) / kfont_10.height;
-    char stop[320];
+    char stop[128];
     snprintf(stop, sizeof stop, "*** STOP: %s", msg);
+    for (char *p = stop; *p; p++) if (*p == '\n' || *p == '\t') *p = ' ';
+    if ((int)strlen(stop) > cols) memcpy(stop + cols - 3, "...", 4);  /* one line */
     memset(canvas, 0, sizeof canvas);
     int row = 0;
     for (int i = 0; i < N_LINES && row < rows; i++)
