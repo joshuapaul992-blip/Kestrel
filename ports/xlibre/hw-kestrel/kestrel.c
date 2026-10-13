@@ -91,7 +91,7 @@ struct kfb_blit {
     uint32_t src_pitch, reserved;
 };
 
-#define KFB_MAX_MODES       32
+#define KFB_MAX_MODES       24
 #define KFB_MODE_PREFERRED  1
 #define KFB_MODE_CURRENT    2
 struct kfb_mode {
@@ -136,6 +136,7 @@ typedef struct {
     RROutputPtr output;
     Bool        on;             /* showing part of the screen */
     int         mw, mh;         /* its current mode */
+    struct kfb_mode start;      /* the mode it had before the server, restored at exit */
     int         x, y, w, h;     /* the screen rectangle it shows (w, h swapped when turned) */
     Rotation    rotation;
     uint64_t    blits, pixels;
@@ -201,6 +202,10 @@ kOpenMonitors(void)
         }
         m->mw = (int)m->info.width;
         m->mh = (int)m->info.height;
+        m->start = (struct kfb_mode) { m->info.width, m->info.height, 0, 0 };
+        for (uint32_t j = 0; j < m->modes.count; j++)
+            if (m->modes.mode[j].flags & KFB_MODE_CURRENT)
+                m->start = m->modes.mode[j];
         kOutputName(m, i);
         LogMessage(X_INFO, "kestrel: %s (%s): %ux%u, %u mode(s), R/G/B at bits %u/%u/%u, %s%s%s\n",
                    path, m->name, m->info.width, m->info.height, m->modes.count,
@@ -702,6 +707,15 @@ ddxGiveUp(enum ExitCode error)
 {
     for (int i = 0; i < knum; i++) {
         if (kmon[i].fd > 0) {
+            KMonitor *m = &kmon[i];
+            /* the terminal gets the mode back that it had */
+            for (uint32_t j = 0; j < m->modes.count; j++) {
+                const struct kfb_mode *now = &m->modes.mode[j];
+                if ((now->flags & KFB_MODE_CURRENT) &&
+                    (now->width != m->start.width || now->height != m->start.height ||
+                     now->refresh_mhz != m->start.refresh_mhz))
+                    ioctl(m->fd, KFB_SET_MODE, &m->start);
+            }
             ioctl(kmon[i].fd, KDSETMODE, KD_TEXT);
             close(kmon[i].fd);
             kmon[i].fd = -1;
