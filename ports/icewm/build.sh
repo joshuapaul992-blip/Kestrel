@@ -14,10 +14,10 @@
 #            X libraries (`make xlibre`, ports/xlibre/build-sysroot.sh)
 #
 # Configuration: X core fonts (the server has no FreeType), XPM + libpng
-# images, no i18n/NLS, no session management, RandR, Xinerama, FriBidi,
-# freedesktop menus or sound. Only the `icewm` program itself is built:
-# icewm-session, icewmbg and icewmtray start further processes, which needs
-# fork/exec.
+# images, Xinerama (one desktop across all monitors), no i18n/NLS, no session
+# management, RandR, FriBidi, freedesktop menus or sound. Only the `icewm`
+# program itself is built: icewm-session, icewmbg and icewmtray start further
+# processes, which needs fork/exec.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$1" && pwd)
@@ -33,7 +33,7 @@ OUT=$BUILD/icewm
 
 # IceWM's CMake lists libraries de-duplicated, which breaks static link
 # order; hand the complete static set to the end of every link line.
-LIBS=$("$SYSROOT/bin/kestrel-pkg-config" --libs xpm libpng xext xrender xcomposite xdamage xfixes x11)
+LIBS=$("$SYSROOT/bin/kestrel-pkg-config" --libs xpm libpng xext xrender xcomposite xdamage xfixes xinerama x11)
 
 cmake -S "$SRC" -B "$OUT" -DCMAKE_TOOLCHAIN_FILE="$SYSROOT/bin/kestrel.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD_LIBRARIES="$LIBS" \
@@ -41,7 +41,7 @@ cmake -S "$SRC" -B "$OUT" -DCMAKE_TOOLCHAIN_FILE="$SYSROOT/bin/kestrel.cmake" \
     -DCFGDIR=/boot/etc/icewm -DLIBDIR=/boot/share/icewm \
     -DCONFIG_IMLIB2=off -DCONFIG_XPM=on -DCONFIG_LIBPNG=on -DCONFIG_LIBJPEG=off \
     -DCONFIG_I18N=off -DENABLE_NLS=off -DCONFIG_SESSION=off -DCONFIG_XRANDR=off \
-    -DCONFIG_COREFONTS=on -DCONFIG_XFREETYPE=off -DXINERAMA=off -DCONFIG_FRIBIDI=off \
+    -DCONFIG_COREFONTS=on -DCONFIG_XFREETYPE=off -DXINERAMA=on -DCONFIG_FRIBIDI=off \
     -DCONFIG_FDO_MENUS=off -DICESOUND=none -DBUILD_TESTING=off >"$BUILD/icewm.log" 2>&1 \
     || { tail -30 "$BUILD/icewm.log"; exit 1; }
 make -C "$OUT" -j"${MAKEJ:-8}" icewm >>"$BUILD/icewm.log" 2>&1 \

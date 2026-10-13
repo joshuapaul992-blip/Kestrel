@@ -4,7 +4,7 @@
 # and the monitors return to their text terminals.
 export DISPLAY=:0
 export NO_AT_BRIDGE=1                  # no accessibility bus: GTK programs would warn
-Xkestrel :0 "$@" &
+Xkestrel :0 +xinerama "$@" &         # all monitors as one desktop
 xpid=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done

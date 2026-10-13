@@ -6,8 +6,8 @@
 # release tarballs (*.orig.tar.* from Ubuntu's source packages work:
 # `apt-get source --download-only xorgproto xtrans libxau libxdmcp xcb-proto
 # libxcb libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender
-# libxfixes libxdamage libxcomposite libxpm libpng1.6 libice libsm libxt
-# libxmu libxaw ncurses`). The current XLibre server needs xorgproto 2024.1
+# libxfixes libxdamage libxcomposite libxinerama libxpm libpng1.6 libice libsm
+# libxt libxmu libxaw ncurses`). The current XLibre server needs xorgproto 2024.1
 # or newer (presentproto 1.4); Ubuntu 24.04 has 2023.2, so take
 # xorgproto_2024.1.orig.tar.gz from a later release's pool.
 set -eu
@@ -93,6 +93,7 @@ autotools  libxrender
 autotools  libxfixes
 autotools  libxdamage
 autotools  libxcomposite --disable-doc --without-xmlto
+autotools  libxinerama
 autotools  libxpm --disable-open-zfile --disable-stat-zfile
 autotools  libpng1.6 --disable-tools
 

@@ -786,7 +786,7 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | GLX/DRI, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
-- **Screens:** one X screen per monitor (`-screens N` limits the count), each a 24-bit TrueColor fb screen with RENDER. A damage listener on each root window collects changes, and a wrapped screen BlockHandler pushes them to the monitor before the server sleeps, after the software cursor has been drawn back.
+- **Screens:** one X screen per monitor (`-screens N` limits the count), each a 24-bit TrueColor fb screen with RENDER. The screens sit side by side, left to right in `/dev/fbN` order with their tops aligned, and `startx` runs the server with `+xinerama`, so all monitors form one desktop: windows move across them, and IceWM puts its taskbar on the first. `ports/xlibre/patches/0003` makes the Xinerama extension list the monitors in that order (XLibre lists them backward). A damage listener on each root window collects changes, and a wrapped screen BlockHandler pushes them to the monitor before the server sleeps, after the software cursor has been drawn back.
 - **Input:** a read notification on `/dev/kinput` feeds keys, buttons, relative motion and the wheel (as buttons 4 and 5) into the dix event queue.
 
 Exiting the server returns its monitors to their text terminals.
@@ -821,10 +821,11 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 
 **Configuration** (`ports/icewm/build.sh`):
 - X core fonts, XPM and PNG images.
-- No Xft/fontconfig, i18n, session management, RandR, Xinerama, FriBidi, freedesktop menus or sound.
+- Xinerama, so maximised windows and the taskbar keep to one monitor.
+- No Xft/fontconfig, i18n, session management, RandR, FriBidi, freedesktop menus or sound.
 - `/boot/etc/icewm/prefoverride` sets every font to the server's built-in `fixed` font and turns off the network, battery and mail applets.
 - `/boot/etc/icewm/programs` and `menu` hold the Kestrel menus.
-- The sysroot gained libXext, libXrender, libXfixes, libXdamage, libXcomposite, libXpm and libpng.
+- The sysroot gained libXext, libXrender, libXfixes, libXdamage, libXcomposite, libXinerama, libXpm and libpng.
 
 **Kernel support it needed:** `select`/`pselect6`, `wait4` (no children), `/proc/stat`, and execute bits on boot-volume files (IceWM only lists programs it can see are executable).
 

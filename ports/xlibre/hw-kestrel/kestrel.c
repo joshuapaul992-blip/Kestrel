@@ -277,6 +277,12 @@ kScreenInit(ScreenPtr pScreen, int argc, char **argv, void *closure)
     if (!noRenderExtension)
         fbPictureInit(pScreen, 0, 0);
 
+    /* Monitors side by side, left to right in /dev/fbN order, tops aligned:
+     * the layout Xinerama (+xinerama) joins into one desktop. */
+    pScreen->x = pScreen->myNum ? screenInfo.screens[pScreen->myNum - 1]->x +
+                                  screenInfo.screens[pScreen->myNum - 1]->width : 0;
+    pScreen->y = 0;
+
     miDCInitialize(pScreen, &kPointerCursorFuncs);
     pScreen->blackPixel = 0;
     pScreen->whitePixel = (0xffu << k->info.r_pos) | (0xffu << k->info.g_pos) | (0xffu << k->info.b_pos);
