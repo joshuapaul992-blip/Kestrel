@@ -218,7 +218,11 @@ void ioapic_route_isa(int irq, uint8_t vector)
 
 /* A panic about to call the video BIOS in real mode, where no Kestrel
  * vector has a handler: every IO APIC input masked, this CPU's timer
- * stopped and its local APIC software-disabled (which masks the LVT). */
+ * stopped, and the task priority at its highest, so that not even an
+ * interrupt already pending in the IRR (the mouse's MSI, the timer: the
+ * panic has run with interrupts off) is delivered if the BIOS enables
+ * interrupts. Software-disabling the local APIC would not do: pending
+ * interrupts are held, not dropped, and some CPUs still deliver them. */
 void apic_quiesce(void)
 {
     for (int i = 0; i < nioapics; i++)
@@ -227,7 +231,8 @@ void apic_quiesce(void)
     if (!lapic) return;
     lw(LAPIC_LVT_TIMER, LVT_MASKED);
     lw(LAPIC_TIMER_INIT, 0);
-    lw(LAPIC_SVR, VEC_SPURIOUS);                        /* bit 8 clear: disabled */
+    lw(LAPIC_LVT_ERR, LVT_MASKED);
+    lw(LAPIC_TPR, 0xFF);                                /* blocks every fixed vector */
 }
 
 bool apic_init(void)

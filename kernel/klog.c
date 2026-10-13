@@ -77,6 +77,7 @@ void panic_set_hook(void (*fn)(const char *msg)) { panic_hook = fn; }
 
 void panic(const char *fmt, ...)
 {
+    static int depth;
     cli();
     smp_stop_others();          /* NMI to the other CPUs: they halt where they are */
     char buf[256];
@@ -87,6 +88,10 @@ void panic(const char *fmt, ...)
     serial_write("\n*** KERNEL PANIC: ");
     serial_write(buf);
     serial_write("\n");
+    /* A fault while the first panic draws its screen (or in the hook) ends
+     * here: drawing again would fault again, recursing until the stack is
+     * gone and the CPU resets the machine. */
+    if (__atomic_fetch_add(&depth, 1, __ATOMIC_SEQ_CST)) cpu_halt_forever();
 
     void (*hook)(const char *) = panic_hook;
     panic_hook = NULL;          /* once: a panic inside the hook goes straight on */
