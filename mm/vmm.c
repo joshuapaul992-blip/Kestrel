@@ -79,6 +79,8 @@ static bool pat_wc_ready(void)
     return true;
 }
 
+static uint64_t *identity_pte(uint64_t phys);
+
 bool vmm_set_write_combining(uint64_t phys, uint64_t size)
 {
     if (!size || !pat_wc_ready() || !vmm_identity_map(phys, size, VMM_WRITE)) return false;
@@ -92,10 +94,26 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
          * the range asked for: a frame buffer a driver mapped both ways
          * (Linux's bochs ioremaps VRAM, then TTM ioremap_wc's it). */
         bool inside = a >= phys && a + 0x200000 <= phys + size;
-        if (!(*pde & PTE_HUGE) || ((*pde & VMM_PCD) && !inside)) continue;
-        *pde = (*pde & ~(uint64_t)VMM_PCD) | VMM_PWT;
-        tlb_shootdown_kernel(a, a + PAGE_SIZE);
-        pages++;
+        if ((*pde & PTE_HUGE) && (inside || !(*pde & VMM_PCD))) {
+            *pde = (*pde & ~(uint64_t)VMM_PCD) | VMM_PWT;
+            tlb_shootdown_kernel(a, a + PAGE_SIZE);
+            pages++;
+            continue;
+        }
+        /* An uncached large page only partly in the range (a frame buffer
+         * that does not start or end on 2 MiB, e.g. after a mode switch), or
+         * one already split: just the 4 KiB pages in the range. */
+        uint64_t lo = a > (phys & ~0xFFFull) ? a : (phys & ~0xFFFull);
+        uint64_t hi = a + 0x200000 < phys + size ? a + 0x200000 : phys + size;
+        uint64_t f = irq_save();
+        for (uint64_t p = lo; p < hi; p += PAGE_SIZE) {
+            uint64_t *pte = identity_pte(p);
+            if (!pte) break;
+            *pte = (*pte & ~(uint64_t)(VMM_PCD | 0x80)) | VMM_PWT;      /* PAT entry 1 */
+            pages++;
+        }
+        irq_restore(f);
+        tlb_shootdown_kernel(lo, hi);
     }
     __asm__ volatile("wbinvd" ::: "memory");
     return pages > 0;
