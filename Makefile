@@ -65,16 +65,16 @@ LDFLAGS   := -nostdlib -static -no-pie -T linker.ld -z max-page-size=0x1000 \
 BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
-           arch/x86_64/trampoline.asm arch/x86_64/vdso_blob.asm
+           arch/x86_64/trampoline.asm arch/x86_64/vbe_thunk.asm arch/x86_64/vdso_blob.asm
 C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
-           drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
+           drivers/font_8x16.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \
-           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c \
+           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/stopscreen.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
@@ -598,7 +598,6 @@ fonts:
 	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/Kestrel_12.bmp drivers/kfont_12.c kfont_12
 	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/Kestrel_15.bmp drivers/kfont_15.c kfont_15
 	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-8x16.bdf  font_8x16  > drivers/font_8x16.c
-	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-12x24.bdf font_12x24 > drivers/font_12x24.c
 
 # ---- full-screen artwork (assets/), lossless palette + RLE
 images:

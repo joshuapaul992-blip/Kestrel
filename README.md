@@ -525,6 +525,7 @@ arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order
                              IO APIC routing of ISA IRQs, IPIs, INIT/STARTUP
               smp.c          percpu blocks (GS base), big kernel lock, TLB shootdowns, AP start-up
               trampoline.asm real mode -> long mode start-up code of the other CPUs (at 0x8000)
+              vbe_thunk.asm  long mode -> real mode -> long mode: one VBE mode switch for the panic screen
               pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz (without an APIC)
               switch.asm     context_switch(), thread_trampoline, enter_user/user_return
               syscall_entry.asm  SYSCALL/LSTAR fast path (for ring 3), canonical-RIP SYSRET check
@@ -538,7 +539,7 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               kinput.c       /dev/kinput: evdev-style key/button/motion events for the X server
                              (PS/2 set 1 and USB HID -> Linux codes), grab while open
               serial.c       COM1 log
-              font_*.c       Spleen 8x16 (kernel console) and 12x24 (panic banner), from tools/bdf2c.py
+              font_8x16.c    Spleen 8x16 (kernel console), from tools/bdf2c.py
               kfont_*.c      the terminals' Kestrel 10, 12 and 15 (also the boot manager's),
                              from tools/sheet2font.py
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
@@ -593,7 +594,8 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
               uaccess.c      copy_from_user/copy_to_user and friends (checked, fault-safe)
               futex.c        futexes: hashed wait queues, requeue, wake-op, robust lists
-              klog.c         dmesg ring buffer, panic screen
+              klog.c         dmesg ring buffer, panic()
+              stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
@@ -909,6 +911,7 @@ The lock order is: the file tree's lock, then a volume's mutex, then the big loc
 - **User memory:** every copy to or from user memory goes through routines with exception-table fixups: a bad pointer is `-EFAULT`, even in the middle of a copy.
 - **Exception isolation:** #PF, #GP, #DE, #AC and the rest are separate IDT entries. In ring 3 they become signals. #DF, NMI and #MC run on their own IST stacks, so a kernel stack overflow (which hits a guard page below every kernel stack) is still reported.
 - **Kernel faults:** the report has the registers, CR0–CR4, the code bytes and a symbolized backtrace. It goes to the serial port, the kernel log and the panic screen, and other CPUs are stopped with an NMI.
+- **Panic screen** (`kernel/stopscreen.c`): white text on red, in the style of the Windows XP to 7 stop screen. It is set in the Kestrel 10 font and word wrapped for 800×600, with the panic message on the `*** STOP:` line. On a BIOS boot whose screen is still the boot frame buffer, the display really switches to 800×600: the video BIOS is called in real mode (`arch/x86_64/vbe_thunk.asm`: VBE 4F00/4F01/4F02, with every interrupt source masked), then the CPU goes back to long mode to draw. Where that cannot be done safely (UEFI, or a Linux display driver owning the card), the 800×600 picture is scaled to fill the whole screen, the way a monitor's scaler shows 800×600. `kestrel.panicmode=0` skips the BIOS call.
 - **Crash test:** `kestrel.crashtest=stack|null|ud` exercises this at boot.
 
 **Tests** (each a musl program in `/boot/bin`, exit status 0 = all passed; `kestrel.exec=` runs them at boot):

@@ -13,6 +13,5 @@ struct font {
 
 /* Spleen by Frederic Cambus (BSD-2-Clause), see third_party/spleen/LICENSE */
 extern const struct font font_8x16;     /* kernel console: 128 x 48 cells   */
-extern const struct font font_12x24;    /* the panic banner                 */
 
 #endif
