@@ -105,7 +105,6 @@ bool percpu_is_kernel_gs(uint64_t base);
 /* ---- APIC (arch/x86_64/apic.c) ------------------------------------------ */
 bool     apic_init(void);               /* MADT, LAPIC, IO APIC; false: stay on the PIC */
 bool     apic_enabled(void);
-void     apic_quiesce(void);            /* panic, before a BIOS call: no interrupt can arrive */
 void     lapic_init_cpu(void);          /* this CPU's LAPIC (and timer, once calibrated) */
 void     lapic_timer_start(void);       /* calibrate (boot CPU) and start, 1 kHz */
 void     lapic_eoi(void);

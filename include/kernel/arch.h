@@ -48,7 +48,6 @@ void pic_init(void);                 /* remap to vectors 32-47, mask all */
 void pic_unmask(int irq);
 void pic_mask(int irq);
 void pic_eoi(int irq);
-void pic_bios_mode(void);            /* vectors 8 and 0x70 as the BIOS had them, all masked */
 
 /* ---- 8253/8254 PIT ------------------------------------------------------ */
 #define PIT_HZ 1000

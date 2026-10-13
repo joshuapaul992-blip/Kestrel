@@ -17,6 +17,7 @@
 #include <kernel/uvm.h>
 #include <kernel/cpu.h>
 #include <kernel/arch.h>
+#include <kernel/vbe_emu.h>
 #include <kernel/multiboot2.h>
 #include <kernel/serial.h>
 #include <kernel/klog.h>
@@ -433,6 +434,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     /* Page 0 becomes a guard page: a kernel NULL-pointer access faults (and
      * is reported) instead of scribbling over low memory. ACPI's search of
      * the BIOS data area there is done by now. */
+    vbe_emu_save_low();         /* the BIOS vectors, for the panic screen's mode switch */
     vmm_set_guard(0, true);
     pci_init();                 /* before video: BAR sizing briefly disables decoding */
     video_init(fbt);
