@@ -14,8 +14,12 @@
 ;      protected mode -> long mode, kernel GDT/IDT/stack/segment bases back
 ;
 ;  It returns 1 with the chosen mode's ModeInfoBlock at VBE_MODE_INFO, or 0
-;  (no VBE 2.0, no such mode, or the BIOS refused). Interrupts stay off as
-;  far as this code is concerned; vbe.c has masked every source first.
+;  (no VBE 2.0, no such mode, or the BIOS refused). The BIOS may enable
+;  interrupts, so stopscreen.c blocks them all at the local APIC first, and
+;  for as long as the BIOS runs, the real-mode vectors Kestrel uses (0x20-
+;  0x2F, 0x50-0x6F, 0xE0-0xFF: the BIOS has nothing there) point at an IRET:
+;  an interrupt that was already pending when the panic began, delivered
+;  there anyway, returns instead of jumping into whatever the table held.
 ;  Absolute addresses are computed from VBE_BASE: the blob runs there only.
 ; =============================================================================
 
@@ -23,6 +27,7 @@ VBE_BASE      equ 0x8000
 VBE_STACK     equ VBE_BASE               ; stack: down into free conventional memory (0x500-0x7FFF)
 VBE_INFO      equ VBE_BASE + 0xC00       ; VbeInfoBlock, 512 bytes
 VBE_MODE_INFO equ VBE_BASE + 0xE00       ; ModeInfoBlock, 256 bytes
+VBE_IVT_SAVE  equ VBE_BASE + 0xA00       ; 80 real-mode vectors, 320 bytes
 %define V(x) (VBE_BASE + (x) - vbe_start)
 
 global vbe_thunk_start, vbe_thunk_end
@@ -117,6 +122,16 @@ rm:
     mov     ss, ax
     mov     sp, VBE_STACK
     lidt    [V(rm_idt)]
+    mov     di, VBE_IVT_SAVE
+    mov     si, 0x20 * 4
+    mov     cx, 16
+    call    ivt_patch
+    mov     si, 0x50 * 4
+    mov     cx, 32
+    call    ivt_patch
+    mov     si, 0xE0 * 4
+    mov     cx, 32
+    call    ivt_patch
     mov     word [V(result)], 0
     mov     word [V(best_mode)], 0xFFFF
     mov     byte [V(best_bpp)], 0
@@ -194,11 +209,35 @@ rm:
     cli
     xor     ax, ax
     mov     ds, ax
+    mov     es, ax
+    mov     si, VBE_IVT_SAVE            ; the BIOS's vectors back
+    mov     di, 0x20 * 4
+    mov     cx, 16
+    rep     movsd
+    mov     di, 0x50 * 4
+    mov     cx, 32
+    rep     movsd
+    mov     di, 0xE0 * 4
+    mov     cx, 32
+    rep     movsd
     o32 lgdt [V(gdt_ptr)]
     mov     eax, cr0
     or      eax, 1                      ; PE
     mov     cr0, eax
     jmp     dword 0x08:V(pm32_back)
+
+; cx vectors from IVT offset si: saved at di (advanced), then -> iret_stub
+ivt_patch:
+    mov     eax, [si]
+    mov     [di], eax
+    mov     word [si], V(iret_stub)
+    mov     word [si + 2], 0
+    add     si, 4
+    add     di, 4
+    loop    ivt_patch
+    ret
+iret_stub:
+    iret
 
 bits 32
 pm32_back:

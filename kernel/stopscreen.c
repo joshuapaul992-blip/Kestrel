@@ -27,6 +27,7 @@
 #include <kernel/string.h>
 #include <kernel/klog.h>
 #include <kernel/serial.h>
+#include <kernel/display.h>
 
 #define STOP_W      800
 #define STOP_H      600
@@ -128,10 +129,13 @@ struct vbe_mode_info {
 
 static bool bios_800x600(void)
 {
-    if (g_boot.uefi || g_fb.driver[0] || strstr(g_boot.cmdline, "kestrel.panicmode=0")) return false;
+    /* only the card as the BIOS left it: not once a driver has taken it
+     * over, nor while one is doing so (it may have reprogrammed it already) */
+    if (g_boot.uefi || g_fb.driver[0] || display_handover_pending() ||
+        strstr(g_boot.cmdline, "kestrel.panicmode=0")) return false;
     if (pmm_low_page() != VBE_BASE) return false;               /* not RAM: nowhere to run */
     size_t n = (size_t)(vbe_thunk_end - vbe_thunk_start);
-    if (n > 0xC00) return false;
+    if (n > 0xA00) return false;                                /* the IVT copy starts there */
     serial_write("panic: switching the boot frame buffer to 800x600 through the video BIOS\n");
     memcpy((void *)(uintptr_t)VBE_BASE, vbe_thunk_start, n);
     apic_quiesce();
