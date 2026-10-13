@@ -424,6 +424,7 @@ static const struct { uint32_t req; uint16_t size; uint8_t dir; } ioctl_args[] =
     { FIONBIO, 4, IOC_IN }, { TIOCGETD, 4, IOC_OUT }, { TIOCSETD, 4, IOC_IN }, { TIOCGSID, 4, IOC_OUT },
     { TIOCGPTN, 4, IOC_OUT }, { TIOCSPTLCK, 4, IOC_IN },
     { KFB_GET_INFO, sizeof(struct kfb_info), IOC_OUT }, { KFB_BLIT, sizeof(struct kfb_blit), IOC_IN },
+    { KFB_GET_MODES, sizeof(struct kfb_modes), IOC_OUT }, { KFB_SET_MODE, sizeof(struct kfb_mode), IOC_IN },
     { FBIOGET_VSCREENINFO, sizeof(struct fb_var_screeninfo_lite), IOC_OUT },
     { KINPUT_GRAB, 4, IOC_IN },
 };
@@ -492,6 +493,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
     } else {
         uint64_t kb[64];                                        /* 512 bytes, 8-aligned */
+        _Static_assert(sizeof(struct kfb_modes) <= sizeof kb, "ioctl argument too large");
         memset(kb, 0, sizeof kb);
         if ((dir & IOC_IN) && copy_from_user(kb, (const void *)arg, (size_t)size)) { r = -EFAULT; goto out; }
         if ((dir & IOC_OUT) && !ubuf_ok(arg, (uint64_t)size)) { r = -EFAULT; goto out; }

@@ -173,14 +173,37 @@ int lkpi_pci_get(int index, struct lkpi_pci_info *out)
 }
 
 /* ---- displays ------------------------------------------------------------- */
+/* set_mode() of each monitor a Linux driver lit, behind the head's own */
+static struct lkpi_mode_switch {
+    int  (*fn)(void *ctx, int monitor, const struct lkpi_display_mode *mode);
+    void  *ctx;
+} mode_switches[MAX_MONITORS * 2];
+static int nmode_switches;
+
+static int lkpi_switch_mode(void *ctx, int index, const struct display_mode *m)
+{
+    struct lkpi_mode_switch *sw = ctx;
+    struct lkpi_display_mode lm = { m->width, m->height, m->refresh_mhz, m->preferred };
+    return sw->fn(sw->ctx, index, &lm);
+}
+
 int lkpi_display_add(const struct lkpi_display *d)
 {
     struct display_head h = {
         .phys = d->phys, .vram = d->vram, .width = d->width, .height = d->height, .pitch = d->pitch,
         .bytes_pp = 4, .r_pos = 16, .g_pos = 8, .b_pos = 0,                 /* x8r8g8b8 */
         .write_span = d->write_span, .write_ctx = d->ctx,
+        .refresh_mhz = d->refresh_mhz, .width_mm = d->width_mm, .height_mm = d->height_mm,
     };
     if (d->width <= 0 || d->height <= 0 || d->pitch < d->width * 4) return -1;
+    if (d->set_mode && d->nmodes > 0 && nmode_switches < (int)(sizeof mode_switches / sizeof *mode_switches)) {
+        for (int i = 0; i < d->nmodes && i < DISPLAY_MAX_MODES; i++)
+            h.modes[h.nmodes++] = (struct display_mode){ d->modes[i].width, d->modes[i].height,
+                                                         d->modes[i].refresh_mhz, d->modes[i].preferred != 0 };
+        mode_switches[nmode_switches] = (struct lkpi_mode_switch){ d->set_mode, d->ctx };
+        h.set_mode = lkpi_switch_mode;
+        h.mode_ctx = &mode_switches[nmode_switches++];
+    }
     size_t frames = ((size_t)d->pitch * (size_t)d->height + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t shadow = pmm_alloc_contig(frames);          /* zeroed, identity mapped */
     if (!shadow) return -1;
@@ -193,6 +216,27 @@ int lkpi_display_add(const struct lkpi_display *d)
     if (idx < 0) { pmm_free_contig(shadow, frames); return -1; }
     if (tty_add_monitor(idx) < 0) kprintf("linuxkpi: monitor %d has no terminal\n", idx);
     return idx;
+}
+
+int lkpi_display_update(int monitor, const struct lkpi_display *d)
+{
+    const struct display_head *cur = display_get(monitor);
+    if (!cur || d->width <= 0 || d->height <= 0 || d->pitch < d->width * 4) return -EINVAL;
+    struct display_head h = *cur;
+    h.phys = d->phys; h.vram = d->vram;
+    h.width = d->width; h.height = d->height; h.pitch = d->pitch;
+    h.write_span = d->write_span; h.write_ctx = d->ctx;
+    h.refresh_mhz = d->refresh_mhz;
+    size_t frames = ((size_t)d->pitch * (size_t)d->height + PAGE_SIZE - 1) / PAGE_SIZE;
+    size_t old_frames = ((size_t)cur->pitch * (size_t)cur->height + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t *old = cur->shadow;
+    uint64_t shadow = pmm_alloc_contig(frames);
+    if (!shadow) return -ENOMEM;
+    h.shadow = (uint32_t *)(uintptr_t)shadow;
+    int rc = display_update(monitor, &h);
+    if (rc) { pmm_free_contig(shadow, frames); return rc; }
+    if (old) pmm_free_contig((uint64_t)(uintptr_t)old, old_frames);
+    return 0;
 }
 
 void lkpi_display_reclaim(void *handle)

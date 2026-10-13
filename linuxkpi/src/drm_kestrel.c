@@ -15,6 +15,10 @@
  *     otherwise Kestrel's writes land in the buffer through write_span() and
  *     a worker reports the damage with drm_client_framebuffer_flush().
  *
+ * Each head also lists its connector's modes, and KFB_SET_MODE (xrandr)
+ * switches it: a new frame buffer of the new size, a commit with the new
+ * mode, then the head moves over and the old buffer is freed.
+ *
  * Monitors are not removed again: Kestrel's display registry has no hot
  * unplug, so after the driver unbinds (only at shutdown here) the head's
  * writes are dropped. */
@@ -49,12 +53,16 @@ struct kdrm_head {
     struct kdrm_client       *kc;
     struct drm_client_buffer *buffer;
     struct drm_crtc          *crtc;
+    struct drm_connector     *connector;
     struct iosys_map          map;
     int                       width, height, pitch;
     int                       monitor;          /* Kestrel's monitor number */
     spinlock_t                lock;             /* damage                    */
     int                       damage_y0, damage_y1;     /* rows, y1 exclusive; empty if y0 >= y1 */
     struct work_struct        flush_work;
+    struct lkpi_display_mode  modes[LKPI_DISPLAY_MAX_MODES];
+    int                       nmodes;
+    unsigned int              refresh_mhz;
 };
 
 struct kdrm_client {
@@ -113,6 +121,68 @@ static void kdrm_monitor_name(struct drm_mode_set *ms, char *name, int size)
     blob = connector->edid_blob_ptr;                    /* the EDID the last probe read */
     if (blob && blob->length >= EDID_LENGTH) drm_edid_get_monitor_name(blob->data, name, size);
     mutex_unlock(&connector->dev->mode_config.mutex);
+}
+
+/* A mode's refresh rate in mHz, as KFB_GET_MODES reports it. */
+static unsigned int kdrm_mhz(const struct drm_display_mode *m)
+{
+    if (!m->htotal || !m->vtotal) return 0;
+    u64 mhz = (u64)m->clock * 1000000 / ((u64)m->htotal * m->vtotal);
+    if (m->flags & DRM_MODE_FLAG_DBLSCAN) mhz /= 2;
+    if (m->vscan > 1) mhz /= m->vscan;
+    return (unsigned int)mhz;
+}
+
+/* The connector's progressive modes, each size and rate once. */
+static void kdrm_list_modes(struct kdrm_head *h)
+{
+    struct drm_connector *connector = h->connector;
+    struct drm_display_mode *mode;
+
+    h->nmodes = 0;
+    if (!connector) return;
+    mutex_lock(&connector->dev->mode_config.mutex);
+    list_for_each_entry(mode, &connector->modes, head) {
+        if (mode->flags & DRM_MODE_FLAG_INTERLACE) continue;
+        struct lkpi_display_mode m = { mode->hdisplay, mode->vdisplay, kdrm_mhz(mode),
+                                       !!(mode->type & DRM_MODE_TYPE_PREFERRED) };
+        bool seen = false;
+        for (int i = 0; i < h->nmodes && !seen; i++)
+            if (h->modes[i].width == m.width && h->modes[i].height == m.height &&
+                h->modes[i].refresh_mhz == m.refresh_mhz) {
+                h->modes[i].preferred |= m.preferred;
+                seen = true;
+            }
+        if (!seen && h->nmodes < LKPI_DISPLAY_MAX_MODES) h->modes[h->nmodes++] = m;
+    }
+    mutex_unlock(&connector->dev->mode_config.mutex);
+}
+
+static int kdrm_set_mode(void *ctx, int monitor, const struct lkpi_display_mode *want);
+
+/* What Kestrel gets for a head: its frame buffer and modes. */
+static struct lkpi_display kdrm_display(struct kdrm_head *h, const char *name, const char *monitor)
+{
+    struct drm_device *dev = h->kc->client.dev;
+    /* VRAM that scans out as it is written: Kestrel draws to it directly
+     * (KPI I/O mappings are identity mappings, so the address is physical) */
+    bool direct = h->map.is_iomem && !h->buffer->fb->funcs->dirty;
+    struct lkpi_display d = {
+        .phys = direct ? (unsigned long)h->map.vaddr_iomem : 0,
+        .vram = direct ? (void __force *)h->map.vaddr_iomem : NULL,
+        .width = h->width, .height = h->height, .pitch = h->pitch,
+        .write_span = direct ? NULL : kdrm_write_span, .ctx = h,
+        .name = name, .monitor = monitor,
+        .refresh_mhz = h->refresh_mhz,
+        .modes = h->modes, .nmodes = h->nmodes, .set_mode = kdrm_set_mode,
+    };
+    if (h->connector) {
+        mutex_lock(&dev->mode_config.mutex);
+        d.width_mm = h->connector->display_info.width_mm;
+        d.height_mm = h->connector->display_info.height_mm;
+        mutex_unlock(&dev->mode_config.mutex);
+    }
+    return d;
 }
 
 /* Map a frame buffer for good, where it is. drm_client_buffer_vmap() pins
@@ -183,6 +253,8 @@ static int kdrm_setup(struct kdrm_client *kc)
         h->kc = kc;
         h->buffer = buffer;
         h->crtc = ms->crtc;
+        h->connector = ms->connectors[0];
+        h->refresh_mhz = kdrm_mhz(ms->mode);
         h->width = ms->mode->hdisplay;
         h->height = ms->mode->vdisplay;
         h->pitch = buffer->fb->pitches[0];
@@ -218,17 +290,12 @@ static int kdrm_setup(struct kdrm_client *kc)
         kc->nheads = i + 1;
 
         char name[32];
-        snprintf(name, sizeof name, "%s %s", dev->driver->name, dev_name(dev->dev));
-        /* VRAM that scans out as it is written: Kestrel draws to it directly
-         * (KPI I/O mappings are identity mappings, so the address is physical) */
-        bool direct = h->map.is_iomem && !h->buffer->fb->funcs->dirty;
-        struct lkpi_display d = {
-            .phys = direct ? (unsigned long)h->map.vaddr_iomem : 0,
-            .vram = direct ? (void __force *)h->map.vaddr_iomem : NULL,
-            .width = h->width, .height = h->height, .pitch = h->pitch,
-            .write_span = direct ? NULL : kdrm_write_span, .ctx = h,
-            .name = name, .monitor = monitors[i],
-        };
+        const char *pci = dev_name(dev->dev);
+        if (!strncmp(pci, "0000:", 5)) pci += 5;        /* "nouveau 01:00.0 DP-1": room for the connector */
+        snprintf(name, sizeof name, "%s %s %s", dev->driver->name, pci, h->connector ? h->connector->name : "");
+        kdrm_list_modes(h);
+        struct lkpi_display d = kdrm_display(h, name, monitors[i]);
+        bool direct = d.vram != NULL;
         if (!direct) iosys_map_memset(&h->map, 0, 0, (size_t)h->pitch * h->height);
         else kdrm_probe_vram(h);
         h->monitor = lkpi_display_add(&d);
@@ -242,6 +309,101 @@ err_delete:
     drm_client_for_each_modeset(ms, client) ms->fb = NULL;
     mutex_unlock(&client->modeset_mutex);
     for (int i = 0; i < n; i++) drm_client_framebuffer_delete(kc->heads[i].buffer);
+    return ret;
+}
+
+/* KFB_SET_MODE: light the CRTC with `want` on a new frame buffer, move
+ * Kestrel's monitor to it, then free the old one. On failure the old mode
+ * and buffer stay. */
+static int kdrm_set_mode(void *ctx, int monitor, const struct lkpi_display_mode *want)
+{
+    struct kdrm_head *h = ctx;
+    struct kdrm_client *kc = h->kc;
+    struct drm_client_dev *client = &kc->client;
+    struct drm_device *dev = client->dev;
+    struct drm_display_mode *mode, *new_mode = NULL, *old_mode;
+    struct drm_framebuffer *old_fb;
+    struct drm_mode_set *ms, *set = NULL;
+    struct iosys_map map;
+    int ret;
+
+    if (READ_ONCE(kc->gone) || !h->connector) return -ENODEV;
+    mutex_lock(&dev->mode_config.mutex);
+    list_for_each_entry(mode, &h->connector->modes, head) {
+        if (mode->hdisplay != want->width || mode->vdisplay != want->height ||
+            (mode->flags & DRM_MODE_FLAG_INTERLACE) || (want->refresh_mhz && kdrm_mhz(mode) != want->refresh_mhz))
+            continue;
+        new_mode = drm_mode_duplicate(dev, mode);
+        break;
+    }
+    mutex_unlock(&dev->mode_config.mutex);
+    if (!new_mode) return -EINVAL;
+
+    struct drm_client_buffer *buffer =
+        drm_client_framebuffer_create(client, new_mode->hdisplay, new_mode->vdisplay, DRM_FORMAT_XRGB8888);
+    if (IS_ERR(buffer)) {
+        drm_mode_destroy(dev, new_mode);
+        return PTR_ERR(buffer);
+    }
+
+    mutex_lock(&client->modeset_mutex);
+    drm_client_for_each_modeset(ms, client)
+        if (ms->crtc == h->crtc) set = ms;
+    if (!set) {
+        mutex_unlock(&client->modeset_mutex);
+        drm_client_framebuffer_delete(buffer);
+        drm_mode_destroy(dev, new_mode);
+        return -ENODEV;
+    }
+    old_mode = set->mode;
+    old_fb = set->fb;
+    set->mode = new_mode;
+    set->fb = buffer->fb;
+    mutex_unlock(&client->modeset_mutex);
+
+    ret = drm_client_modeset_commit(client);           /* pins the new buffer, unpins the old */
+    if (!ret) {
+        ret = kdrm_vmap(buffer, &map);
+        if (ret) drm_err(dev, "kestrel: cannot map the new %dx%d frame buffer: %d\n",
+                         new_mode->hdisplay, new_mode->vdisplay, ret);
+    }
+    if (ret) {
+        mutex_lock(&client->modeset_mutex);
+        set->mode = old_mode;
+        set->fb = old_fb;
+        mutex_unlock(&client->modeset_mutex);
+        drm_client_modeset_commit(client);
+        drm_client_framebuffer_delete(buffer);
+        drm_mode_destroy(dev, new_mode);
+        return ret;
+    }
+    drm_mode_destroy(dev, old_mode);
+
+    /* the head takes the new buffer; write_span() refuses everything while
+     * the size is 0, and no flush may use the old buffer any more */
+    cancel_work_sync(&h->flush_work);
+    struct drm_client_buffer *old = h->buffer;
+    WRITE_ONCE(h->height, 0);
+    smp_wmb();
+    h->buffer = buffer;
+    h->map = map;
+    h->width = new_mode->hdisplay;
+    h->pitch = buffer->fb->pitches[0];
+    h->refresh_mhz = kdrm_mhz(new_mode);
+    h->damage_y0 = new_mode->vdisplay;
+    h->damage_y1 = 0;
+    smp_wmb();
+    WRITE_ONCE(h->height, new_mode->vdisplay);
+
+    struct lkpi_display d = kdrm_display(h, "", "");
+    if (!d.vram) iosys_map_memset(&h->map, 0, 0, (size_t)h->pitch * h->height);
+    else kdrm_probe_vram(h);
+    ret = lkpi_display_update(monitor, &d);
+    if (ret) drm_err(dev, "kestrel: monitor %d did not take the new frame buffer: %d\n", monitor, ret);
+    else drm_info(dev, "kestrel: monitor %d now %dx%d@%u.%03u\n", monitor, h->width, h->height,
+                  h->refresh_mhz / 1000, h->refresh_mhz % 1000);
+    cancel_work_sync(&h->flush_work);
+    if (!ret) drm_client_framebuffer_delete(old);   /* else the terminal still draws there */
     return ret;
 }
 

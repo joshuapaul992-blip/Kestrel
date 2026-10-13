@@ -26,6 +26,7 @@
 #include <kernel/gpu.h>
 #include <kernel/bootinfo.h>
 #include <kernel/tty.h>
+#include <kernel/posix.h>
 #include "pci.h"
 #include "edid.h"
 #include "bochs_dispi.h"
@@ -178,6 +179,27 @@ int display_reclaim(const struct pci_device *dev)
     return i;
 }
 
+/* The panic screen (g_fb, see fb.h) draws on monitor `h` from now on: its
+ * CPU-mapped VRAM, through its RAM shadow. */
+static void panic_screen_to(const struct display_head *h)
+{
+    g_fb.double_buffered = false;
+    g_fb.phys = h->phys;
+    g_fb.front = (uint8_t *)h->vram;
+    g_fb.back = (uint8_t *)h->shadow;
+    g_fb.width = (uint32_t)h->width; g_fb.height = (uint32_t)h->height; g_fb.pitch = (uint32_t)h->pitch;
+    g_fb.bpp = 32; g_fb.bytes_pp = 4;
+    g_fb.r_pos = h->r_pos; g_fb.g_pos = h->g_pos; g_fb.b_pos = h->b_pos;
+    g_fb.r_size = g_fb.g_size = g_fb.b_size = 8;
+    const char *sp = strchr(h->name, ' ');         /* "nouveau 0000:01:00.0" -> "nouveaudrmfb", as Linux */
+    size_t n = sp ? (size_t)(sp - h->name) : strlen(h->name);
+    if (n > sizeof g_fb.driver - 6) n = sizeof g_fb.driver - 6;
+    memcpy(g_fb.driver, h->name, n);
+    strlcpy(g_fb.driver + n, "drmfb", sizeof g_fb.driver - n);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    g_fb.double_buffered = true;
+}
+
 /* The first monitor a driver lights after display_handover() takes the
  * place of the monitor given up, with its terminal (tty_replace_monitor()).
  * When the new frame buffer is CPU-mapped VRAM with a RAM shadow, the panic
@@ -196,24 +218,63 @@ int display_replace(const struct display_head *h)
         return i;                               /* the old copy may still be drawn into */
     }
     if (h->vram && h->shadow && h->bytes_pp == 4) {
-        g_fb.double_buffered = false;           /* the panic screen: see fb.h */
-        g_fb.phys = h->phys;
-        g_fb.front = (uint8_t *)h->vram;
-        g_fb.back = (uint8_t *)h->shadow;
-        g_fb.width = (uint32_t)h->width; g_fb.height = (uint32_t)h->height; g_fb.pitch = (uint32_t)h->pitch;
-        g_fb.bpp = 32; g_fb.bytes_pp = 4;
-        g_fb.r_pos = h->r_pos; g_fb.g_pos = h->g_pos; g_fb.b_pos = h->b_pos;
-        g_fb.r_size = g_fb.g_size = g_fb.b_size = 8;
-        const char *sp = strchr(h->name, ' ');         /* "nouveau 0000:01:00.0" -> "nouveaudrmfb", as Linux */
-        size_t n = sp ? (size_t)(sp - h->name) : strlen(h->name);
-        if (n > sizeof g_fb.driver - 6) n = sizeof g_fb.driver - 6;
-        memcpy(g_fb.driver, h->name, n);
-        strlcpy(g_fb.driver + n, "drmfb", sizeof g_fb.driver - n);
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        g_fb.double_buffered = true;
+        panic_screen_to(h);
         if (old != (uint8_t *)h->shadow) pmm_free_contig((uint64_t)(uintptr_t)old, old_frames);
     }
     return i;
+}
+
+/* ---- mode switching (KFB_SET_MODE) ----------------------------------------- */
+static int switching = -1;              /* the monitor being switched */
+
+int display_set_mode(int index, const struct display_mode *m)
+{
+    struct display_head *h = index >= 0 && index < nheads ? &heads[index] : NULL;
+    if (!h) return -ENODEV;
+    if (!h->set_mode || !h->nmodes) return -EOPNOTSUPP;
+    const struct display_mode *want = NULL;
+    for (int i = 0; i < h->nmodes && !want; i++)
+        if (h->modes[i].width == m->width && h->modes[i].height == m->height &&
+            (!m->refresh_mhz || h->modes[i].refresh_mhz == m->refresh_mhz))
+            want = &h->modes[i];
+    if (!want) return -EINVAL;
+    if (want->width == h->width && want->height == h->height &&
+        (!want->refresh_mhz || want->refresh_mhz == h->refresh_mhz))
+        return 0;                                   /* already there */
+    int idle = -1;
+    if (!__atomic_compare_exchange_n(&switching, &idle, index, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return -EBUSY;
+    struct display_mode copy = *want;
+    kprintf("display: monitor %d: switching to %ux%u @ %u.%03u Hz\n", index, copy.width, copy.height,
+            copy.refresh_mhz / 1000, copy.refresh_mhz % 1000);
+    int rc = h->set_mode(h->mode_ctx, index, &copy);
+    if (rc) kprintf("display: monitor %d: mode switch failed (%d)\n", index, rc);
+    __atomic_store_n(&switching, -1, __ATOMIC_RELEASE);
+    return rc;
+}
+
+int display_update(int index, const struct display_head *h)
+{
+    if (index < 0 || index >= nheads || !head_valid(h)) return -EINVAL;
+    const struct display_head old = heads[index];
+    bool panic_here = g_fb.ready && ((old.vram && g_fb.front == (uint8_t *)old.vram) ||
+                                     (old.shadow && g_fb.back == (uint8_t *)old.shadow));
+    head_store(index, h);
+    if (tty_replace_monitor(index) < 0) {
+        kprintf("display: monitor %d keeps its old terminal\n", index);
+        heads[index] = old;
+        return -ENOMEM;
+    }
+    if (panic_here) {
+        if (h->vram && h->shadow && h->bytes_pp == 4) panic_screen_to(h);
+        else {                                      /* nowhere to draw directly: RAM only */
+            g_fb.double_buffered = false;
+            g_fb.front = g_fb.back = (uint8_t *)h->shadow;
+            g_fb.width = (uint32_t)h->width; g_fb.height = (uint32_t)h->height; g_fb.pitch = (uint32_t)h->pitch;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+        }
+    }
+    return 0;
 }
 
 /* ---- head 0: the boot frame buffer ---------------------------------------- */
@@ -245,6 +306,54 @@ static void probe_boot_fb(void)
 }
 
 /* ---- secondary heads: Bochs/QEMU DISPI adapters --------------------------- */
+/* The adapter takes any size; offer the usual ones that fit the monitor. */
+static const uint16_t dispi_sizes[][2] = {
+    { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 800 },
+    { 1280, 1024 }, { 1366, 768 }, { 1440, 900 }, { 1600, 900 }, { 1600, 1200 }, { 1680, 1050 },
+    { 1920, 1080 }, { 1920, 1200 }, { 2560, 1440 }, { 2560, 1600 }, { 3840, 2160 },
+};
+
+struct dispi_adapter {
+    volatile void *mmio;
+    uint64_t lfb, lfb_size;
+};
+static struct dispi_adapter dispi_adapters[MAX_MONITORS];
+static int ndispi;
+
+static bool dispi_fits(const struct dispi_adapter *a, int w, int h, uint32_t vram)
+{
+    return w <= DISPI_MAX_XRES && h <= DISPI_MAX_YRES && (uint64_t)w * h * 4 <= a->lfb_size &&
+           (!vram || (uint64_t)w * h * 4 <= vram);
+}
+
+static int dispi_switch(void *ctx, int index, const struct display_mode *m)
+{
+    struct dispi_adapter *a = ctx;
+    const struct display_head *cur = display_get(index);
+    struct dispi_mode mode;
+    if (!cur) return -ENODEV;
+    if (!dispi_set_mode(a->mmio, m->width, m->height, &mode) || (uint64_t)mode.pitch * mode.height > a->lfb_size) {
+        dispi_set_mode(a->mmio, cur->width, cur->height, &mode);       /* back to what works */
+        return -EINVAL;
+    }
+    struct display_head h = *cur;
+    h.width = mode.width; h.height = mode.height; h.pitch = mode.pitch;
+    h.refresh_mhz = m->refresh_mhz;
+    size_t frames = ((size_t)mode.pitch * mode.height + PAGE_SIZE - 1) / PAGE_SIZE;
+    size_t old_frames = ((size_t)cur->pitch * cur->height + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t shadow = pmm_alloc_contig(frames);             /* zeroed, identity mapped */
+    uint32_t *old = cur->shadow;
+    h.shadow = (uint32_t *)(uintptr_t)shadow;
+    int rc = display_update(index, &h);
+    if (rc) {
+        if (shadow) pmm_free_contig(shadow, frames);
+        dispi_set_mode(a->mmio, cur->width, cur->height, &mode);
+        return rc;
+    }
+    if (old) pmm_free_contig((uint64_t)(uintptr_t)old, old_frames);
+    return 0;
+}
+
 static void probe_dispi(struct pci_device *dev)
 {
     const struct pci_bar *lfb = &dev->bars[0], *mmio_bar = &dev->bars[2];
@@ -303,6 +412,25 @@ static void probe_dispi(struct pci_device *dev)
     head.shadow = (uint32_t *)(uintptr_t)shadow;
     snprintf(head.name, sizeof head.name, "DISPI adapter %02x:%02x.%x", dev->bus, dev->device, dev->function);
     strlcpy(head.monitor, edid.name, sizeof head.monitor);
+    head.refresh_mhz = edid.refresh_hz > 0 ? (uint32_t)edid.refresh_hz * 1000 : 60000;
+    head.width_mm = edid.width_mm;
+    head.height_mm = edid.height_mm;
+    if (ndispi < MAX_MONITORS) {                            /* the modes xrandr may switch to */
+        struct dispi_adapter *a = &dispi_adapters[ndispi];
+        uint32_t vram = mode.vram_bytes;
+        a->mmio = mmio;
+        a->lfb = lfb->base;
+        a->lfb_size = lfb->size;
+        head.modes[head.nmodes++] = (struct display_mode){ (uint16_t)w, (uint16_t)h, head.refresh_mhz, true };
+        for (size_t i = 0; i < sizeof dispi_sizes / sizeof dispi_sizes[0] && head.nmodes < DISPLAY_MAX_MODES; i++) {
+            int mw = dispi_sizes[i][0], mh = dispi_sizes[i][1];
+            if ((mw == w && mh == h) || mw > w || mh > h || !dispi_fits(a, mw, mh, vram)) continue;
+            head.modes[head.nmodes++] = (struct display_mode){ (uint16_t)mw, (uint16_t)mh, 60000, false };
+        }
+        head.set_mode = dispi_switch;
+        head.mode_ctx = a;
+        ndispi++;
+    }
     if (display_register(&head) < 0 && shadow) pmm_free_contig(shadow, frames);
 }
 

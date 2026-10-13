@@ -102,6 +102,7 @@ Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestre
 - Monitor 0 is the boot frame buffer (the VBE or GOP mode set by GRUB).
 - Further monitors come from drivers that can set modes. Today that is `drivers/video/bochs_dispi.c`, for QEMU's `bochs-display` and `secondary-vga`. It reads the monitor's EDID (`drivers/video/edid.c`) and sets the preferred timing, so each monitor runs at its own native resolution.
 - A native GPU driver would add its monitors through the same `display_register()` call. There is no NVIDIA driver yet.
+- **Modes.** A head may list the modes its monitor can take and offer a `set_mode()` callback. `/dev/fbN` reports them with `KFB_GET_MODES` (the current and the EDID's preferred one marked, and the picture's size in mm), and `KFB_SET_MODE` switches: the driver programs the new mode and hands its new frame buffer to `display_update()`, which moves the terminal (and the panic screen, if it is on that monitor) before the old buffer is freed. The X server's `xrandr --mode` ends up here. DISPI adapters offer their EDID's native size and the usual sizes below it; monitors lit by Linux DRM drivers offer their connector's progressive modes (below); the boot frame buffer has only its own.
 
 **Terminals** (`struct kestrel_tty`, `system_ttys[MAX_MONITORS]`). Each TTY owns:
 - its frame buffer pointer, plus an optional RAM shadow
@@ -570,7 +571,8 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
                              getdents64, ramfs files, generated "pseudo" files
               devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor,
                              ptmx and pts/ (fs/pty.c)
-                             (KFB_GET_INFO, KDSETMODE, KFB_BLIT) (+ block devices)
+                             (KFB_GET_INFO, KDSETMODE, KFB_BLIT, KFB_GET_MODES,
+                             KFB_SET_MODE) (+ block devices)
               tarfs.c        read-only ustar file system on a block device (the /boot volume)
               pipe.c         pipes
               unixsock.c     AF_UNIX stream/seqpacket/datagram-pair sockets, SCM_RIGHTS
@@ -1289,7 +1291,7 @@ The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNN
 
 What Linux keeps under GPL-2.0 is written in the KPI: `ww_mutex`, `dma-fence` (with arrays and chains), SRCU, `drm_managed`, `drm_device.h`, seqlocks, `iosys-map`, `sort`/`list_sort`, `kthread_worker`, and stubs for DRM's sysfs, PRIME and sync objects.
 
-**Kestrel's display client** (`linuxkpi/src/drm_kestrel.c`) stands in for fbdev: drivers call `drm_fbdev_ttm_setup()`, which here is an in-kernel DRM client. It lights each connected monitor at its preferred mode, gives each CRTC an XRGB8888 frame buffer and hands it to Kestrel through `lkpi_display_add()`, which calls `display_register()`; `tty_add_monitor()` then gives the monitor a terminal and its `/dev/ttyN` and `/dev/fbN`. VRAM that scans out as it is written is drawn directly; other buffers get Kestrel's changed lines through `write_span()`, and a worker reports the damage to the driver.
+**Kestrel's display client** (`linuxkpi/src/drm_kestrel.c`) stands in for fbdev: drivers call `drm_fbdev_ttm_setup()`, which here is an in-kernel DRM client. It lights each connected monitor at its preferred mode, gives each CRTC an XRGB8888 frame buffer and hands it to Kestrel through `lkpi_display_add()`, which calls `display_register()`; `tty_add_monitor()` then gives the monitor a terminal and its `/dev/ttyN` and `/dev/fbN`. VRAM that scans out as it is written is drawn directly; other buffers get Kestrel's changed lines through `write_span()`, and a worker reports the damage to the driver. Each head also lists its connector's progressive modes; a mode switch (`KFB_SET_MODE`) creates a frame buffer of the new size, commits the new mode on it, moves the monitor over with `lkpi_display_update()` and frees the old buffer. A buffer that shares a 2 MiB page with the driver's uncached mappings gets its own 4 KiB pages made write-combining.
 
 **Who drives which adapter.** Linux DRM drivers only bind with `linuxkpi.drm=1`. Without it `video_firmware_drivers_only()` is true, and bochs and nouveau decline every device. With it, `display_probe()` leaves secondary DISPI adapters to Linux's bochs. An adapter Kestrel itself programs (a DISPI adapter without `linuxkpi.drm=1`, an NVIDIA card under `nvidia.modeset=`) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (…), not offered to …`. With `-vga std -device bochs-display`, monitor 2 comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under the native driver, and the same pixels on screen. User space gets no DRM ioctls yet.
 
