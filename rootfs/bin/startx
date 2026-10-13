@@ -1,14 +1,25 @@
 #!/bin/sh
-# /boot/bin/startx -- the Kestrel desktop: X server on :0, IceWM, one xterm.
-# Choose Logout in IceWM's menu to end the session; the X server stops too
-# and the monitors return to their text terminals.
+# /boot/bin/startx -- the Kestrel desktop: the X server on :0, then LXDE
+# where the root file system has it (the Firefox image's Ubuntu root), else
+# IceWM with one xterm. Logout in the desktop's menu ends the session; the
+# X server stops too and the monitors return to their text terminals.
 export DISPLAY=:0
 export NO_AT_BRIDGE=1                  # no accessibility bus: GTK programs would warn
-Xkestrel :0 "$@" &                   # all monitors as one desktop (xrandr)
+# FreeType's classic TrueType interpreter (35) for every program on the desktop
+export FREETYPE_PROPERTIES=${FREETYPE_PROPERTIES:-truetype:interpreter-version=35}
+# programs started by kestrel.exec= run with HOME=/
+if [ "$(id -u)" = 0 ] && [ "${HOME:-/}" = / ] && [ -d /root ]; then export HOME=/root; fi
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+Xkestrel :0 "$@" &
 xpid=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-xterm &
-icewm
+if command -v startlxde >/dev/null 2>&1; then
+    startlxde
+else
+    xterm &
+    icewm
+fi
 kill $xpid 2>/dev/null
 wait $xpid
