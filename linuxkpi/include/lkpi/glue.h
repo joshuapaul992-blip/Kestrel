@@ -103,6 +103,12 @@ int           lkpi_pci_msi_is_msix(int vector);
  * draws into a RAM copy and writes changed lines through), or `vram` is
  * NULL and write_span(ctx, byte offset, ...) receives the changed bytes.
  * Pixels are 32-bit x8r8g8b8. Returns the monitor number, or -1. */
+#define LKPI_DISPLAY_MAX_MODES 24
+struct lkpi_display_mode {
+    unsigned short width, height;
+    unsigned int   refresh_mhz;             /* 0 = unknown                       */
+    int            preferred;
+};
 struct lkpi_display {
     unsigned long long phys;                /* scan-out buffer, or 0             */
     void          *vram;
@@ -111,8 +117,20 @@ struct lkpi_display {
     void          *ctx;
     const char    *name;                    /* "bochs-drm 0000:00:03.0"          */
     const char    *monitor;                 /* EDID monitor name, or ""          */
+    unsigned int   refresh_mhz;             /* current mode, 0 = unknown          */
+    int            width_mm, height_mm;     /* 0 = unknown                       */
+    /* Modes the monitor can be switched to (KFB_SET_MODE): set_mode(ctx,
+     * monitor, mode) switches and hands the new frame buffer to
+     * lkpi_display_update(). NULL / 0: a fixed mode. */
+    const struct lkpi_display_mode *modes;
+    int            nmodes;
+    int          (*set_mode)(void *ctx, int monitor, const struct lkpi_display_mode *mode);
 };
 int           lkpi_display_add(const struct lkpi_display *d);
+/* After set_mode(): monitor `monitor` now shows `d`'s frame buffer (its
+ * name, monitor and mode list are kept). The terminal has moved to it when
+ * this returns, so the old buffer may be freed. 0 or -errno. */
+int           lkpi_display_update(int monitor, const struct lkpi_display *d);
 /* A Linux driver claims the adapter `handle` (sysfb_disable()): if Kestrel's
  * boot frame buffer is on it, Kestrel stops drawing there, and the driver's
  * first lkpi_display_add() takes that monitor's place. Returns the monitor

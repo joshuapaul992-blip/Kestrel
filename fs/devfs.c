@@ -212,6 +212,39 @@ static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
         }
         return -EINVAL;
     }
+    case KFB_GET_MODES: {
+        if (!arg || !h) return -EFAULT;
+        struct kfb_modes *m = arg;                      /* a kernel copy (sys_ioctl) */
+        memset(m, 0, sizeof *m);
+        m->width_mm = h->width_mm > 0 ? (uint32_t)h->width_mm : 0;
+        m->height_mm = h->height_mm > 0 ? (uint32_t)h->height_mm : 0;
+        if (!h->nmodes) {                               /* a fixed mode */
+            m->count = 1;
+            m->mode[0] = (struct kfb_mode){ (uint32_t)t->native_width, (uint32_t)t->native_height, h->refresh_mhz,
+                                            KFB_MODE_PREFERRED | KFB_MODE_CURRENT };
+            return 0;
+        }
+        bool found = false;
+        for (int i = 0; i < h->nmodes && i < KFB_MAX_MODES; i++) {
+            const struct display_mode *d = &h->modes[i];
+            struct kfb_mode *k = &m->mode[m->count++];
+            *k = (struct kfb_mode){ d->width, d->height, d->refresh_mhz, d->preferred ? KFB_MODE_PREFERRED : 0 };
+            if (!found && d->width == h->width && d->height == h->height &&
+                (!h->refresh_mhz || !d->refresh_mhz || d->refresh_mhz == h->refresh_mhz)) {
+                k->flags |= KFB_MODE_CURRENT;
+                found = true;
+            }
+        }
+        return 0;
+    }
+    case KFB_SET_MODE: {
+        if (!arg) return -EFAULT;
+        const struct kfb_mode *k = arg;
+        if (fb_owner[idx] && fb_owner[idx] != current_task()->pid) return -EBUSY;
+        if (!k->width || !k->height || k->width > 0xffff || k->height > 0xffff) return -EINVAL;
+        struct display_mode m = { (uint16_t)k->width, (uint16_t)k->height, k->refresh_mhz, false };
+        return display_set_mode(idx, &m);
+    }
     case KFB_BLIT: {
         if (!arg) return -EFAULT;
         const struct kfb_blit *b = arg;                 /* kernel copy; b->src is a user pointer */

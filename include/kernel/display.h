@@ -16,6 +16,13 @@
 #include <stdbool.h>
 
 #define MAX_MONITORS    4
+#define DISPLAY_MAX_MODES   24
+
+struct display_mode {
+    uint16_t  width, height;
+    uint32_t  refresh_mhz;          /* 0 = unknown */
+    bool      preferred;            /* the monitor's own choice (EDID)  */
+};
 
 struct display_head {
     uint64_t  phys;                 /* frame buffer (VRAM aperture) physical address */
@@ -34,6 +41,16 @@ struct display_head {
     void     *write_ctx;
     char      name[32];             /* "VBE frame buffer", "bochs-display 00:04.0"   */
     char      monitor[16];          /* EDID monitor name, or "" if unknown           */
+    uint32_t  refresh_mhz;          /* of the current mode, 0 = unknown              */
+    int       width_mm, height_mm;  /* picture size, 0 = unknown                     */
+    /* Drivers that can switch modes list them here (the current one
+     * included) and set set_mode(), which reprograms the monitor and hands
+     * its new frame buffer to display_update(); it runs in the caller's
+     * task and may sleep. nmodes == 0: the current mode is the only one. */
+    struct display_mode modes[DISPLAY_MAX_MODES];
+    int       nmodes;
+    int     (*set_mode)(void *ctx, int index, const struct display_mode *mode);
+    void     *mode_ctx;
 };
 
 /* Register a head; returns its index (monitor number) or -1 when full or the
@@ -58,6 +75,13 @@ int display_replace(const struct display_head *head);
  * monitor `index` again. Returns it, or -1 if `dev` was not handed over. */
 int display_reclaim(const struct pci_device *dev);
 bool display_handover_pending(void);     /* a monitor waits for display_replace() */
+
+/* Switch monitor `index` to one of its modes (KFB_SET_MODE): 0 or -errno. */
+int display_set_mode(int index, const struct display_mode *mode);
+/* A driver's set_mode(): monitor `index` now shows `head`'s frame buffer.
+ * The terminal (and the panic screen, if it is on this monitor) moves to it
+ * before this returns, so the old frame buffer may then be freed. */
+int display_update(int index, const struct display_head *head);
 
 /* Boot: head 0 from the boot frame buffer (g_fb), then every secondary
  * display adapter a driver knows how to program. Call after pci_init(). */
