@@ -704,3 +704,46 @@ void rcu_barrier(void)
 {
     do flush_work(&rcu_work); while (READ_ONCE(rcu_list));
 }
+
+/* ---- process ids as objects (linux/sched.h) -------------------------------------------- */
+/* One per task slot, made on first use and kept: a struct pid outlives its
+ * task in Linux too, and here it only carries the number. */
+static struct pid *slot_pids[256];
+static DEFINE_SPINLOCK(slot_pids_lock);
+
+struct pid *lkpi_task_pid_obj(struct task_struct *t)
+{
+    struct pid *pid, *fresh;
+    int slot = t->tgid % 256;
+
+    spin_lock(&slot_pids_lock);
+    pid = slot_pids[slot];
+    spin_unlock(&slot_pids_lock);
+    if (pid && pid->nr == t->tgid) return pid;
+    fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
+    if (!fresh) return NULL;
+    refcount_set(&fresh->count, 1);             /* the table's reference, never dropped */
+    fresh->nr = t->tgid;
+    spin_lock(&slot_pids_lock);
+    pid = slot_pids[slot];
+    if (pid && pid->nr == t->tgid) {
+        spin_unlock(&slot_pids_lock);
+        kfree(fresh);
+        return pid;
+    }
+    slot_pids[slot] = fresh;                    /* an older one stays alive while referenced */
+    spin_unlock(&slot_pids_lock);
+    if (pid) put_pid(pid);
+    return fresh;
+}
+
+void put_pid(struct pid *pid)
+{
+    if (pid && refcount_dec_and_test(&pid->count)) kfree(pid);
+}
+
+struct task_struct *lkpi_pid_task(struct pid *pid)
+{
+    struct task_struct *t = current;
+    return pid && t->tgid == pid->nr ? t : NULL;
+}

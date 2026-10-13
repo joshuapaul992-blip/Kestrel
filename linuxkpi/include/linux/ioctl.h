@@ -24,4 +24,8 @@
 #define _IOC_TYPE(nr)           (((nr) >> _IOC_TYPESHIFT) & ((1 << _IOC_TYPEBITS) - 1))
 #define _IOC_NR(nr)             (((nr) >> _IOC_NRSHIFT) & ((1 << _IOC_NRBITS) - 1))
 #define _IOC_SIZE(nr)           (((nr) >> _IOC_SIZESHIFT) & ((1 << _IOC_SIZEBITS) - 1))
+#define IOC_IN          (_IOC_WRITE << _IOC_DIRSHIFT)
+#define IOC_OUT         (_IOC_READ << _IOC_DIRSHIFT)
+#define IOC_INOUT       ((_IOC_WRITE | _IOC_READ) << _IOC_DIRSHIFT)
+
 #endif

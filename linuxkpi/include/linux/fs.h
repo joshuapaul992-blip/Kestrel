@@ -16,8 +16,17 @@
 #include <linux/poll.h>
 #include <linux/mutex.h>
 #include <linux/kref.h>
+#include <linux/rwsem.h>
+#include <linux/completion.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
+#include <linux/capability.h>
+#include <linux/gfp_types.h>
 
 struct module;
+struct dentry;
+struct seq_file;
+struct super_block;
 struct vm_area_struct;
 struct cdev;
 
@@ -46,12 +55,23 @@ struct cdev;
 #define SEEK_CUR        1
 #define SEEK_END        2
 
+struct address_space {
+    struct inode       *host;
+    gfp_t               gfp_mask;
+    unsigned long       nrpages;
+    void               *private_data;
+};
+
 struct inode {
     umode_t             i_mode;
     dev_t               i_rdev;
     loff_t              i_size;
     struct cdev        *i_cdev;
     void               *i_private;
+    struct address_space *i_mapping;
+    struct address_space i_data;
+    struct super_block *i_sb;
+    unsigned long       i_ino;
 };
 
 struct file_operations;
@@ -63,6 +83,8 @@ struct file {
     loff_t              f_pos;
     void               *private_data;
     struct mutex        f_pos_lock;
+    struct address_space *f_mapping;
+    atomic_long_t       f_count;
 };
 
 struct file_operations {
@@ -79,7 +101,10 @@ struct file_operations {
     int      (*release)(struct inode *, struct file *);
     int      (*fsync)(struct file *, loff_t, loff_t, int datasync);
     int      (*fasync)(int, struct file *, int);
+    unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+    unsigned int fop_flags;
 };
+#define FOP_UNSIGNED_OFFSET     ((unsigned int)(1 << 5))
 
 static inline struct inode *file_inode(const struct file *f) { return f->f_inode; }
 static inline unsigned iminor(const struct inode *inode) { return MINOR(inode->i_rdev); }
@@ -105,5 +130,10 @@ void __unregister_chrdev(unsigned int major, unsigned int baseminor, unsigned in
 static inline int register_chrdev(unsigned int major, const char *name, const struct file_operations *fops)
 { return __register_chrdev(major, 0, 256, name, fops); }
 static inline void unregister_chrdev(unsigned int major, const char *name) { __unregister_chrdev(major, 0, 256, name); }
+
+#define fops_get(fops)                  (fops)
+#define fops_put(fops)                  do { } while (0)
+#define replace_fops(f, fops)           do { (f)->f_op = (fops); } while (0)
+struct file *file_clone_open(struct file *file);
 
 #endif

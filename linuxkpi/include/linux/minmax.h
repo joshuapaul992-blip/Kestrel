@@ -25,4 +25,9 @@
 #define in_range(val, start, len) ((val) >= (start) && (val) - (start) < (len))
 #define swap(a, b)              do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)
 
+#define MIN_T(T, a, b)          ((T)(a) < (T)(b) ? (T)(a) : (T)(b))     /* constant expressions */
+#define MAX_T(T, a, b)          ((T)(a) > (T)(b) ? (T)(a) : (T)(b))
+#define MIN(a, b)               ((a) < (b) ? (a) : (b))
+#define MAX(a, b)               ((a) > (b) ? (a) : (b))
+
 #endif

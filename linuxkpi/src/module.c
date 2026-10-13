@@ -221,6 +221,7 @@ static int lkpi_init_thread(void *unused)
     lkpi_tasklet_core_init();
     lkpi_device_core_init();
     lkpi_pci_core_init();
+    lkpi_drm_core_init();
 
     cmdline_walk(param_one, NULL);
     run_initcalls();

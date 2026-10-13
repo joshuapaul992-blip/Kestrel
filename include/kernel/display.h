@@ -42,6 +42,11 @@ int  display_register(const struct display_head *head);
 int  display_count(void);
 const struct display_head *display_get(int index);
 
+/* The name of the head an adapter drives (its frame buffer is in one of the
+ * device's memory BARs), or NULL: the Linux KPI leaves such adapters alone. */
+struct pci_device;
+const char *display_pci_owner(const struct pci_device *dev);
+
 /* Boot: head 0 from the boot frame buffer (g_fb), then every secondary
  * display adapter a driver knows how to program. Call after pci_init(). */
 void display_probe(void);

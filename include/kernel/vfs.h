@@ -277,6 +277,7 @@ struct vm_object *vfs_vmobject(struct vnode *vn);  /* see vnode_ops.vmobject */
 /* ---- filesystem drivers ------------------------------------------------- */
 extern const struct vnode_ops ramfs_ops;
 void devfs_init(const char *mountpoint);
+void devfs_add_monitor(int index);      /* /dev/ttyN, /dev/fbN of a late monitor */
 /* Add a character/block-style device node to /dev after boot (drivers). */
 /* fs/pty.c: /dev/ptmx and /dev/pts/N (created by devfs_init) */
 void          pty_init(struct vnode *devroot);

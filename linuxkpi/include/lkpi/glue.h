@@ -78,6 +78,8 @@ struct lkpi_pci_info {
         int            prefetch;
     } bar[6];
     void          *parent;                  /* upstream bridge's handle, or NULL */
+    const char    *native;                  /* the Kestrel driver using it (not offered
+                                               to Linux drivers), or NULL           */
 };
 int           lkpi_pci_count(void);
 int           lkpi_pci_get(int index, struct lkpi_pci_info *out);
@@ -88,6 +90,23 @@ void          lkpi_pci_write(void *handle, int off, int size, unsigned int v);
 int           lkpi_pci_msi_enable(void *handle, void (*fn)(void *), void *arg, const char *name);
 void          lkpi_pci_msi_disable(void *handle, int vector);
 int           lkpi_pci_msi_is_msix(int vector);
+
+/* ---- displays ----------------------------------------------------------- */
+/* A monitor lit by a Linux DRM driver, as a Kestrel display head with its
+ * own terminal. Either `vram` is the CPU-mapped scan-out buffer (Kestrel
+ * draws into a RAM copy and writes changed lines through), or `vram` is
+ * NULL and write_span(ctx, byte offset, ...) receives the changed bytes.
+ * Pixels are 32-bit x8r8g8b8. Returns the monitor number, or -1. */
+struct lkpi_display {
+    unsigned long long phys;                /* scan-out buffer, or 0             */
+    void          *vram;
+    int            width, height, pitch;
+    void         (*write_span)(void *ctx, unsigned int offset, const void *src, unsigned int len);
+    void          *ctx;
+    const char    *name;                    /* "bochs-drm 0000:00:03.0"          */
+    const char    *monitor;                 /* EDID monitor name, or ""          */
+};
+int           lkpi_display_add(const struct lkpi_display *d);
 
 /* ---- files and device nodes ---------------------------------------------- */
 /* The whole file at `path` in a buffer from lkpi_heap_alloc: its size, or

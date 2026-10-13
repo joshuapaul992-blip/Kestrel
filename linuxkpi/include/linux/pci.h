@@ -103,6 +103,7 @@ struct pci_dev {
     /* the KPI's own */
     void               *lkpi_handle;            /* Kestrel's struct pci_device */
     int                 lkpi_vector;            /* MSI vector, or -1 */
+    const char         *lkpi_native;            /* Kestrel drives it (e.g. the boot display): no Linux driver binds */
     bool                lkpi_managed;           /* pcim_enable_device */
     bool                lkpi_irq_managed;       /* vectors freed at unbind */
     u32                 lkpi_regions;           /* BARs requested */
@@ -331,5 +332,7 @@ int  pci_dev_present(const struct pci_device_id *ids);
 /* ---- the old DMA mask calls -------------------------------------------- */
 static inline int pci_set_dma_mask(struct pci_dev *dev, u64 mask) { return dma_set_mask(&dev->dev, mask); }
 static inline int pci_set_consistent_dma_mask(struct pci_dev *dev, u64 mask) { return dma_set_coherent_mask(&dev->dev, mask); }
+
+static inline bool dev_is_pci(const struct device *dev) { return dev && dev->bus == &pci_bus_type; }
 
 #endif

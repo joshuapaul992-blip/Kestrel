@@ -567,3 +567,60 @@ void get_random_bytes(void *buf, size_t len)
         len -= n;
     }
 }
+
+/* ---- phase 2 helpers -------------------------------------------------------------------- */
+#include <linux/overflow.h>
+#include <linux/seq_file.h>
+#include <linux/seq_buf.h>
+#include <linux/stdarg.h>
+
+void *memdup_array_user(const void __user *src, size_t n, size_t size)
+{
+    size_t nbytes;
+    if (check_mul_overflow(n, size, &nbytes)) return ERR_PTR(-EOVERFLOW);
+    return memdup_user(src, nbytes);
+}
+
+/* seq_file: only debugfs files use it, and there are none; output to a
+ * buffer when one is given, else dropped */
+static void seq_add(struct seq_file *m, const char *s, size_t len)
+{
+    if (!m || !m->buf || m->count >= m->size) return;
+    if (len > m->size - m->count) len = m->size - m->count;
+    memcpy(m->buf + m->count, s, len);
+    m->count += len;
+}
+
+void seq_printf(struct seq_file *m, const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    seq_add(m, buf, min_t(size_t, n, sizeof(buf) - 1));
+}
+
+void seq_puts(struct seq_file *m, const char *s) { seq_add(m, s, strlen(s)); }
+void seq_putc(struct seq_file *m, char c) { seq_add(m, &c, 1); }
+void seq_write(struct seq_file *m, const void *data, size_t len) { seq_add(m, data, len); }
+
+int seq_buf_printf(struct seq_buf *s, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    size_t room = s->len < s->size ? s->size - s->len : 0;
+
+    va_start(ap, fmt);
+    n = vsnprintf(s->buffer + (room ? s->len : 0), room, fmt, ap);
+    va_end(ap);
+    if (n < 0) return n;
+    s->len += n;                                /* past size means overflowed */
+    return (size_t)n < room ? 0 : -1;
+}
+
+int seq_buf_puts(struct seq_buf *s, const char *str)
+{
+    return seq_buf_printf(s, "%s", str);
+}

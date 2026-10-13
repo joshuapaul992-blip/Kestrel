@@ -7,6 +7,8 @@
 
 #include <linux/err.h>
 #include <linux/sched.h>
+#include <linux/workqueue.h>
+#include <linux/timer.h>
 
 struct completion;
 
@@ -35,5 +37,29 @@ bool kthread_freezable_should_stop(bool *was_frozen);
 #define set_freezable()                 do { } while (0)
 #define try_to_freeze()                 false
 #define freezing(t)                     false
+
+/* kthread workers: an ordered workqueue under another name */
+struct kthread_work;
+typedef void (*kthread_work_func_t)(struct kthread_work *work);
+struct kthread_worker {
+    struct workqueue_struct *wq;
+    struct task_struct *task;           /* NULL: the work runs on a workqueue thread */
+};
+struct kthread_work {
+    struct work_struct ws;
+    kthread_work_func_t func;
+    struct kthread_worker *worker;
+};
+void lkpi_kthread_work_fn(struct work_struct *ws);
+static inline void kthread_init_work(struct kthread_work *work, kthread_work_func_t fn)
+{ INIT_WORK(&work->ws, lkpi_kthread_work_fn); work->func = fn; work->worker = NULL; }
+__printf(2, 3) struct kthread_worker *kthread_create_worker(unsigned int flags, const char namefmt[], ...);
+void kthread_destroy_worker(struct kthread_worker *worker);
+static inline bool kthread_queue_work(struct kthread_worker *worker, struct kthread_work *work)
+{ work->worker = worker; return queue_work(worker->wq, &work->ws); }
+static inline bool kthread_cancel_work_sync(struct kthread_work *work) { return cancel_work_sync(&work->ws); }
+static inline void kthread_flush_work(struct kthread_work *work) { flush_work(&work->ws); }
+static inline void kthread_flush_worker(struct kthread_worker *worker) { flush_workqueue(worker->wq); }
+
 
 #endif

@@ -256,6 +256,17 @@ static void add_tty(struct vnode *dir, const char *name, uint32_t mode, uint32_t
 
 static struct vnode *devfs_root;
 
+/* /dev/ttyN and /dev/fbN of a monitor added after boot (tty_add_monitor) */
+void devfs_add_monitor(int i)
+{
+    char name[8];
+    snprintf(name, sizeof name, "tty%d", i + 1);
+    if (!devfs_register(name, 0620, MKDEV(4, (uint32_t)(i + 1)), &tty_ops, tty_get(i)))
+        return;
+    snprintf(name, sizeof name, "fb%d", i);
+    devfs_register(name, 0660, MKDEV(29, (uint32_t)i), &fb_ops, tty_get(i));
+}
+
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx)
 {

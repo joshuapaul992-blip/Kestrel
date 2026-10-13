@@ -26,6 +26,7 @@
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/uaccess.h>
+#include <kernel/vfs.h>
 
 struct kestrel_tty system_ttys[MAX_MONITORS];
 int tty_count;
@@ -1030,6 +1031,26 @@ int tty_init_all(void)
     pit_add_tick_hook(tty_cursor_tick);
     input_active = true;
     return n;
+}
+
+/* A monitor registered after the boot ones (a Linux DRM driver through the
+ * Linux KPI): its terminal and its /dev/ttyN and /dev/fbN. Only the next
+ * monitor number can be added, so TTY numbers keep matching monitors. */
+int tty_add_monitor(int index)
+{
+    if (!tty_count || index != tty_count || index >= MAX_MONITORS || !display_get(index)) return -1;
+    struct kestrel_tty *t = &system_ttys[index];
+    if (!tty_setup(t, index, display_get(index))) {
+        kprintf("tty: no terminal for monitor %d (out of memory or too small)\n", index);
+        return -1;
+    }
+    tty_clear(t);
+    __atomic_store_n(&tty_count, index + 1, __ATOMIC_RELEASE);
+    kprintf("tty: tty%d on monitor %d: %dx%d pixels, %d x %d cells%s\n", index + 1, index,
+            t->native_width, t->native_height, t->max_cols, t->max_rows,
+            t->shadow ? ", drawn through a RAM shadow" : "");
+    devfs_add_monitor(index);
+    return index;
 }
 
 /* ======================================================================== */

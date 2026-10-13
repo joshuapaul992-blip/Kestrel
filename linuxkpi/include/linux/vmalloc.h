@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/gfp_types.h>
 #include <linux/mm_types.h>
+#include <linux/pgtable.h>
 
 void *vmalloc(unsigned long size);
 void *vzalloc(unsigned long size);
@@ -23,11 +24,7 @@ void *vcalloc(size_t n, size_t size);
 
 #define VM_MAP                          0x00000004
 #define VM_IOREMAP                      0x00000001
-void *vmap(struct page **pages, unsigned int count, unsigned long flags, unsigned long prot);
+void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot);
 void  vunmap(const void *addr);
-#define PAGE_KERNEL                     0
-#define PAGE_KERNEL_IO                  0
-#define pgprot_writecombine(p)          (p)
-#define pgprot_noncached(p)             (p)
 
 #endif

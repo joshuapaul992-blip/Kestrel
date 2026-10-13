@@ -162,4 +162,6 @@ void devm_release_action(struct device *dev, void (*action)(void *), void *data)
 static inline int devm_remove_action_nowarn(struct device *dev, void (*action)(void *), void *data)
 { devm_remove_action(dev, action, data); return 0; }
 
+static inline bool dev_is_platform(const struct device *dev) { return false; }
+
 #endif

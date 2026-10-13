@@ -20,5 +20,15 @@ struct lockdep_map { int dummy; };
 #define might_lock_nested(l, s)                         do { } while (0)
 #define lock_acquire(...)                               do { } while (0)
 #define lock_release(...)                               do { } while (0)
+#define lock_acquire_shared_recursive(...)              do { } while (0)
+#define lock_acquire_exclusive(...)                     do { } while (0)
+#define lock_acquire_shared(...)                        do { } while (0)
+#define lock_map_acquire(l)                             do { } while (0)
+#define lock_map_acquire_read(l)                        do { } while (0)
+#define lock_map_acquire_try(l)                         do { } while (0)
+#define lock_map_release(l)                             do { } while (0)
+#define STATIC_LOCKDEP_MAP_INIT(name, key)              { 0 }
 #define SINGLE_DEPTH_NESTING                            1
+#define lockdep_assert_once(c)                          do { } while (0)
+
 #endif

@@ -77,4 +77,7 @@ static inline void *kmem_cache_zalloc(struct kmem_cache *s, gfp_t gfp) { return 
 #define KMEM_CACHE(__struct, __flags) \
     kmem_cache_create(#__struct, sizeof(struct __struct), __alignof__(struct __struct), (__flags), NULL)
 
+#define kmem_cache_alloc_lru(c, lru, gfp)       kmem_cache_alloc(c, gfp)
+struct list_lru;
+
 #endif

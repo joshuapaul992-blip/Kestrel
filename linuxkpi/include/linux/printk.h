@@ -11,6 +11,7 @@
 #include <linux/compiler.h>
 #include <linux/sprintf.h>
 #include <linux/kern_levels.h>
+#include <linux/instruction_pointer.h>
 
 /* %pV: a format and its arguments, printed in place */
 struct va_format { const char *fmt; va_list *va; };
@@ -77,5 +78,7 @@ static inline char *hex_byte_pack(char *buf, u8 byte) { *buf++ = hex_asc_hi(byte
 int hex_to_bin(unsigned char ch);
 int __must_check hex2bin(u8 *dst, const char *src, size_t count);
 char *bin2hex(char *dst, const void *src, size_t count);
+
+#define oops_in_progress        0
 
 #endif

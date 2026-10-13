@@ -12,6 +12,7 @@
 #include <linux/list.h>
 
 struct address_space;
+struct task_struct;
 
 struct page {
     unsigned long           flags;
@@ -27,7 +28,39 @@ struct page {
 
 struct folio { struct page page; };
 struct mm_struct { int dummy; };
-struct vm_area_struct;
 typedef unsigned long vm_flags_t;
+typedef unsigned int vm_fault_t;
+#ifndef _LKPI_PGPROT_T
+#define _LKPI_PGPROT_T
+typedef struct { unsigned long pgprot; } pgprot_t;
+#endif
+
+/* mappings of a file (a DRM device) into a process: Kestrel does not map
+ * driver memory into processes yet, so these only describe a request */
+struct vm_operations_struct;
+struct file;
+struct vm_area_struct {
+    unsigned long vm_start, vm_end;
+    struct mm_struct *vm_mm;
+    pgprot_t vm_page_prot;
+    vm_flags_t vm_flags;
+    unsigned long vm_pgoff;             /* offset in the file, in pages */
+    struct file *vm_file;
+    void *vm_private_data;
+    const struct vm_operations_struct *vm_ops;
+};
+struct vm_fault {
+    struct vm_area_struct *vma;
+    unsigned int flags;                 /* FAULT_FLAG_* */
+    pgoff_t pgoff;
+    unsigned long address;
+    struct page *page;
+};
+struct vm_operations_struct {
+    void (*open)(struct vm_area_struct *area);
+    void (*close)(struct vm_area_struct *area);
+    vm_fault_t (*fault)(struct vm_fault *vmf);
+    int (*access)(struct vm_area_struct *vma, unsigned long addr, void *buf, int len, int write);
+};
 
 #endif

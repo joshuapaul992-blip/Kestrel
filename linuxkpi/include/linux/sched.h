@@ -111,4 +111,17 @@ void put_task_struct(struct task_struct *t);
 #define set_user_nice(t, n)     do { (void)(t); } while (0)
 #define task_nice(t)            0
 
+/* process ids as objects (DRM keeps the opener's) */
+struct pid { refcount_t count; pid_t nr; };
+struct pid *lkpi_task_pid_obj(struct task_struct *t);   /* linuxkpi/src/sched.c */
+#define task_tgid(t)                    lkpi_task_pid_obj(t)
+#define task_pid(t)                     lkpi_task_pid_obj(t)
+static inline struct pid *get_pid(struct pid *pid) { if (pid) refcount_inc(&pid->count); return pid; }
+void put_pid(struct pid *pid);
+static inline pid_t pid_nr(struct pid *pid) { return pid ? pid->nr : 0; }
+static inline pid_t pid_vnr(struct pid *pid) { return pid_nr(pid); }
+struct task_struct *lkpi_pid_task(struct pid *pid);
+#define pid_task(pid, type)             lkpi_pid_task(pid)
+#define get_pid_task(pid, type)         lkpi_pid_task(pid)
+
 #endif

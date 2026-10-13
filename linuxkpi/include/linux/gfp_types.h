@@ -48,4 +48,6 @@
 
 static inline bool gfpflags_allow_blocking(const gfp_t gfp) { return !!(gfp & __GFP_DIRECT_RECLAIM); }
 
+#define __GFP_BITS_SHIFT        26      /* bits Linux code may use above the gfp flags */
+
 #endif
