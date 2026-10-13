@@ -1,10 +1,16 @@
 /* ui/bootmgr.c -- boot manager screen in the style of the classic BIOS-based
- * Windows Boot Manager: black background, light-gray monospace text, a
- * silver title bar, a thick silver highlight bar that slides between
- * entries, a live countdown under the entry list, a "Tools:" block, and a
- * key legend along the bottom edge.
+ * Windows Boot Manager: black background, light-gray text, a silver title
+ * bar, a thick silver highlight bar that slides between entries, a live
+ * countdown under the entry list, a "Tools:" block, and a key legend along
+ * the bottom edge.
  *
- * Layout uses the 12x24 font as an 85 x 32 character grid on 1024x768.
+ * Text is the Kestrel 15 font (drivers/kfont_15.c), set proportionally:
+ * each glyph is drawn pixel for pixel and advances by its own ink width
+ * plus a 2-pixel gap, so narrow letters (i, l, 1) are not padded out to
+ * the widest one. Tables of numbers use mono() instead, which keeps a
+ * fixed 13-pixel advance so their columns line up.
+ *
+ * Positions use a 12 x 24 pixel grid, 85 x 32 cells on 1024x768.
  *
  *   row  0   [######### Kestrel Boot Manager #########]   title bar
  *   row  2   Choose an operating system to start, or press TAB to select a tool:
@@ -20,9 +26,11 @@
 #include <kernel/bootmgr.h>
 #include <kernel/bootinfo.h>
 #include <kernel/fb.h>
+#include <kernel/kestrel_font.h>
 #include <kernel/keyboard.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
+#include <kernel/smp.h>
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
@@ -31,7 +39,6 @@
 #include <kernel/storage.h>
 #include <kernel/usbhost.h>
 
-#define F       (&font_12x24)
 #define CW      12
 #define CH      24
 #define ROW(r)  ((r) * CH)
@@ -80,12 +87,103 @@ static const struct list os_list    = { ROW_OS,    N_OS,    os_items,   true  };
 static const struct list tools_list = { ROW_TOOLS, N_TOOLS, tool_items, false };
 
 /* ------------------------------------------------------------------------- */
+/*  waiting                                                                     */
+/* ------------------------------------------------------------------------- */
+
+/* The boot code holds the big kernel lock (kernel.c), and every interrupt
+ * handler that needs it is deferred until it is let go: the timer hooks,
+ * xhci_poll() among them, and all MSIs, the xHCI's included. So the boot
+ * manager lets go of it whenever it waits; otherwise the xHCI's event ring
+ * is not read until Kestrel starts and a USB keyboard does nothing here.
+ * Only the PS/2 keyboard's IRQ 1 runs without the lock. */
+static void run_deferred_irqs(void) { bkl_reacquire(bkl_release_all()); }
+
+static void idle(void)
+{
+    int depth = bkl_release_all();              /* runs what was deferred */
+    hlt();                                      /* next interrupt: at most a 1 ms tick */
+    bkl_reacquire(depth);
+}
+
+static void sleep_ms(uint64_t ms)
+{
+    uint64_t end = uptime_ms() + ms;
+    while (uptime_ms() < end) idle();
+}
+
+static void wait_key(struct key_event *ev)
+{
+    while (!keyboard_poll(ev)) idle();
+}
+
+/* ------------------------------------------------------------------------- */
 /*  drawing helpers                                                             */
 /* ------------------------------------------------------------------------- */
 
-static void text(int col, int row, const char *s, uint32_t fg)
+#define GLYPH_GAP   2           /* blank pixels between two glyphs' ink   */
+#define SPACE_W     6           /* advance of a space (plus the gap before) */
+#define MONO_W      13          /* mono(): widest ink (12) + 1             */
+
+/* Ink columns of each glyph, found once from the bitmaps. */
+static uint8_t ink_x0[256], ink_w[256];
+
+static void measure_font(void)
 {
-    draw_string(col * CW, ROW(row), s, fg, FB_TRANSPARENT, F);
+    static bool done;
+    if (done) return;
+    done = true;
+    for (int c = 0; c < 256; c++) {
+        const uint16_t *g = kfont_glyph(&kfont_15, (unsigned char)c);
+        unsigned bits = 0;
+        for (int y = 0; y < kfont_15.height; y++) bits |= g[y];
+        if (!bits) continue;
+        int x0 = 0, x1 = kfont_15.width - 1;
+        while (!(bits & (0x8000u >> x0))) x0++;
+        while (!(bits & (0x8000u >> x1))) x1--;
+        ink_x0[c] = (uint8_t)x0;
+        ink_w[c] = (uint8_t)(x1 - x0 + 1);
+    }
+}
+
+static int advance(unsigned char c) { return ink_w[c] ? ink_w[c] + GLYPH_GAP : SPACE_W; }
+
+/* Width of `s` as text() draws it, without the gap after the last glyph. */
+static int text_width(const char *s)
+{
+    int w = 0;
+    for (; *s; s++) w += advance((unsigned char)*s);
+    return w > GLYPH_GAP ? w - GLYPH_GAP : w;
+}
+
+/* Glyph columns [from, from + n) at x, vertically centred in a CH row. */
+static void put_glyph(int x, int y, unsigned char c, int from, int n, uint32_t fg)
+{
+    const uint16_t *g = kfont_glyph(&kfont_15, c);
+    y += (CH - kfont_15.height) / 2;
+    for (int row = 0; row < kfont_15.height; row++)
+        for (int col = 0; col < n; col++)
+            if (g[row] & (0x8000u >> (from + col))) put_pixel(x + col, y + row, fg);
+}
+
+/* Proportional text at pixel (x, y); returns the x after it. */
+static int draw_text(int x, int y, const char *s, uint32_t fg)
+{
+    measure_font();
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (ink_w[c]) put_glyph(x, y, c, ink_x0[c], ink_w[c], fg);
+        x += advance(c);
+    }
+    return x;
+}
+
+static int text(int col, int row, const char *s, uint32_t fg) { return draw_text(col * CW, ROW(row), s, fg); }
+
+/* Fixed-advance text for tables (memory map, addresses): the sheet's cells
+ * hold every glyph's ink in columns 0..12, so a 13-pixel cell keeps them all. */
+static void mono(int col, int row, const char *s, uint32_t fg)
+{
+    for (int x = col * CW; *s; s++, x += MONO_W) put_glyph(x, ROW(row), (unsigned char)*s, 0, MONO_W, fg);
 }
 
 static void clear_row(int row) { draw_rect(0, ROW(row), SCR_W, CH, COL_BLACK); }
@@ -95,8 +193,7 @@ static void flush_rows(int row, int n) { fb_flush_rect(0, ROW(row), SCR_W, n * C
 static void title_bar(const char *title)
 {
     draw_rect(0, ROW(ROW_TITLE), SCR_W, CH, COL_SILVER);
-    int x = (SCR_W - (int)strlen(title) * CW) / 2;
-    draw_string(x, ROW(ROW_TITLE), title, COL_BLACK, FB_TRANSPARENT, F);
+    draw_text((SCR_W - text_width(title)) / 2, ROW(ROW_TITLE), title, COL_BLACK);
 }
 
 /* Bottom legend: up to three labels placed left / centre / right. */
@@ -104,9 +201,9 @@ static void legend_bar(const char *left, const char *mid, const char *right)
 {
     int y = ROW(LAST_ROW);
     draw_rect(0, y, SCR_W, SCR_H - y, COL_SILVER);
-    if (left)  draw_string(CW, y, left, COL_BLACK, FB_TRANSPARENT, F);
-    if (mid)   draw_string((SCR_W - (int)strlen(mid) * CW) / 2, y, mid, COL_BLACK, FB_TRANSPARENT, F);
-    if (right) draw_string(SCR_W - CW - (int)strlen(right) * CW, y, right, COL_BLACK, FB_TRANSPARENT, F);
+    if (left)  draw_text(CW, y, left, COL_BLACK);
+    if (mid)   draw_text((SCR_W - text_width(mid)) / 2, y, mid, COL_BLACK);
+    if (right) draw_text(SCR_W - CW - text_width(right), y, right, COL_BLACK);
 }
 
 /* Draw a list with the highlight bar at pixel row `bar_y` (-1 = no bar).
@@ -117,16 +214,16 @@ static void draw_list_at(const struct list *l, int bar_y)
     int y0 = ROW(l->row0), h = l->n * CH;
     draw_rect(0, y0, SCR_W, h, COL_BLACK);
     for (int i = 0; i < l->n; i++)
-        draw_string(TEXT_X, y0 + i * CH, l->items[i], COL_LIGHTGRAY, FB_TRANSPARENT, F);
+        draw_text(TEXT_X, y0 + i * CH, l->items[i], COL_LIGHTGRAY);
 
     if (bar_y >= 0) {
         draw_rect(BAR_X, bar_y, BAR_W, CH, COL_SILVER);
         fb_set_clip(BAR_X, bar_y, BAR_W, CH);
         for (int i = 0; i < l->n; i++)
-            draw_string(TEXT_X, y0 + i * CH, l->items[i], COL_BLACK, FB_TRANSPARENT, F);
+            draw_text(TEXT_X, y0 + i * CH, l->items[i], COL_BLACK);
         fb_reset_clip();
         if (l->arrow)
-            fb_draw_char(BAR_X + BAR_W - 2 * CW, bar_y, '>', COL_BLACK, FB_TRANSPARENT, F);
+            draw_text(BAR_X + BAR_W - 2 * CW, bar_y, ">", COL_BLACK);
     }
     fb_flush_rect(0, y0, SCR_W, h);
 }
@@ -145,7 +242,7 @@ static void animate_list(const struct list *l, int from, int to)
         /* ease-out: larger steps first */
         int t = s * (2 * steps - s);                 /* 0 .. steps^2 */
         draw_list_at(l, y_from + (y_to - y_from) * t / (steps * steps));
-        if (s < steps) pit_sleep_ms(10);
+        if (s < steps) sleep_ms(10);
     }
 }
 
@@ -153,24 +250,28 @@ static void wait_any_key(void)
 {
     struct key_event ev;
     keyboard_flush();
-    while (!keyboard_poll(&ev)) hlt();
+    wait_key(&ev);
 }
 
-/* Word-wrap `s` starting at (col,row), `width` columns wide. */
+/* Word-wrap `s` starting at (col,row) into lines of at most `width` pixels. */
 static int text_wrapped(int col, int row, int width, const char *s, uint32_t fg)
 {
-    char line[96];
+    char line[128];
     while (*s) {
-        int n = (int)strlen(s);
-        if (n > width) {
-            n = width;
-            while (n > 0 && s[n] != ' ') n--;
-            if (n == 0) n = width;
+        int n = 0, fit = 0;                     /* fit: longest prefix ending at a word */
+        while (s[n] && n < (int)sizeof line - 1) {
+            line[n] = s[n];
+            line[n + 1] = 0;
+            if (text_width(line) > width) break;
+            n++;
+            if (!s[n] || s[n] == ' ') fit = n;
         }
-        memcpy(line, s, (size_t)n);
-        line[n] = 0;
+        if (!s[n]) fit = n;
+        if (fit == 0) fit = n ? n : 1;          /* one word wider than the line */
+        memcpy(line, s, (size_t)fit);
+        line[fit] = 0;
         text(col, row++, line, fg);
-        s += n;
+        s += fit;
         while (*s == ' ') s++;
     }
     return row;
@@ -187,10 +288,10 @@ static void draw_countdown(int seconds)
     clear_row(ROW_COUNTDOWN);
     if (seconds >= 0) {
         const char *msg = "Seconds until the highlighted choice will be started automatically: ";
-        text(1, ROW_COUNTDOWN, msg, COL_LIGHTGRAY);
+        int x = text(1, ROW_COUNTDOWN, msg, COL_LIGHTGRAY);
         char num[8];
         snprintf(num, sizeof num, "%d", seconds);
-        text(1 + (int)strlen(msg), ROW_COUNTDOWN, num, COL_WHITE);
+        draw_text(x, ROW(ROW_COUNTDOWN), num, COL_WHITE);
     }
     flush_rows(ROW_COUNTDOWN, 1);
 }
@@ -249,7 +350,7 @@ static void draw_adv_desc(int sel)
 {
     draw_rect(0, ROW(ROW_ADV_DESC), SCR_W, 4 * CH, COL_BLACK);
     text(1, ROW_ADV_DESC, "Description:", COL_WHITE);
-    text_wrapped(14, ROW_ADV_DESC, 68, adv_desc[sel], COL_LIGHTGRAY);
+    text_wrapped(14, ROW_ADV_DESC, SCR_W - 16 * CW, adv_desc[sel], COL_LIGHTGRAY);
     flush_rows(ROW_ADV_DESC, 4);
 }
 
@@ -261,8 +362,8 @@ static int advanced_options(int os_entry)
 
     fb_clear(COL_BLACK);
     title_bar("Advanced Boot Options");
-    text(1, ROW_PROMPT, "Choose Advanced Options for: ", COL_LIGHTGRAY);
-    text(30, ROW_PROMPT, os_items[os_entry], COL_WHITE);
+    int x = text(1, ROW_PROMPT, "Choose Advanced Options for: ", COL_LIGHTGRAY);
+    draw_text(x, ROW(ROW_PROMPT), os_items[os_entry], COL_WHITE);
     text(1, ROW_PROMPT + 1, "(Use the arrow keys to highlight your choice.)", COL_LIGHTGRAY);
     legend_bar("ENTER=Choose", NULL, "ESC=Cancel");
     fb_flush();
@@ -271,7 +372,7 @@ static int advanced_options(int os_entry)
 
     for (;;) {
         struct key_event ev;
-        keyboard_wait(&ev);
+        wait_key(&ev);
         int old = sel;
         switch (ev.key) {
         case KEY_UP:   do sel = sel > 0 ? sel - 1 : sel; while (!*adv_items[sel] && sel > 0); break;
@@ -323,6 +424,7 @@ static void tool_memory_diagnostic(void)
 
     for (int c = 0; c < total; c++) {
         struct key_event ev;
+        run_deferred_irqs();                    /* USB keys */
         if (keyboard_poll(&ev) && ev.key == KEY_ESC) { aborted = true; break; }
 
         uint64_t base = pmm_alloc_contig(CHUNK_FRAMES);
@@ -424,7 +526,7 @@ static void tool_system_information(void)
             struct mb2_mmap_entry *e = (struct mb2_mmap_entry *)p;
             snprintf(v, sizeof v, "%016lx - %016lx  %8lu KiB  %s", e->addr, e->addr + e->len - 1,
                      e->len >> 10, types[e->type <= 5 ? e->type : 0]);
-            text(4, r++, v, COL_LIGHTGRAY);
+            mono(4, r++, v, COL_LIGHTGRAY);
         }
     }
     text(2, LAST_ROW - 1, "Press any key to return to the boot manager.", COL_LIGHTGRAY);
@@ -438,7 +540,7 @@ static void tool_restart(void)
     fb_clear(COL_BLACK);
     text(1, 2, "Restarting...", COL_WHITE);
     fb_flush();
-    pit_sleep_ms(300);
+    sleep_ms(300);
     cli();
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;
     outb(0x64, 0xFE);                       /* 8042 pulse reset line */
@@ -485,7 +587,7 @@ struct boot_choice bootmgr_run(void)
         }
 
         struct key_event ev;
-        if (!keyboard_poll(&ev)) { hlt(); continue; }
+        if (!keyboard_poll(&ev)) { idle(); continue; }
 
         if (counting) {                     /* any key stops the countdown */
             counting = false;

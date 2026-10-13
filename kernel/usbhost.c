@@ -8,7 +8,9 @@
  *   key events          translated to Kestrel key codes and injected into the
  *                       same queue as PS/2, so the boot manager and console
  *                       work with a USB-only keyboard
- *   mouse events        accumulate an absolute pointer drawn as an overlay
+ *   mouse events        go to the display server (/dev/kinput); without one,
+ *                       only the position is tracked for /proc/usb: the text
+ *                       terminals show no pointer
  */
 #include <kernel/usbhost.h>
 #include <kernel/keyboard.h>
@@ -30,7 +32,7 @@
 #include "usb_msc.h"
 
 static bool usb_up;
-static int  mouse_x, mouse_y, ptr_x = -1, ptr_y = -1;
+static int  mouse_x, mouse_y;
 static uint8_t mouse_buttons;
 static uint32_t mouse_reports, key_events;
 
@@ -103,30 +105,11 @@ static void on_key(const struct usb_key_event *ev)
     keyboard_inject(key, ev->ascii, mods);
 }
 
-/* ---- mouse: absolute pointer from relative reports ------------------------ */
-static const char *const arrow[12] = {
-    "X.........", "XX........", "X#X.......", "X##X......", "X###X.....", "X####X....",
-    "X#####X...", "X######X..", "X###XXXX..", "X#X#X.....", "XX.X#X....", "X...XX....",
-};
-
-static void draw_pointer(void)
-{
-    if (!g_fb.double_buffered) return;          /* nothing to restore from */
-    if (ptr_x >= 0) fb_flush_rect(ptr_x, ptr_y, 10, 12);       /* erase old */
-    ptr_x = mouse_x; ptr_y = mouse_y;
-    for (int y = 0; y < 12; y++)
-        for (int x = 0; x < 10; x++) {
-            char c = arrow[y][x];
-            if (c == 'X') fb_front_pixel(ptr_x + x, ptr_y + y, COL_BLACK);
-            else if (c == '#') fb_front_pixel(ptr_x + x, ptr_y + y, mouse_buttons ? COL_YELLOW : COL_WHITE);
-        }
-}
-
+/* ---- mouse: the display server's, or a position for /proc/usb ------------ */
 static void on_mouse(const struct usb_mouse_event *ev)
 {
     mouse_reports++;
     if (kinput_grabbed()) {                     /* the display server draws its own cursor */
-        ptr_x = -1;
         kinput_usb_mouse(ev->dx, ev->dy, ev->wheel, ev->buttons);
         return;
     }
@@ -140,7 +123,6 @@ static void on_mouse(const struct usb_mouse_event *ev)
         kprintf("usb: mouse buttons %c%c%c at %d,%d\n", ev->buttons & 1 ? 'L' : '-',
                 ev->buttons & 4 ? 'M' : '-', ev->buttons & 2 ? 'R' : '-', mouse_x, mouse_y);
     mouse_buttons = ev->buttons;
-    draw_pointer();
 }
 
 /* HPET/TSC clock: valid before interrupts are enabled, unlike uptime_ms(),
@@ -226,15 +208,6 @@ static int usbd_main(void *arg)
 void usb_start_thread(void)
 {
     if (usb_up) task_create("usbd", usbd_main, NULL);
-}
-
-void usb_redraw_pointer(void)
-{
-    if (!usb_up || ptr_x < 0) return;
-    uint64_t f = irq_save();
-    ptr_x = -1;                                 /* screen was redrawn: nothing to erase */
-    draw_pointer();
-    irq_restore(f);
 }
 
 size_t usb_summary(char *buf, size_t cap)

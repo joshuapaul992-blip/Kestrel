@@ -82,7 +82,7 @@ The tools are:
 - **System Information**: firmware, boot loader, video mode, CPU, the memory map and IRQ counts.
 - **Restart Computer**.
 
-Layout is an 85×32 character grid drawn with a 12×24 font:
+Text is the **Kestrel 15** font (`drivers/kfont_15.c`, from `third_party/kestrel_font/Kestrel_15.bmp`), drawn pixel for pixel but set proportionally: each letter advances by its own ink width plus a 2-pixel gap, so narrow letters (i, l, 1) are not padded out to the width of W. The memory map in System Information keeps a fixed 13-pixel advance so its columns line up. Positions are on a 12×24-pixel grid, 85×32 cells at 1024×768:
 - a silver title bar
 - white prompt text on black
 - the entry list, with a `>` at the end of the highlighted entry
@@ -95,7 +95,7 @@ Layout is an 85×32 character grid drawn with a 12×24 font:
 
 Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestrel font for its resolution (below). `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts a shell on every monitor: BusyBox's `/bin/sh` as a login shell on a real Unix terminal (`kernel/vt.c`, see "The shell on the terminals" below). Without `/bin/sh` on the boot volume, or with `kestrel.shell=kush` on the kernel command line, it runs `kush` (`kernel/kush.c`), the shell built into the kernel, instead.
 
-**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `include/kernel/kestrel_font.h`): two sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600, and **Kestrel 12** (12×18) at 1024×768 and above, so 85 × 42 cells at 1024×768. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells) and `Kestrel_12.bmp` (13×18) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
+**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `drivers/kfont_15.c`, `include/kernel/kestrel_font.h`): three sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600; **Kestrel 12** (12×18) from 1024×768, so 85 × 42 cells at 1024×768; and **Kestrel 15** (14×22) from 1920×1080, so 137 × 49 cells at 1920×1080. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells), `Kestrel_12.bmp` (13×18) and `Kestrel_15.bmp` (14×22) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
 
 **Monitors** (`kernel/display.c`):
 - Display drivers register one head per monitor. Each head has its frame buffer, native resolution, pitch and pixel format.
@@ -389,7 +389,7 @@ Not implemented yet:
   - `xhci_poll()` drains the event ring. It completes commands and transfers, re-arms report buffers and records port changes. It runs from the controller's MSI-X (or MSI) interrupt, with 40 µs moderation, and from the 1 kHz timer as a fallback.
   - Commands, control and bulk transfers sleep while they wait (through the platform's `pause`/`wake` hooks), and `xhci_poll()` wakes them, so a USB disk read no longer holds the CPU and the kernel lock.
   - `xhci_service()` runs in the `usbd` thread. It enumerates hot-plugged devices, frees removed ones, and recovers halted endpoints (Reset Endpoint, then Set TR Dequeue).
-- **Kestrel integration:** USB keys go into the same queue as PS/2, so the boot manager works with a USB-only keyboard. The mouse drives an overlay pointer. Status is in `/proc/usb` (the `usb` shell command) and in the System Information tool.
+- **Kestrel integration:** USB keys go into the same queue as PS/2, so the boot manager works with a USB-only keyboard. The mouse goes to the display server; the text terminals show no pointer. Status is in `/proc/usb` (the `usb` shell command) and in the System Information tool.
 
 Tested in QEMU `qemu-xhci` under SeaBIOS and OVMF. On OVMF, BAR0 sat at 0xC0_0000_0000, above 4 GiB.
 - **Devices:** high-speed and full-speed keyboards, a mouse, and a SuperSpeed mass-storage device (enumerated only).
@@ -525,6 +525,7 @@ arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order
                              IO APIC routing of ISA IRQs, IPIs, INIT/STARTUP
               smp.c          percpu blocks (GS base), big kernel lock, TLB shootdowns, AP start-up
               trampoline.asm real mode -> long mode start-up code of the other CPUs (at 0x8000)
+              vbe_thunk.asm  long mode -> real mode -> long mode: one VBE mode switch for the panic screen
               pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz (without an APIC)
               switch.asm     context_switch(), thread_trampoline, enter_user/user_return
               syscall_entry.asm  SYSCALL/LSTAR fast path (for ring 3), canonical-RIP SYSRET check
@@ -538,8 +539,9 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               kinput.c       /dev/kinput: evdev-style key/button/motion events for the X server
                              (PS/2 set 1 and USB HID -> Linux codes), grab while open
               serial.c       COM1 log
-              font_*.c       Spleen 8x16 and 12x24 (boot manager), generated by tools/bdf2c.py
-              kfont_*.c      the terminals' Kestrel 10 and 12, from tools/sheet2font.py
+              font_8x16.c    Spleen 8x16 (kernel console), from tools/bdf2c.py
+              kfont_*.c      the terminals' Kestrel 10, 12 and 15 (also the boot manager's),
+                             from tools/sheet2font.py
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
               nvme/          standalone NVMe driver: admin + I/O queue pair, PRP lists (nvme.h, nvme.c)
@@ -592,7 +594,8 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
               uaccess.c      copy_from_user/copy_to_user and friends (checked, fault-safe)
               futex.c        futexes: hashed wait queues, requeue, wake-op, robust lists
-              klog.c         dmesg ring buffer, panic screen
+              klog.c         dmesg ring buffer, panic()
+              stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
@@ -610,7 +613,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
                              NVMe self-test and shutdown, MSI hookup
               msi.c          MSI/MSI-X: vectors 0x50-0x6F for PCI devices, /proc/interrupts lines
-              usbhost.c      PCI -> xHCI glue, key injection, mouse pointer, usbd thread, /proc/usb,
+              usbhost.c      PCI -> xHCI glue, key injection, mouse position, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
               time.c         invariant TSC / HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
               vdso.c         the vDSO's pages, mapped into every process (clock reads without syscalls)
@@ -908,6 +911,7 @@ The lock order is: the file tree's lock, then a volume's mutex, then the big loc
 - **User memory:** every copy to or from user memory goes through routines with exception-table fixups: a bad pointer is `-EFAULT`, even in the middle of a copy.
 - **Exception isolation:** #PF, #GP, #DE, #AC and the rest are separate IDT entries. In ring 3 they become signals. #DF, NMI and #MC run on their own IST stacks, so a kernel stack overflow (which hits a guard page below every kernel stack) is still reported.
 - **Kernel faults:** the report has the registers, CR0–CR4, the code bytes and a symbolized backtrace. It goes to the serial port, the kernel log and the panic screen, and other CPUs are stopped with an NMI.
+- **Panic screen** (`kernel/stopscreen.c`): white text on red, in the style of the Windows XP to 7 stop screen. It is set in the Kestrel 10 font and word wrapped for 800×600, with the panic message on the `*** STOP:` line, always one line (cut short with `...` if longer). On a BIOS boot whose screen is still the boot frame buffer, the display really switches to 800×600: the video BIOS is called in real mode (`arch/x86_64/vbe_thunk.asm`: VBE 4F00/4F01/4F02, with every interrupt source masked), then the CPU goes back to long mode to draw. Where that cannot be done safely (UEFI, or a Linux display driver owning the card), the 800×600 picture is scaled to fill the whole screen, the way a monitor's scaler shows 800×600. `kestrel.panicmode=0` skips the BIOS call.
 - **Crash test:** `kestrel.crashtest=stack|null|ud` exercises this at boot.
 
 **Tests** (each a musl program in `/boot/bin`, exit status 0 = all passed; `kestrel.exec=` runs them at boot):

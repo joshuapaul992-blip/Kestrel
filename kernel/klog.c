@@ -8,6 +8,7 @@
 #include <kernel/cpu.h>
 #include <kernel/spinlock.h>
 #include <kernel/tty.h>
+#include <kernel/stopscreen.h>
 
 static char   log_buf[KLOG_SIZE];
 static size_t log_len;              /* total bytes ever written (wraps buffer) */
@@ -91,15 +92,6 @@ void panic(const char *fmt, ...)
     panic_hook = NULL;          /* once: a panic inside the hook goes straight on */
     if (hook) hook(buf);
 
-    if (g_fb.ready) {
-        int w = 900, h = 120, x = ((int)g_fb.width - w) / 2, y = ((int)g_fb.height - h) / 2;
-        draw_rect(x, y, w, h, RGB(0x80, 0x00, 0x00));
-        draw_rect_outline(x, y, w, h, 2, COL_WHITE);
-        draw_string(x + 16, y + 16, "*** KERNEL PANIC ***", COL_WHITE, FB_TRANSPARENT, &font_12x24);
-        draw_string(x + 16, y + 52, buf, COL_WHITE, FB_TRANSPARENT, &font_8x16);
-        draw_string(x + 16, y + 84, "The system has been halted. Restart your computer.",
-                    COL_SILVER, FB_TRANSPARENT, &font_8x16);
-        fb_flush();
-    }
+    stop_screen(buf);           /* red, 800x600 (kernel/stopscreen.c) */
     cpu_halt_forever();
 }
