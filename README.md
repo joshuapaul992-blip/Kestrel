@@ -525,7 +525,6 @@ arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order
                              IO APIC routing of ISA IRQs, IPIs, INIT/STARTUP
               smp.c          percpu blocks (GS base), big kernel lock, TLB shootdowns, AP start-up
               trampoline.asm real mode -> long mode start-up code of the other CPUs (at 0x8000)
-              vbe_thunk.asm  long mode -> real mode -> long mode: one VBE mode switch for the panic screen
               pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz (without an APIC)
               switch.asm     context_switch(), thread_trampoline, enter_user/user_return
               syscall_entry.asm  SYSCALL/LSTAR fast path (for ring 3), canonical-RIP SYSRET check
@@ -596,6 +595,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               futex.c        futexes: hashed wait queues, requeue, wake-op, robust lists
               klog.c         dmesg ring buffer, panic()
               stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
+              vbe_emu.c      VBE calls into the video BIOS through the x86emu emulator (no real mode)
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
@@ -656,6 +656,8 @@ linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see 
 third_party/linux/           unmodified Linux v6.12 code built through the KPI (pvpanic,
                              i6300esb; the DRM core, TTM and bochs), with their upstream
                              paths and licenses in README.md
+third_party/x86emu/          the X.org real-mode x86 emulator (SciTech/X11 licence, LICENSE),
+                             with a timeout hook; shim/ has the libc headers it includes
 include/kernel/posix.h       errno, O_* flags, struct stat, dirent64, utsname (Linux ABI layout)
 include/kernel/usyscall.h    int 0x80 wrappers used by init
 ```
@@ -911,7 +913,7 @@ The lock order is: the file tree's lock, then a volume's mutex, then the big loc
 - **User memory:** every copy to or from user memory goes through routines with exception-table fixups: a bad pointer is `-EFAULT`, even in the middle of a copy.
 - **Exception isolation:** #PF, #GP, #DE, #AC and the rest are separate IDT entries. In ring 3 they become signals. #DF, NMI and #MC run on their own IST stacks, so a kernel stack overflow (which hits a guard page below every kernel stack) is still reported.
 - **Kernel faults:** the report has the registers, CR0–CR4, the code bytes and a symbolized backtrace. It goes to the serial port, the kernel log and the panic screen, and other CPUs are stopped with an NMI.
-- **Panic screen** (`kernel/stopscreen.c`): white text on red, in the style of the Windows XP to 7 stop screen. It is set in the Kestrel 10 font and word wrapped for 800×600, with the panic message on the `*** STOP:` line, always one line (cut short with `...` if longer). On a BIOS boot whose screen is still the boot frame buffer, the display really switches to 800×600: the video BIOS is called in real mode (`arch/x86_64/vbe_thunk.asm`: VBE 4F00/4F01/4F02, with every interrupt source masked), then the CPU goes back to long mode to draw. Where that cannot be done safely (UEFI, or a Linux display driver owning the card), the 800×600 picture is scaled to fill the whole screen, the way a monitor's scaler shows 800×600. `kestrel.panicmode=0` skips the BIOS call.
+- **Panic screen** (`kernel/stopscreen.c`): white text on red, in the style of the Windows XP to 7 stop screen. It is set in the Kestrel 10 font and word wrapped for 800×600, with the panic message on the `*** STOP:` line, always one line (cut short with `...` if longer). On a BIOS boot whose screen is still the boot frame buffer, the display really switches to 800×600: the video BIOS's VBE 4F00/4F01/4F02 calls are run in an x86 emulator (`kernel/vbe_emu.c`, `third_party/x86emu`, as X.org's int10 does), so the CPU never leaves long mode. The BIOS code reaches the card through real port I/O and memory; page 0 (its interrupt vectors and data area) is a copy taken at boot, INT 15h and INT 1Ah (PCI BIOS, tick count) are answered by the kernel, and a call that has not finished after 5 seconds is given up. Where that cannot be done safely (UEFI, or a Linux display driver owning the card), the 800×600 picture is scaled to fill the whole screen, the way a monitor's scaler shows 800×600. `kestrel.panicmode=0` skips the BIOS call.
 - **Crash test:** `kestrel.crashtest=stack|null|ud` exercises this at boot.
 
 **Tests** (each a musl program in `/boot/bin`, exit status 0 = all passed; `kestrel.exec=` runs them at boot):
@@ -1345,7 +1347,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 
 Kestrel source: yours to license as you wish.
 
-Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The terminal fonts (`third_party/kestrel_font`) are the project's own.
+Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The x86emu real-mode emulator (`third_party/x86emu`, from X.org): SciTech/X11 permissive licence (`third_party/x86emu/LICENSE`), © SciTech Software, David Mosberger-Tang, Egbert Eich, Bart Trojanowski. The terminal fonts (`third_party/kestrel_font`) are the project's own.
 
 NVIDIA register and VBIOS table knowledge in `drivers/gpu/nvidia/` is derived from nouveau (`third_party/nouveau/LICENSE`): MIT, © Red Hat Inc.
 
