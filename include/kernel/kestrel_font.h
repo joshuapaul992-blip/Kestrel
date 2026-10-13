@@ -20,10 +20,12 @@ struct kfont {
 
 extern const struct kfont kfont_10;     /* drivers/kfont_10.c */
 extern const struct kfont kfont_12;     /* drivers/kfont_12.c */
+extern const struct kfont kfont_15;     /* drivers/kfont_15.c: 1920x1080 and up, the boot manager */
 
 static inline const struct kfont *kfont_for(int width, int height)
 {
-    return width < 1024 || height < 768 ? &kfont_10 : &kfont_12;
+    if (width < 1024 || height < 768) return &kfont_10;
+    return width < 1920 || height < 1080 ? &kfont_12 : &kfont_15;
 }
 
 static inline const uint16_t *kfont_glyph(const struct kfont *f, unsigned char c)

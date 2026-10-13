@@ -990,7 +990,7 @@ static bool tty_setup(struct kestrel_tty *t, int index, const struct display_hea
     t->bytes_pp      = h->bytes_pp;
     t->r_pos = h->r_pos; t->g_pos = h->g_pos; t->b_pos = h->b_pos;
     t->index    = index;
-    t->font     = kfont_for(h->width, h->height);  /* Kestrel 10 below 1024x768 */
+    t->font     = kfont_for(h->width, h->height);  /* Kestrel 10, 12 or 15 by resolution */
     t->max_cols = h->width / t->font->width;
     t->max_rows = h->height / t->font->height;
     if (t->max_cols < 1 || t->max_rows < 1) return false;
