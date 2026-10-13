@@ -26,22 +26,6 @@ void pic_init(void)
     outb(PIC2_DATA, 0xFF);
 }
 
-/* Before a real-mode BIOS call (the panic screen's mode switch): the BIOS
- * vectors, so a stray IRQ would at least reach a BIOS handler; all masked. */
-void pic_bios_mode(void)
-{
-    outb(PIC1_CMD, 0x11); io_wait();
-    outb(PIC2_CMD, 0x11); io_wait();
-    outb(PIC1_DATA, 0x08); io_wait();
-    outb(PIC2_DATA, 0x70); io_wait();
-    outb(PIC1_DATA, 0x04); io_wait();
-    outb(PIC2_DATA, 0x02); io_wait();
-    outb(PIC1_DATA, 0x01); io_wait();
-    outb(PIC2_DATA, 0x01); io_wait();
-    outb(PIC1_DATA, 0xFF);
-    outb(PIC2_DATA, 0xFF);
-}
-
 void pic_unmask(int irq)
 {
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;

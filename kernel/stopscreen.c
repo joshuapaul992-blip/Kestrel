@@ -7,9 +7,9 @@
  * short with "...". Then the screen itself goes to 800x600 where that can
  * be done safely with every other CPU stopped:
  *
- *   - the boot frame buffer of a BIOS boot, through the video BIOS
- *     (vbe_thunk.asm: real mode, VBE 4F02), as long as no driver has taken
- *     the card over since;
+ *   - the boot frame buffer of a BIOS boot, through the video BIOS (VBE
+ *     4F02), run in an x86 emulator so that the CPU never leaves long mode
+ *     (vbe_emu.c), as long as no driver has taken the card over since;
  *   - anything else (UEFI GOP, a Linux display driver), where a mode switch
  *     would need firmware that is gone or locks a panic cannot take, gets
  *     the 800x600 canvas scaled to its whole screen, as a monitor's scaler
@@ -20,13 +20,11 @@
 #include <kernel/fb.h>
 #include <kernel/kestrel_font.h>
 #include <kernel/bootinfo.h>
-#include <kernel/arch.h>
-#include <kernel/cpu.h>
-#include <kernel/smp.h>
-#include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
 #include <kernel/serial.h>
+#include <kernel/display.h>
+#include <kernel/vbe_emu.h>
 
 #define STOP_W      800
 #define STOP_H      600
@@ -107,49 +105,23 @@ static void render(const char *msg)
 }
 
 /* ---- 800x600 through the video BIOS ------------------------------------------ */
-#define VBE_BASE      0x8000
-#define VBE_MODE_INFO (VBE_BASE + 0xE00)
-extern uint8_t vbe_thunk_start[], vbe_thunk_end[];
-
-struct vbe_mode_info {
-    uint16_t attributes;
-    uint8_t  win_a, win_b;
-    uint16_t granularity, win_size, seg_a, seg_b;
-    uint32_t win_func;
-    uint16_t pitch;                     /* BytesPerScanLine */
-    uint16_t width, height;
-    uint8_t  char_w, char_h, planes, bpp, banks, memory_model, bank_size, image_pages, reserved0;
-    uint8_t  red_size, red_pos, green_size, green_pos, blue_size, blue_pos, rsv_size, rsv_pos, dc_info;
-    uint32_t phys_base;
-    uint32_t reserved1;
-    uint16_t reserved2;
-    uint16_t lin_pitch;                 /* VBE 3.0: LinBytesPerScanLine */
-} __attribute__((packed));
-
 static bool bios_800x600(void)
 {
-    if (g_boot.uefi || g_fb.driver[0] || strstr(g_boot.cmdline, "kestrel.panicmode=0")) return false;
-    if (pmm_low_page() != VBE_BASE) return false;               /* not RAM: nowhere to run */
-    size_t n = (size_t)(vbe_thunk_end - vbe_thunk_start);
-    if (n > 0xC00) return false;
-    serial_write("panic: switching the boot frame buffer to 800x600 through the video BIOS\n");
-    memcpy((void *)(uintptr_t)VBE_BASE, vbe_thunk_start, n);
-    apic_quiesce();
-    pic_bios_mode();
-    int (*thunk)(void) = (int (*)(void))(uintptr_t)VBE_BASE;
-    if (!thunk()) { serial_write("panic: the video BIOS has no 800x600 mode\n"); return false; }
-
-    const struct vbe_mode_info *mi = (const struct vbe_mode_info *)(uintptr_t)VBE_MODE_INFO;
-    uint32_t pitch = mi->lin_pitch ? mi->lin_pitch : mi->pitch;
-    if (!mi->phys_base || (mi->bpp != 32 && mi->bpp != 24)) return false;
+    /* only the card as the BIOS left it: not once a driver has taken it
+     * over, nor while one is doing so (it may have reprogrammed it already) */
+    if (g_boot.uefi || g_fb.driver[0] || display_handover_pending() ||
+        strstr(g_boot.cmdline, "kestrel.panicmode=0")) return false;
+    serial_write("panic: switching the boot frame buffer to 800x600 through the video BIOS (emulated)\n");
+    struct vbe_mode m;
+    if (!vbe_emu_set_mode(STOP_W, STOP_H, &m)) return false;
     g_fb.double_buffered = false;
-    g_fb.phys = mi->phys_base;
-    g_fb.front = g_fb.back = (uint8_t *)(uintptr_t)mi->phys_base;  /* below 4 GiB: identity mapped */
-    g_fb.width = mi->width; g_fb.height = mi->height; g_fb.pitch = pitch;
-    g_fb.bpp = mi->bpp; g_fb.bytes_pp = mi->bpp / 8;
-    g_fb.r_pos = mi->red_pos;   g_fb.r_size = mi->red_size;
-    g_fb.g_pos = mi->green_pos; g_fb.g_size = mi->green_size;
-    g_fb.b_pos = mi->blue_pos;  g_fb.b_size = mi->blue_size;
+    g_fb.phys = m.phys;
+    g_fb.front = g_fb.back = (uint8_t *)(uintptr_t)m.phys;     /* below 4 GiB: identity mapped */
+    g_fb.width = m.width; g_fb.height = m.height; g_fb.pitch = m.pitch;
+    g_fb.bpp = m.bpp; g_fb.bytes_pp = m.bpp / 8;
+    g_fb.r_pos = m.r_pos; g_fb.r_size = m.r_size;
+    g_fb.g_pos = m.g_pos; g_fb.g_size = m.g_size;
+    g_fb.b_pos = m.b_pos; g_fb.b_size = m.b_size;
     return true;
 }
 

@@ -216,20 +216,6 @@ void ioapic_route_isa(int irq, uint8_t vector)
     io_write(a, 0x10 + 2 * pin, lo);
 }
 
-/* A panic about to call the video BIOS in real mode, where no Kestrel
- * vector has a handler: every IO APIC input masked, this CPU's timer
- * stopped and its local APIC software-disabled (which masks the LVT). */
-void apic_quiesce(void)
-{
-    for (int i = 0; i < nioapics; i++)
-        for (uint32_t p = 0; p < ioapics[i].count; p++)
-            io_write(&ioapics[i], 0x10 + 2 * p, LVT_MASKED);
-    if (!lapic) return;
-    lw(LAPIC_LVT_TIMER, LVT_MASKED);
-    lw(LAPIC_TIMER_INIT, 0);
-    lw(LAPIC_SVR, VEC_SPURIOUS);                        /* bit 8 clear: disabled */
-}
-
 bool apic_init(void)
 {
     if (strstr(g_boot.cmdline, "kestrel.noapic")) { kprintf("apic: disabled (kestrel.noapic)\n"); return false; }
