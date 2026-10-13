@@ -13,7 +13,7 @@ Because I want to prove that vibe-coding operating systems isn't always a bad id
 
 ## Overview
 
-Kestrel (0.3.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
+Kestrel (0.3.2 alpha 1, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -58,7 +58,7 @@ On Fedora and Arch the GRUB tools are called `grub2-*`. The Makefile finds both 
 The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`).
 
 **Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer these entries for 5 seconds:
-- **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, IceWM and an xterm. Logout in IceWM's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
+- **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, then LXDE where the root file system has it (the Firefox image, see "glibc programs, GTK and Firefox"), otherwise IceWM and an xterm. Logout in the desktop's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
 - **Text console:** a login shell (`/bin/sh`) on every monitor's terminal, no X. Type `startx` there for the desktop.
 - **Desktop** and **text console, Linux display drivers (experimental):** the same with `linuxkpi.drm=1`, so Linux's DRM drivers (nouveau, bochs) drive the screens, the boot screen included (see "Phase 2" under "Linux drivers: the Linux KPI").
 
@@ -209,7 +209,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.0-release`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.2-alpha1`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
@@ -1096,6 +1096,8 @@ make usbimg ROOTFS_BASE=ffroot.tar ROOTDISK_MB=2400
 ```
 
 The script resolves the dependencies of a short package list (bash and the usual tools, GTK 3 and gtk3-demo, Mesa, the X client tools, fonts, icons, D-Bus, ALSA and PulseAudio), downloads them with `apt-get download`, unpacks them into a merged-`/usr` tree and builds the font, schema, pixbuf, MIME and icon caches. Firefox goes into `/opt/firefox` with a policy file that skips the first-run and terms-of-use pages, and `/usr/local/bin/firefox` starts PulseAudio if needed, then Firefox. IceWM's menu and toolbar get Firefox, XTerm, the GTK demo and xeyes. `tools/mergeroot.py` then adds Kestrel's X server, IceWM, xterm and test programs.
+
+**LXDE.** The root also carries the LXDE desktop from Ubuntu's packages, resolved by apt's own solver so that only the first of each alternative comes in: Openbox (window manager), LXPanel, LXSession, the PCManFM file manager, which also draws the desktop and its icons on every monitor, Xarchiver (with tar, gzip, bzip2, xz, zstd, zip and unzip), LXRandR, LXTerminal, LXAppearance and LXTask, in the Clearlooks-Phenix theme with the nuoveXT2 icons. `/bin/startx` runs `startlxde` when it finds it, so this root boots into LXDE, and the images without it keep IceWM. The panel runs along the bottom of the first monitor with the menu, Firefox, PCManFM and LXTerminal, the task list, a CPU graph, the tray, a clock and the logout button; the other monitors show PCManFM's desktop, and windows move freely across all of them, as with IceWM. LXRandR changes the monitors with `xrandr`, through the X server's RandR outputs (see "X11"), and keeps a layout for the next session when asked to (`~/.config/autostart/lxrandr-autostart.desktop`). Text everywhere on the desktop is hinted by FreeType's classic TrueType interpreter, version 35 (Ubuntu's FreeType defaults to 40): `/bin/startx` sets `FREETYPE_PROPERTIES=truetype:interpreter-version=35` for the session, `/etc/profile.d/freetype.sh` and `/etc/environment` do the same for login shells, and fontconfig and LXSession's XSETTINGS ask for full hinting, since slight hinting would hand TrueType fonts to FreeType's autohinter instead. All the DejaVu fonts are there (`fonts-dejavu-core` and `-extra`). The script leaves out the screen locker and the autostart entries that need services Kestrel lacks (lxpolkit, PulseAudio's own; Firefox's wrapper starts PulseAudio with Kestrel's sink).
 
 Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the desktop and, a minute later, Firefox.
 
