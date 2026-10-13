@@ -10,11 +10,12 @@ column, Windows-1252 order), light glyphs on a dark background, every cell
 the same whole number of pixels. Glyphs are copied pixel for pixel: nothing
 is scaled, moved or thresholded beyond light/dark.
 
-The terminal cell is the box that holds the ink of every glyph, plus a
-one-pixel margin on each side, cut out of the same place in every sheet
-cell, so all glyphs keep their baseline and their position. When the sheet's
-own cells are already that tight (Kestrel_12: 13 x 18), the cell is the
-sheet's cell. At most 16 pixels wide.
+The terminal cell is the box that holds the ink of every glyph, cut out of
+the same place in every sheet cell, so all glyphs keep their baseline and
+their position. Across, it gets one more pixel on the right: the narrowest
+cell that still leaves a pixel between neighbouring letters, even between
+the widest ones (mm, WW). Down, it gets a one-pixel margin above and below.
+At most 16 pixels wide.
 
 Requires Pillow.
 """
@@ -48,8 +49,10 @@ def main():
                 if ink(cx + x, cy + y):
                     x0, y0 = min(x0, x), min(y0, y)
                     x1, y1 = max(x1, x + 1), max(y1, y + 1)
-    x0, y0 = max(0, x0 - 1), max(0, y0 - 1)
-    x1, y1 = min(cw, x1 + 1), min(ch, y1 + 1)
+    y0 = max(0, y0 - 1)
+    x1, y1 = x1 + 1, min(ch, y1 + 1)          # past the sheet's cell: blank
+    if x1 > cw and x0 > 0:
+        x0, x1 = x0 - 1, x1 - 1
     W, H = x1 - x0, y1 - y0
     if W > 16:
         sys.exit("%s: glyphs %d pixels wide, at most 16" % (src, W))
@@ -61,7 +64,7 @@ def main():
         for y in range(H):
             v = 0
             for x in range(W):
-                if ink(cx + x, cy + y):
+                if x0 + x < cw and ink(cx + x, cy + y):
                     v |= 0x8000 >> x
             rows.append(v)
         font.append(rows)
