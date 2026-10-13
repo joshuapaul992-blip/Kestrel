@@ -761,20 +761,20 @@ Not done yet: job control (stop/continue).
 
 ## X11: the XLibre server (`ports/xlibre/`)
 
-[XLibre](https://github.com/X11Libre/xserver), the X server forked from xorg-server, runs on Kestrel as an ordinary ring-3 musl program called `Xkestrel`. Clients connect over `/tmp/.X11-unix/X0` (or its abstract-namespace twin) and draw. The server's portable parts (dix, mi, fb, render, xkb, the extensions) are built unchanged. Everything Kestrel-specific is either the DDX in `hw/kestrel/` or a configure-time choice; the XLibre sources themselves get only two small patches.
+[XLibre](https://github.com/X11Libre/xserver), the X server forked from xorg-server, runs on Kestrel as an ordinary ring-3 musl program called `Xkestrel`. Clients connect over `/tmp/.X11-unix/X0` (or its abstract-namespace twin) and draw. The server's portable parts (dix, mi, fb, render, xkb, the extensions) are built unchanged. Everything Kestrel-specific is either the DDX in `hw/kestrel/` or a configure-time choice; the XLibre sources themselves get only three small patches.
 
 **Building** (on the build host, apart from the kernel):
 
 ```sh
 make xlibre XLIBRE_SRC=<checkout of X11Libre/xserver> XLIBRE_DEPS=<library tarballs>
-make usbimg       # stages bin/Xkestrel, bin/xdemo and the keymap into /boot
+make usbimg       # stages bin/Xkestrel, bin/xdemo, bin/xrandr and the keymap into /boot
 ```
 
 `ports/xlibre/build.sh` does four things:
-1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
+1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more) and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
 2. Applies `ports/xlibre/patches` and adds the `kestrel` meson option and `hw/kestrel`.
 3. Cross-builds the server with musl (`kestrel-cross.txt.in`).
-4. Builds the test client `xdemo` and precompiles the default keymap with the host's `xkbcomp`.
+4. Builds the test client `xdemo` and `xrandr` (from Ubuntu's x11-xserver-utils), and precompiles the default keymap with the host's `xkbcomp`.
 
 Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 
@@ -784,7 +784,7 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 |---|---|
 | Listening and client sockets (xtrans, `os/connection.c`) | `AF_UNIX` stream sockets, `SO_PEERCRED` |
 | Event loop (`os/ospoll.c`) | `poll(2)`; the epoll backend is configured out |
-| Frame buffer (DDX) | `/dev/fbN`, one per monitor: `KFB_GET_INFO`, then `KDSETMODE KD_GRAPHICS` to take the head from the text terminal, then `KFB_BLIT` to copy damaged rectangles from the server's shadow buffer |
+| Frame buffer (DDX) | `/dev/fbN`, one per monitor: `KFB_GET_INFO` and `KFB_GET_MODES`, then `KDSETMODE KD_GRAPHICS` to take the head from the text terminal, then `KFB_BLIT` to copy damaged rectangles from the server's shadow buffer; `KFB_SET_MODE` for `xrandr --mode` |
 | Keyboard and mouse (DDX) | `/dev/kinput`: evdev-style records with Linux key, button and axis codes, so X keycode = code + 8 and the stock evdev keymap applies. `ioctl(KINPUT_GRAB)` takes PS/2 and USB keyboards and USB mice away from the terminals until the file is closed |
 | Running `xkbcomp` for each keymap | the precompiled `/boot/share/X11/xkb/compiled/kestrel-default.xkm` (us layout, pc105 model), copied into place by patch 0001 |
 | `SIGALRM` smart scheduler, `link()` lock file | configured out (patch 0002); the scheduler falls back to time checks in the dispatch loop |
@@ -793,7 +793,7 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | GLX/DRI, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
-- **Screens:** one X screen per monitor (`-screens N` limits the count), each a 24-bit TrueColor fb screen with RENDER. A damage listener on each root window collects changes, and a wrapped screen BlockHandler pushes them to the monitor before the server sleeps, after the software cursor has been drawn back.
+- **Screens:** one X screen for all monitors (`-screens N` uses only the first N), a 24-bit TrueColor fb screen with RENDER and RandR. Each monitor is a RandR output with its own CRTC, named after its connector (`DP-1`, `HDMI-A-1`) or else `fbN`. The monitors start side by side, left to right in `/dev/fbN` order with their tops aligned, the first one primary, so they form one desktop. `xrandr` (in `/boot/bin`) can then move (`--pos`, `--left-of`, `--right-of`), mirror (`--same-as`), rotate and reflect (`--rotate`, `--reflect`), switch off (`--off`, `--auto`) and choose the primary (`--primary`); the screen grows and shrinks to fit. A monitor whose kernel driver can switch modes lists them all, and `--mode`/`--rate` switch it (`KFB_GET_MODES`, `KFB_SET_MODE`); the others list only their current mode. The server answers Xinerama queries from RandR, so Xinerama-only clients see the same monitors. A damage listener on the root pixmap collects changes, and a wrapped screen BlockHandler pushes each changed box to every monitor showing it before the server sleeps, after the software cursor has been drawn back; rotated and reflected monitors get the box turned in a scratch buffer first. `ports/xlibre/patches/0003` also fixes the order in which XLibre's own Xinerama (`+xinerama`, for several X screens) lists them.
 - **Input:** a read notification on `/dev/kinput` feeds keys, buttons, relative motion and the wheel (as buttons 4 and 5) into the dix event queue.
 
 Exiting the server returns its monitors to their text terminals.
@@ -828,10 +828,11 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 
 **Configuration** (`ports/icewm/build.sh`):
 - X core fonts, XPM and PNG images.
-- No Xft/fontconfig, i18n, session management, RandR, Xinerama, FriBidi, freedesktop menus or sound.
+- RandR and Xinerama, so maximised windows and the taskbar keep to one monitor and follow `xrandr` changes. `ports/icewm/patches/0001` puts the taskbar on RandR's primary output (`xrandr --primary`); unpatched, IceWM moves it to whichever monitor its own list happens to start with.
+- No Xft/fontconfig, i18n, session management, FriBidi, freedesktop menus or sound.
 - `/boot/etc/icewm/prefoverride` sets every font to the server's built-in `fixed` font and turns off the network, battery and mail applets.
 - `/boot/etc/icewm/programs` and `menu` hold the Kestrel menus.
-- The sysroot gained libXext, libXrender, libXfixes, libXdamage, libXcomposite, libXpm and libpng.
+- The sysroot gained libXext, libXrender, libXfixes, libXdamage, libXcomposite, libXinerama, libXrandr, libXpm and libpng.
 
 **Kernel support it needed:** `select`/`pselect6`, `wait4` (no children), `/proc/stat`, and execute bits on boot-volume files (IceWM only lists programs it can see are executable).
 

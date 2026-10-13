@@ -1,0 +1,21 @@
+Xinerama: report the heads in screen order
+
+ProcXineramaQueryScreens() walks the screens backward, so clients see the
+last screen as head 0. Window managers put their taskbar on head 0 (IceWM's
+XineramaPrimaryScreen), which then lands on the last monitor instead of the
+first. Upstream X.Org reports screen 0 first; so does this.
+
+diff --git a/Xext/panoramiX/panoramiX.c b/Xext/panoramiX/panoramiX.c
+index 1a0f02e62..1723d4687 100644
+--- a/Xext/panoramiX/panoramiX.c
++++ b/Xext/panoramiX/panoramiX.c
+@@ -960,7 +960,8 @@ ProcXineramaQueryScreens(ClientPtr client)
+     x_rpcbuf_t rpcbuf = { .swapped = client->swapped, .err_clear = TRUE };
+ 
+     if (PanoramiXIsEnabled()) {
+-        XINERAMA_FOR_EACH_SCREEN_BACKWARD({
++        /* in screen order: clients take the first head as the primary one */
++        XINERAMA_FOR_EACH_SCREEN_FORWARD({
+             /* xXineramaScreenInfo is the same as xRectangle */
+             x_rpcbuf_write_rect(&rpcbuf,
+                                 walkScreen->x,

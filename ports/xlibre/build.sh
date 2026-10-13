@@ -6,6 +6,7 @@
 #
 #   bin/Xkestrel                         the X server (static-PIE, musl)
 #   bin/xdemo                            first test client (xcb)
+#   bin/xrandr                           monitor layout and modes (RandR)
 #   share/X11/xkb/compiled/kestrel-default.xkm   precompiled us/pc105 keymap
 #   share/X11/xkb/rules/evdev            rules file (names only; no xkbcomp)
 #
@@ -41,6 +42,17 @@ echo "  MUSLCC  xdemo"
 musl-gcc -std=gnu11 -O2 -Wall -fPIE -static-pie -I"$SYSROOT/include" \
     "$HERE/clients/xdemo.c" -L"$SYSROOT/lib" -lxcb -lXau -lXdmcp -o "$ROOT/bin/xdemo"
 strip "$ROOT/bin/xdemo"
+
+# xrandr 1.5.2, from Ubuntu's x11-xserver-utils (a bundle of small tools)
+echo "  MUSLCC  xrandr"
+XU=$(ls "$DEPS"/x11-xserver-utils_*.tar.* | grep -v '\.asc$' | head -1)
+rm -rf "$BUILD/xrandr-src"
+mkdir -p "$BUILD/xrandr-src"
+tar -xf "$XU" -C "$BUILD/xrandr-src" --strip-components=1 --wildcards '*/xrandr/xrandr.c'
+musl-gcc -std=gnu11 -O2 -fPIE -static-pie -I"$SYSROOT/include" -DVERSION='"1.5.2"' \
+    "$BUILD/xrandr-src/xrandr/xrandr.c" -L"$SYSROOT/lib" -lXrandr -lXrender -lXext -lX11 \
+    -lxcb -lXau -lXdmcp -lm -o "$ROOT/bin/xrandr"
+strip "$ROOT/bin/xrandr"
 
 # The server has no xkbcomp to run (no fork/exec): compile the default
 # keymap here. XLibre's built-in defaults are rules "evdev", model "pc105",
