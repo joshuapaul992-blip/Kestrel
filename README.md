@@ -95,7 +95,7 @@ Layout is an 85×32 character grid drawn with a 12×24 font:
 
 Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestrel font for its resolution (below). `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts a shell on every monitor: BusyBox's `/bin/sh` as a login shell on a real Unix terminal (`kernel/vt.c`, see "The shell on the terminals" below). Without `/bin/sh` on the boot volume, or with `kestrel.shell=kush` on the kernel command line, it runs `kush` (`kernel/kush.c`), the shell built into the kernel, instead.
 
-**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `include/kernel/kestrel_font.h`): two sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (12×15-pixel cells) below 1024×768, so 66 × 40 cells at 800×600, and **Kestrel 12** (13×18) at 1024×768 and above, so 78 × 42 cells at 1024×768. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells) and `Kestrel_12.bmp` (13×18) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink, plus a one-pixel margin, out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. For Kestrel 12 that box is the sheet's own cell. To change a font, replace its sheet and run `make fonts`.
+**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `include/kernel/kestrel_font.h`): two sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600, and **Kestrel 12** (12×18) at 1024×768 and above, so 85 × 42 cells at 1024×768. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells) and `Kestrel_12.bmp` (13×18) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
 
 **Monitors** (`kernel/display.c`):
 - Display drivers register one head per monitor. Each head has its frame buffer, native resolution, pitch and pixel format.
@@ -106,7 +106,7 @@ Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestre
 **Terminals** (`struct kestrel_tty`, `system_ttys[MAX_MONITORS]`). Each TTY owns:
 - its frame buffer pointer, plus an optional RAM shadow
 - its native width and height, and pitch
-- `max_cols × max_rows` (width and height over the font's cell): 66 × 40 at 800×600 (Kestrel 10), 78 × 42 at 1024×768, 98 × 56 at 1280×1024, 147 × 60 at 1920×1080 (Kestrel 12)
+- `max_cols × max_rows` (width and height over the font's cell): 72 × 40 at 800×600 (Kestrel 10), 85 × 42 at 1024×768, 106 × 56 at 1280×1024, 160 × 60 at 1920×1080 (Kestrel 12)
 - the cursor position, the blink state and the colours
 - the escape-sequence parser and UTF-8 decoder (see below)
 - a key queue, and a 1024-byte `input_buffer` (for kush)
