@@ -95,7 +95,7 @@ Text is the **Kestrel 15** font (`drivers/kfont_15.c`, from `third_party/kestrel
 
 Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestrel font for its resolution (below). `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts a shell on every monitor: BusyBox's `/bin/sh` as a login shell on a real Unix terminal (`kernel/vt.c`, see "The shell on the terminals" below). Without `/bin/sh` on the boot volume, or with `kestrel.shell=kush` on the kernel command line, it runs `kush` (`kernel/kush.c`), the shell built into the kernel, instead.
 
-**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `include/kernel/kestrel_font.h`): two sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600, and **Kestrel 12** (12×18) at 1024×768 and above, so 85 × 42 cells at 1024×768. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells) and `Kestrel_12.bmp` (13×18) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
+**Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `drivers/kfont_15.c`, `include/kernel/kestrel_font.h`): three sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600; **Kestrel 12** (12×18) from 1024×768, so 85 × 42 cells at 1024×768; and **Kestrel 15** (14×22) from 1920×1080, so 137 × 49 cells at 1920×1080. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells), `Kestrel_12.bmp` (13×18) and `Kestrel_15.bmp` (14×22) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
 
 **Monitors** (`kernel/display.c`):
 - Display drivers register one head per monitor. Each head has its frame buffer, native resolution, pitch and pixel format.
@@ -539,7 +539,7 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
                              (PS/2 set 1 and USB HID -> Linux codes), grab while open
               serial.c       COM1 log
               font_*.c       Spleen 8x16 (kernel console) and 12x24 (panic banner), from tools/bdf2c.py
-              kfont_*.c      the terminals' Kestrel 10 and 12 and the boot manager's Kestrel 15,
+              kfont_*.c      the terminals' Kestrel 10, 12 and 15 (also the boot manager's),
                              from tools/sheet2font.py
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
