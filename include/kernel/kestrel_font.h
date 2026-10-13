@@ -20,6 +20,7 @@ struct kfont {
 
 extern const struct kfont kfont_10;     /* drivers/kfont_10.c */
 extern const struct kfont kfont_12;     /* drivers/kfont_12.c */
+extern const struct kfont kfont_15;     /* drivers/kfont_15.c: the boot manager, proportional */
 
 static inline const struct kfont *kfont_for(int width, int height)
 {
