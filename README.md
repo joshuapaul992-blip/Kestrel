@@ -1308,7 +1308,7 @@ On QEMU (`-vga std -device bochs-display`, BIOS and OVMF) bochs takes monitor 0 
 - Sync objects and PRIME only serve user space, which has no DRM device files yet: their handles name nothing.
 - Kestrel's own VBIOS parser is named `kvbios_*`, so it no longer clashes with nouveau's `nvbios_*`.
 
-With `linuxkpi.drm=1` nouveau takes the boot display over like bochs does (above). Without firmware in `/lib/firmware/nvidia` nouveau runs display-only, which is the first goal; acceleration comes later. Without NVIDIA hardware QEMU can only show that nouveau registers and finds nothing, so its modesetting has not run yet. Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback, and its stage 1 still writes the card's report.
+With `linuxkpi.drm=1` nouveau takes the boot display over like bochs does (above). Without firmware in `/lib/firmware/nvidia` nouveau runs display-only. `make usbimg NVIDIA_FW=<file>` adds NVIDIA's signed firmware for Maxwell 2 to Turing (`tools/nvfirmware.py`; the GSP images of later chips are left out), from Ubuntu's `linux-firmware-nvidia-graphics` .deb (`apt-get download linux-firmware-nvidia-graphics`) or a linux-firmware tree, with NVIDIA's license next to it. The files are NVIDIA's, redistributable unmodified for open-source systems, and never committed here. `nouveau.noaccel=1` keeps nouveau display-only even with the firmware present. Without NVIDIA hardware QEMU can only show that nouveau registers and finds nothing, so its modesetting has not run yet. Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback, and its stage 1 still writes the card's report.
 
 ## Memory map at boot
 

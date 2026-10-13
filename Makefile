@@ -425,7 +425,16 @@ xterm:
 	@ports/xterm/build.sh $(XTERM_SRC) $(BUILD)
 
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp)
+# NVIDIA_FW=<linux-firmware-nvidia-graphics .deb, or a linux-firmware tree>:
+# NVIDIA's GPU firmware for nouveau in /lib/firmware/nvidia, with NVIDIA's
+# license (tools/nvfirmware.py). Not in the repository; off by default.
+NVIDIA_FW ?=
+$(BUILD)/nvfw.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(abspath $(NVIDIA_FW))' | cmp -s - $@ || echo '$(abspath $(NVIDIA_FW))' > $@
+
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp) \
+                       $(BUILD)/nvfw.stamp $(NVIDIA_FW) tools/nvfirmware.py
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
@@ -437,6 +446,7 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
+	@if [ -n "$(NVIDIA_FW)" ]; then $(PYTHON) tools/nvfirmware.py $(NVIDIA_FW) $(ROOTFS_STAGE); fi
 	@touch $@
 
 # The boot volume alone, as a Multiboot2 module for the ISO (kernel/ramdisk.c)
