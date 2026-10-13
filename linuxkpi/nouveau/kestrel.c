@@ -5,7 +5,9 @@
  * the first word of that VRAM holds read through the PRAMIN window (not
  * through BAR1), and what the head's window was told to scan out. When a
  * monitor stays blank, that line says whether Kestrel's writes reach the
- * buffer and whether the buffer is the one on screen. */
+ * buffer and whether the buffer is the one on screen. The display engine's
+ * own record of the methods it took (core channel once, then each head's
+ * base channel) follows, as nvkm prints it after a channel error. */
 #include <drm/drm_crtc.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_framebuffer.h>
@@ -13,6 +15,8 @@
 #include "nouveau_bo.h"
 #include "nouveau_gem.h"
 #include <subdev/instmem.h>
+#include <engine/disp.h>
+#include "nvkm/engine/disp/chan.h"
 #include "dispnv50/atom.h"
 
 /* One word of VRAM through the PRAMIN window (BAR0 0x700000, 64 KiB at
@@ -52,6 +56,18 @@ void lkpi_drm_fb_where(struct drm_crtc *crtc, struct drm_framebuffer *fb, size_t
 		"PRAMIN reads %08x %08x\n", crtc->name, res->mem_type == TTM_PL_VRAM ? "VRAM" : "not VRAM",
 		vram, nvbo->offset, nvbo->contig, nvbo->kind, nvbo->bo.pin_count,
 		(u64)res->bus.offset, pramin_rd32(drm, vram), pramin_rd32(drm, vram + last));
+
+	struct nvkm_disp *disp = nvxx_device(drm)->disp;
+	static bool core_dumped;
+	if (disp && disp->chan[0] && !core_dumped) {
+		core_dumped = true;
+		nv50_disp_chan_mthd(disp->chan[0], NV_DBG_ERROR);
+	}
+	for (int i = 1; disp && i < ARRAY_SIZE(disp->chan); i++) {
+		struct nvkm_disp_chan *chan = disp->chan[i];
+		if (chan && chan->mthd && chan->head == drm_crtc_index(crtc) && !strcmp(chan->mthd->name, "Base"))
+			nv50_disp_chan_mthd(chan, NV_DBG_ERROR);
+	}
 
 	struct drm_plane_state *ps = crtc->primary ? crtc->primary->state : NULL;
 	if (ps && ps->crtc == crtc) {
