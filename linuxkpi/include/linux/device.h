@@ -23,6 +23,9 @@
 #include <linux/device/driver.h>
 #include <linux/device/bus.h>
 #include <linux/device/class.h>
+#include <linux/idr.h>                           /* Linux reaches these through kernfs.h and pm.h */
+#include <linux/completion.h>
+#include <linux/uuid.h>
 #include <linux/dev_printk.h>
 
 struct device_node;
@@ -164,4 +167,14 @@ static inline int devm_remove_action_nowarn(struct device *dev, void (*action)(v
 
 static inline bool dev_is_platform(const struct device *dev) { return false; }
 
+/* device links (power ordering between devices): not tracked */
+#define DL_FLAG_STATELESS               BIT(0)
+#define DL_FLAG_AUTOREMOVE_CONSUMER     BIT(1)
+#define DL_FLAG_PM_RUNTIME              BIT(2)
+#define DL_FLAG_RPM_ACTIVE              BIT(3)
+#define DL_FLAG_AUTOREMOVE_SUPPLIER     BIT(4)
+struct device_link;
+static inline struct device_link *device_link_add(struct device *consumer, struct device *supplier, u32 flags) { return NULL; }
+static inline void device_link_del(struct device_link *link) { }
+static inline void device_link_remove(void *consumer, struct device *supplier) { }
 #endif

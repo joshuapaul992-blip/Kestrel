@@ -66,6 +66,7 @@
 #define PCI_SUBSYSTEM_ID        0x2e
 #define PCI_ROM_ADDRESS         0x30
 #define  PCI_ROM_ADDRESS_ENABLE 0x01
+#define  PCI_ROM_ADDRESS_MASK   (~0x7ffU)
 #define PCI_CAPABILITY_LIST     0x34
 #define PCI_INTERRUPT_LINE      0x3c
 #define PCI_INTERRUPT_PIN       0x3d

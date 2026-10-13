@@ -23,6 +23,7 @@
 #define rcu_dereference(p)              READ_ONCE(p)
 #define rcu_dereference_raw(p)          READ_ONCE(p)
 #define rcu_dereference_protected(p, c) (p)
+#define unrcu_pointer(p)                (p)
 #define rcu_dereference_check(p, c)     READ_ONCE(p)
 #define rcu_access_pointer(p)           READ_ONCE(p)
 #define rcu_assign_pointer(p, v)        smp_store_release(&(p), (v))

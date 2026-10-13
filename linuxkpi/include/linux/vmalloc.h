@@ -1,8 +1,9 @@
 /* linux/vmalloc.h -- Kestrel's Linux KPI: "virtually contiguous" memory
  *
  * Memory is identity mapped, so vmalloc is a page-aligned kmalloc
- * (physically contiguous too). vmap() of scattered pages has no mapping
- * to build: it works only for pages that happen to be contiguous. */
+ * (physically contiguous too). vmap() returns the identity address of
+ * write-back pages that happen to be contiguous, and maps anything else in
+ * Kestrel's vmap window (mm/vmm.c). */
 #ifndef _LKPI_LINUX_VMALLOC_H
 #define _LKPI_LINUX_VMALLOC_H
 

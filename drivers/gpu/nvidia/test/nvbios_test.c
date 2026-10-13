@@ -30,14 +30,14 @@ static void dump(const struct nvbios *b)
            b->version[0], b->version[1], b->version[2], b->version[3], b->version[4], b->bit_offset,
            b->dcb_ver, b->dcb, b->dcb_cnt);
     for (int i = 0; i < b->noutputs; i++) {
-        const struct nvbios_output *o = &b->output[i];
-        printf("  out %d: %-6s or %x link %x heads %x conn %d i2c %d loc %d", o->index, nvbios_output_type_name(o->type),
+        const struct kvbios_output *o = &b->output[i];
+        printf("  out %d: %-6s or %x link %x heads %x conn %d i2c %d loc %d", o->index, kvbios_output_type_name(o->type),
                o->or, o->link, o->heads, o->connector, o->i2c_index, o->location);
         if (o->type == DCB_OUTPUT_DP) printf("  dp %d lanes x %d.%02d Gbps", o->dp_link_nr, o->dp_link_bw * 27 / 100, o->dp_link_bw * 27 % 100);
         printf("\n");
     }
     for (int i = 0; i < b->nconns; i++)
-        printf("  conn %d: %s (0x%02x) hpd %d\n", i, nvbios_conn_type_name(b->conn[i].type), b->conn[i].type, b->conn[i].hpd);
+        printf("  conn %d: %s (0x%02x) hpd %d\n", i, kvbios_conn_type_name(b->conn[i].type), b->conn[i].type, b->conn[i].hpd);
     for (int i = 0; i < b->ni2c; i++)
         printf("  i2c %d: type %02x drive %02x aux %02x\n", i, b->i2c[i].type, b->i2c[i].drive, b->i2c[i].auxch);
 }
@@ -47,10 +47,10 @@ int main(int argc, char **argv)
     struct nvbios b;
     build();
     int score;
-    struct nvbios_image im[8];
-    CHECK(nvbios_images(rom, sizeof rom, im, 8, &score) == 3);
+    struct kvbios_image im[8];
+    CHECK(kvbios_images(rom, sizeof rom, im, 8, &score) == 3);
     CHECK(im[0].checksum_ok && im[2].type == 0xe0 && im[2].last);
-    CHECK(nvbios_parse(&b, rom, sizeof rom));
+    CHECK(kvbios_parse(&b, rom, sizeof rom));
     CHECK(b.image0_size == 0x8000 && b.imaged_addr == 0x10000);
     CHECK(b.bit_offset == 0x1000);
     CHECK(b.has_version && b.version[0] == 0x86 && b.version[1] == 0x06 && b.version[4] == 0x0b);
@@ -63,8 +63,8 @@ int main(int argc, char **argv)
     CHECK(b.ni2c == 5 && b.i2c[1].type == DCB_I2C_PMGR && b.i2c[1].auxch == 1 && b.i2c[1].drive == 1 && b.i2c[1].share == 1);
     CHECK(b.i2c[4].type == DCB_I2C_UNUSED);
     rom[0x123] ^= 1;                            /* checksum must now fail */
-    CHECK(nvbios_images(rom, sizeof rom, im, 8, NULL) == 3 && !im[0].checksum_ok);
-    CHECK(!nvbios_parse(&b, rom + 1, sizeof rom - 1));     /* no 55 AA at offset 0 */
+    CHECK(kvbios_images(rom, sizeof rom, im, 8, NULL) == 3 && !im[0].checksum_ok);
+    CHECK(!kvbios_parse(&b, rom + 1, sizeof rom - 1));     /* no 55 AA at offset 0 */
 
     if (argc > 1) {                             /* a real ROM dump */
         FILE *f = fopen(argv[1], "rb");
@@ -72,7 +72,7 @@ int main(int argc, char **argv)
         static uint8_t buf[1 << 20];
         size_t n = fread(buf, 1, sizeof buf, f);
         fclose(f);
-        if (!nvbios_parse(&b, buf, (uint32_t)n)) { printf("%s: not a usable VBIOS\n", argv[1]); return 1; }
+        if (!kvbios_parse(&b, buf, (uint32_t)n)) { printf("%s: not a usable VBIOS\n", argv[1]); return 1; }
         dump(&b);
     }
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

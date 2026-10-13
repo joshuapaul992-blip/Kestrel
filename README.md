@@ -57,9 +57,10 @@ On Fedora and Arch the GRUB tools are called `grub2-*`. The Makefile finds both 
 
 The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`).
 
-**Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer two entries for 5 seconds:
+**Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer these entries for 5 seconds:
 - **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, IceWM and an xterm. Logout in IceWM's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
 - **Text console:** a login shell (`/bin/sh`) on every monitor's terminal, no X. Type `startx` there for the desktop.
+- **Desktop** and **text console, Linux display drivers (experimental):** the same with `linuxkpi.drm=1`, so Linux's DRM drivers (nouveau, bochs) drive the screens, the boot screen included (see "Phase 2" under "Linux drivers: the Linux KPI").
 
 On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`module2 /boot/kestrel.vol`). `kernel/ramdisk.c` turns each module into a read-only `/dev/ramN`, and the usual boot-volume discovery mounts it on `/boot`, found through the volume's sector-0 signature. `tools/mkusbimg.py --ramdisk` writes that volume file. This has been checked under BIOS and UEFI (OVMF) in QEMU.
 
@@ -219,7 +220,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 
 ## NVIDIA GPUs (`drivers/gpu/nvidia/`): stage 1, detection
 
-Kestrel has no NVIDIA mode-setting driver yet. Stage 1 detects the card and collects everything the mode-setting stage needs, without changing what is on screen. The monitor the firmware lit stays monitor 0, the boot frame buffer. The register knowledge comes from nouveau (Linux v6.6, MIT licence; see `third_party/nouveau/LICENSE`).
+Kestrel has no NVIDIA mode-setting driver yet. Stage 1 detects the card and collects everything the mode-setting stage needs, without changing what is on screen. The monitor the firmware lit stays monitor 0, the boot frame buffer. The register knowledge comes from nouveau (Linux v6.6, MIT licence; see `third_party/nouveau/LICENSE`). nouveau itself can also be built in and drive the card (`make LKPI_NOUVEAU=1`, boot with `linuxkpi.drm=1`; see "Phase 2" under "Linux drivers: the Linux KPI").
 
 - **Chip:** `PMC_BOOT_0` gives the chipset (e.g. `136` = GP106, Quadro P2000) and the family. The VRAM size is read on Pascal and later.
 - **VBIOS** (`nvbios.c`, hardware independent):
@@ -1143,7 +1144,7 @@ Kestrel can build unmodified Linux driver source files into the kernel, the way 
 - `MODULE.PARAM=VALUE` sets a module parameter, for example `i6300esb.heartbeat=10`. `-` and `_` are the same in names. The types are int, uint, long, ulong, short, ushort, byte, bool, invbool, charp, hexint and string; arrays are not parsed yet.
 - `linuxkpi.selftest=1` runs the self-test.
 - `linuxkpi.debug=1` shows `KERN_DEBUG` messages and each initcall as it is called.
-- `linuxkpi.drm=1` lets Linux DRM drivers drive displays (phase 2, below).
+- `linuxkpi.drm=1` lets Linux DRM drivers drive displays, the boot display included (phase 2, below).
 
 A boot with QEMU's two devices logs:
 
@@ -1289,21 +1290,25 @@ What Linux keeps under GPL-2.0 is written in the KPI: `ww_mutex`, `dma-fence` (w
 
 **Kestrel's display client** (`linuxkpi/src/drm_kestrel.c`) stands in for fbdev: drivers call `drm_fbdev_ttm_setup()`, which here is an in-kernel DRM client. It lights each connected monitor at its preferred mode, gives each CRTC an XRGB8888 frame buffer and hands it to Kestrel through `lkpi_display_add()`, which calls `display_register()`; `tty_add_monitor()` then gives the monitor a terminal and its `/dev/ttyN` and `/dev/fbN`. VRAM that scans out as it is written is drawn directly; other buffers get Kestrel's changed lines through `write_span()`, and a worker reports the damage to the driver.
 
-**Who drives which adapter.** Linux DRM drivers only bind with `linuxkpi.drm=1`. Without it `video_firmware_drivers_only()` is true, and bochs declines every device. With it, `display_probe()` leaves secondary DISPI adapters to Linux's bochs. An adapter that holds a frame buffer Kestrel already draws on (the boot frame buffer, head 0) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (boot frame buffer), not offered to bochs-drm`. With `-vga std -device bochs-display`, monitor 2 then comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under the native driver, and the same pixels on screen. User space gets no DRM ioctls yet.
+**Who drives which adapter.** Linux DRM drivers only bind with `linuxkpi.drm=1`. Without it `video_firmware_drivers_only()` is true, and bochs and nouveau decline every device. With it, `display_probe()` leaves secondary DISPI adapters to Linux's bochs. An adapter Kestrel itself programs (a DISPI adapter without `linuxkpi.drm=1`, an NVIDIA card under `nvidia.modeset=`) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (…), not offered to …`. With `-vga std -device bochs-display`, monitor 2 comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under the native driver, and the same pixels on screen. User space gets no DRM ioctls yet.
+
+**Taking over the boot display.** The boot frame buffer is only the firmware's mode, so with `linuxkpi.drm=1` the adapter behind it is offered to Linux drivers too: nouveau on a primary NVIDIA card, bochs on QEMU's `-vga std`. Before such a driver touches the card it calls `aperture_remove_conflicting_pci_devices()`, whose `sysfb_disable()` reaches `display_handover()`:
+- nothing writes to the old frame buffer from then on, because the driver reprograms the card and the old VRAM gets other uses; tty1 (the system console) and the panic screen keep drawing into RAM;
+- the driver's first monitor then takes monitor 0's place (`display_replace()`): tty1 moves to it with its text, cursor and input, at the new size and font, and so do `/dev/fb0` and the panic screen;
+- if the driver fails to probe after the handover, `display_reclaim()` puts the boot frame buffer back as monitor 0;
+- REPORT.TXT on the stick is rewritten just before the handover and every 10 s while monitor 0 waits, so a takeover that leaves the screen dark still leaves its log.
+
+On QEMU (`-vga std -device bochs-display`, BIOS and OVMF) bochs takes monitor 0 from 1024x768 to 1280x800, and the console, the desktop and the panic screen follow it.
 
 **Licensing.** DRM's licenses differ file by file, so each one is checked when it is vendored. Most of the core modesetting code carries MIT terms; those files may be vendored, and the rest is written in the KPI. Some neighbours are GPL-2.0-only and must be written from scratch: for example `drivers/dma-buf/dma-fence.c` and the GEM shmem helpers.
 
-**Step 2, nouveau.** `drivers/gpu/drm/nouveau` is MIT-licensed (Red Hat's terms, as in `third_party/nouveau/LICENSE`), and TTM is `GPL-2.0 OR MIT`, so both can be vendored. Getting there takes:
-- the TTM memory manager;
-- the DMA fence and reservation objects (dma-buf): `dma-resv.c` is MIT, while `dma-fence.c` has to be written in the KPI;
-- the firmware loader, which already exists;
-- full MSI with several vectors, and IOMMU-free DMA above 4 GiB;
-- workqueues with per-CPU behaviour;
-- hrtimers and `wait_event` variants on `dma_fence`;
-- larger parts of `<linux/mm.h>`: `vm_area_struct` and `mmap` for buffer objects;
-- PCIe extended configuration space, through ECAM.
+**Step 2, nouveau (built, not yet run on a card).** `drivers/gpu/drm/nouveau` is MIT-licensed (Red Hat's terms), so it is vendored whole from v6.12, with what it needs: the DisplayPort and HDMI helpers, the GPU scheduler, `drm_exec`, `drm_gpuvm`, `drm_encoder_slave`, `i2c-algo-bit` and the maple tree (`third_party/linux/NOUVEAU.md` lists every file, its license and checksum). `make LKPI_NOUVEAU=1` compiles its 715 files and links them into the kernel; switching the variable relinks.
+- The build follows nouveau's Kbuild file (`linuxkpi/nouveau/files.mk`). `linuxkpi/nouveau/` holds 53 headers written in the KPI where the originals are GPL-2.0-only, and comes first on the include path.
+- Tracepoints are empty, and the I2C core (`linuxkpi/src/i2c.c`), PCI ROM access, `vmap()` of scattered pages (a window in the kernel map, `mm/vmm.c`) and the rest are in the KPI.
+- Sync objects and PRIME only serve user space, which has no DRM device files yet: their handles name nothing.
+- Kestrel's own VBIOS parser is named `kvbios_*`, so it no longer clashes with nouveau's `nvbios_*`.
 
-Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback until nouveau's modesetting works on the same boards. The order is to first bring nouveau up with the display only, and add acceleration, which needs the GPU firmware in `/lib/firmware/nvidia`, later.
+With `linuxkpi.drm=1` nouveau takes the boot display over like bochs does (above). Without firmware in `/lib/firmware/nvidia` nouveau runs display-only. `make usbimg NVIDIA_FW=<file>` adds NVIDIA's signed firmware for Maxwell 2 to Turing (`tools/nvfirmware.py`; the GSP images of later chips are left out), from Ubuntu's `linux-firmware-nvidia-graphics` .deb (`apt-get download linux-firmware-nvidia-graphics`) or a linux-firmware tree, with NVIDIA's license next to it. The files are NVIDIA's, redistributable unmodified for open-source systems, and never committed here. `nouveau.noaccel=1` keeps nouveau display-only even with the firmware present. Without NVIDIA hardware QEMU can only show that nouveau registers and finds nothing, so its modesetting has not run yet. Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback, and its stage 1 still writes the card's report.
 
 ## Memory map at boot
 
@@ -1313,6 +1318,7 @@ Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback until no
 | 2 MiB – ~2.3 MiB | kernel image (+ bss: boot page tables, 32 KiB boot stack) |
 | after the kernel | 8 MiB heap, 3 MiB frame-buffer back buffer (from the PMM) |
 | e.g. `0xFD000000` (VBE), `0x80000000` (OVMF GOP) | linear frame buffer |
+| `0x3F80_0000_0000` – +1 GiB (virtual) | vmap window: scattered pages mapped for Linux drivers (`vmm_vmap()`) |
 
 ## Next steps
 

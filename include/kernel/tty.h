@@ -125,6 +125,7 @@ struct kestrel_tty {
     bool      line_ready;
 
     bool      active;
+    bool      detached;                 /* monitor given up, see tty_detach_monitor() */
     bool      graphics;                 /* a graphics client (X) owns the pixels:
                                            text still updates the cells, but
                                            nothing is drawn until it lets go   */
@@ -147,6 +148,15 @@ int  tty_init_all(void);
 /* A terminal for monitor `index`, registered after boot; it must be the next
  * one (index == tty_count). Returns index, or -1. */
 int  tty_add_monitor(int index);
+/* Monitor `index` is being taken over by another driver (display.h,
+ * display_handover()): from now on the terminal draws into `ram` (when it
+ * has no RAM shadow of its own) and publishes nothing. Returns 0, or -1 if
+ * the terminal cannot be locked. */
+int  tty_detach_monitor(int index, void *ram);
+/* Monitor `index` was replaced (display_replace()): the terminal takes the
+ * new frame buffer, size and font, keeps its text, cursor and input, and is
+ * redrawn. Returns 0, or -1 (out of memory: it stays detached). */
+int  tty_replace_monitor(int index);
 bool tty_ready(void);                   /* at least one TTY is up                   */
 struct kestrel_tty *tty_get(int index); /* NULL if out of range                     */
 struct kestrel_tty *tty_current(void);  /* the calling task's TTY (NULL if none)    */

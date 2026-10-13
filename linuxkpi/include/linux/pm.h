@@ -36,6 +36,16 @@ struct dev_pm_ops {
     int (*runtime_idle)(struct device *dev);
 };
 
+struct dev_pm_domain {
+    struct dev_pm_ops ops;
+    int  (*start)(struct device *dev);
+    void (*detach)(struct device *dev, bool power_off);
+    int  (*activate)(struct device *dev);
+    void (*sync)(struct device *dev);
+    void (*dismiss)(struct device *dev);
+    int  (*set_performance_state)(struct device *dev, unsigned int state);
+};
+
 struct dev_pm_info { unsigned int can_wakeup:1; unsigned int async_suspend:1; };
 
 #define SET_SYSTEM_SLEEP_PM_OPS(s, r) \

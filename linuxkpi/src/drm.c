@@ -24,6 +24,7 @@
 #include <linux/xarray.h>
 #include <linux/device.h>
 #include <linux/kdev_t.h>
+#include <linux/pci.h>
 #include <asm/cpufeature.h>
 #include <asm/smp.h>
 #include <video/nomodeset.h>
@@ -35,6 +36,7 @@
 #include <drm/drm_sysfs.h>
 #include <drm/drm_writeback.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_syncobj.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_utils.h>
 #include "internal.h"
@@ -261,6 +263,46 @@ void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv, uin
 void drm_syncobj_open(struct drm_file *file_private) { }
 void drm_syncobj_release(struct drm_file *file_private) { }
 
+/* Sync objects and PRIME buffers only come from user space, which has no DRM
+ * device files yet: a handle never names one, and nothing is exported. */
+struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private, u32 handle) { return NULL; }
+int drm_syncobj_find_fence(struct drm_file *file_private, u32 handle, u64 point, u64 flags,
+                           struct dma_fence **fence)
+{
+    *fence = NULL;
+    return -ENOENT;
+}
+void drm_syncobj_add_point(struct drm_syncobj *syncobj, struct dma_fence_chain *chain,
+                           struct dma_fence *fence, uint64_t point) { WARN_ON_ONCE(1); }
+void drm_syncobj_replace_fence(struct drm_syncobj *syncobj, struct dma_fence *fence) { WARN_ON_ONCE(1); }
+void drm_syncobj_free(struct kref *kref) { WARN_ON_ONCE(1); }
+EXPORT_SYMBOL(drm_syncobj_find);
+EXPORT_SYMBOL(drm_syncobj_find_fence);
+
+struct sg_table *drm_prime_pages_to_sg(struct drm_device *dev, struct page **pages, unsigned int nr_pages)
+{
+    return ERR_PTR(-EOPNOTSUPP);
+}
+struct dma_buf *drm_gem_prime_export(struct drm_gem_object *obj, int flags) { return ERR_PTR(-EOPNOTSUPP); }
+void drm_prime_gem_destroy(struct drm_gem_object *obj, struct sg_table *sg) { WARN_ON_ONCE(1); }
+
+/* The DMA address of every page of an imported buffer (none are imported
+ * yet, but this one is simple enough to be real). */
+int drm_prime_sg_to_dma_addr_array(struct sg_table *sgt, dma_addr_t *addrs, int max_pages)
+{
+    struct sg_dma_page_iter iter;
+    int n = 0;
+
+    for_each_sgtable_dma_page(sgt, &iter, 0) {
+        if (WARN_ON(n >= max_pages)) return -1;
+        addrs[n++] = sg_page_iter_dma_address(&iter);
+    }
+    return 0;
+}
+EXPORT_SYMBOL(drm_prime_pages_to_sg);
+EXPORT_SYMBOL(drm_gem_prime_export);
+EXPORT_SYMBOL(drm_prime_sg_to_dma_addr_array);
+
 int drm_writeback_set_fb(struct drm_connector_state *conn_state, struct drm_framebuffer *fb) { return -EINVAL; }
 int drm_writeback_prepare_job(struct drm_writeback_job *job) { return 0; }
 void drm_writeback_cleanup_job(struct drm_writeback_job *job) { kfree(job); }
@@ -377,12 +419,14 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
 /* ---- the firmware frame buffer ----------------------------------------------------------- */
 /* Linux drivers call this (through aperture_remove_conflicting_*) before
  * they take over an adapter, so the firmware frame buffer's driver lets go.
- * Kestrel's boot frame buffer (head 0) and every adapter Kestrel drives are
- * never offered to Linux drivers (pci_dev->lkpi_native), so there is nothing
- * here to let go of yet. Taking head 0 over (a primary NVIDIA card under
- * nouveau) will need it. */
+ * Adapters Kestrel drives itself are never offered to Linux drivers
+ * (pci_dev->lkpi_native), but with linuxkpi.drm=1 the one behind the boot
+ * frame buffer is: Kestrel stops drawing to it here, and the driver's first
+ * monitor becomes monitor 0 (drm_kestrel.c). */
 void sysfb_disable(struct device *dev)
 {
+    if (dev_is_pci(dev) && to_pci_dev(dev)->lkpi_handle)
+        lkpi_display_handover(to_pci_dev(dev)->lkpi_handle);
 }
 
 /* ---- memory ---------------------------------------------------------------------------- */

@@ -12,6 +12,7 @@
 #define PAGE_ALIGN_DOWN(addr)   ((addr) & PAGE_MASK)
 #define PAGE_ALIGNED(addr)      (((unsigned long)(addr) & (PAGE_SIZE - 1)) == 0)
 #define PAGE_OFFSET             0UL
+#define TASK_SIZE               0x00007ffffffff000UL     /* top of user space, as on Linux */
 
 /* virtual == physical */
 #define __pa(x)                 ((phys_addr_t)(unsigned long)(x))

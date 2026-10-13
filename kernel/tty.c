@@ -87,7 +87,7 @@ static inline void put_px(const struct kestrel_tty *t, uint8_t *row, int px, uin
  * shadow: drawing already went to VRAM). Clipped to the monitor. */
 static void publish_now(const struct kestrel_tty *t, int x, int y, int w, int h)
 {
-    if (!t->shadow) return;
+    if (!t->shadow || t->detached) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > t->native_width)  w = t->native_width - x;
@@ -1053,6 +1053,96 @@ int tty_add_monitor(int index)
     return index;
 }
 
+/* The whole monitor from the cell model: after a graphics client let go,
+ * or on a new frame buffer. */
+static void repaint_locked(struct kestrel_tty *t)
+{
+    for (int py = 0; py < t->native_height; py++)
+        memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
+    for (int cy = 0; cy < t->max_rows; cy++)
+        for (int cx = 0; cx < t->max_cols; cx++) {
+            const struct tty_cell *k = cell_at(t, cx, cy);
+            const uint16_t *glyph = kfont_glyph(t->font, k->ch);
+            const uint32_t fg = native_color(t, k->fg), bg = native_color(t, k->bg);
+            for (int row = 0; row < t->font->height; row++) {
+                uint8_t *line = row_ptr(t, cy * t->font->height + row);
+                for (int col = 0; col < t->font->width; col++)
+                    put_px(t, line, cx * t->font->width + col, (glyph[row] & (0x8000u >> col)) ? fg : bg);
+            }
+        }
+    publish(t, 0, 0, t->native_width, t->native_height);
+    t->cursor_visible = false;
+    cursor_refresh(t);
+}
+
+int tty_detach_monitor(int index, void *ram)
+{
+    struct kestrel_tty *t = tty_get(index);
+    if (!t || !t->active) return 0;
+    if (!tty_lock(t)) return -1;
+    if (!t->shadow) t->shadow = ram;            /* it drew straight into VRAM */
+    t->detached = true;
+    tty_unlock(t);
+    return 0;
+}
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+int tty_replace_monitor(int index)
+{
+    struct kestrel_tty *t = tty_get(index);
+    const struct display_head *h = display_get(index);
+    if (!t || !h) return -1;
+    struct kestrel_tty *n = kmalloc(sizeof *n);
+    if (!n) return -1;
+    if (!tty_setup(n, index, h)) {
+        kfree(n->cells); kfree(n->row_dirty); kfree(n);
+        return -1;
+    }
+    if (!tty_lock(t)) {
+        kfree(n->cells); kfree(n->row_dirty); kfree(n);
+        return -1;
+    }
+    /* the text: the same rows from the top, or, on a shorter grid, the rows
+     * that end at the cursor */
+    for (int y = 0; y < n->max_rows; y++)
+        for (int x = 0; x < n->max_cols; x++) n->cells[y * n->max_cols + x] = (struct tty_cell){ ' ', t->fg, TTY_BG };
+    int skip = t->cursor_row >= n->max_rows ? t->cursor_row - n->max_rows + 1 : 0;
+    for (int y = 0; y < n->max_rows && y + skip < t->max_rows; y++)
+        for (int x = 0; x < n->max_cols && x < t->max_cols; x++)
+            n->cells[y * n->max_cols + x] = *cell_at(t, x, y + skip);
+    struct tty_cell *old_cells = t->cells;
+    uint8_t *old_dirty = t->row_dirty;
+
+    t->framebuffer_address = n->framebuffer_address;
+    t->shadow = n->shadow;
+    t->native_width = n->native_width; t->native_height = n->native_height;
+    t->pitch = n->pitch;
+    t->write_span = n->write_span; t->write_ctx = n->write_ctx;
+    t->bytes_pp = n->bytes_pp;
+    t->r_pos = n->r_pos; t->g_pos = n->g_pos; t->b_pos = n->b_pos;
+    t->font = n->font;
+    t->max_cols = n->max_cols; t->max_rows = n->max_rows;
+    t->cells = n->cells;
+    t->row_dirty = n->row_dirty;
+    t->cursor_col = clampi(t->cursor_col, 0, t->max_cols - 1);
+    t->cursor_row = clampi(t->cursor_row - skip, 0, t->max_rows - 1);
+    t->saved.col = clampi(t->saved.col, 0, t->max_cols - 1);
+    t->saved.row = clampi(t->saved.row - skip, 0, t->max_rows - 1);
+    t->wrap_pending = false;
+    t->scroll_top = 0; t->scroll_bot = t->max_rows - 1;
+    t->pending_up = 0;
+    t->repaint_all = false;
+    t->detached = false;
+    if (!t->graphics) repaint_locked(t);
+    tty_unlock(t);
+    kfree(old_cells); kfree(old_dirty); kfree(n);
+    kprintf("tty: tty%d on monitor %d: %dx%d pixels, %d x %d cells%s\n", index + 1, index,
+            t->native_width, t->native_height, t->max_cols, t->max_rows,
+            t->shadow ? ", drawn through a RAM shadow" : "");
+    return 0;
+}
+
 /* ======================================================================== */
 /*  graphics clients (/dev/fbN, the X server)                                 */
 /* ======================================================================== */
@@ -1066,23 +1156,8 @@ int tty_set_graphics(int index, bool on)
         cursor_hide(t);
         t->graphics = true;
     } else if (!on && t->graphics) {
-        t->graphics = false;                            /* repaint the text */
-        for (int py = 0; py < t->native_height; py++)
-            memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
-        for (int cy = 0; cy < t->max_rows; cy++)
-            for (int cx = 0; cx < t->max_cols; cx++) {
-                const struct tty_cell *k = cell_at(t, cx, cy);
-                const uint16_t *glyph = kfont_glyph(t->font, k->ch);
-                const uint32_t fg = native_color(t, k->fg), bg = native_color(t, k->bg);
-                for (int row = 0; row < t->font->height; row++) {
-                    uint8_t *line = row_ptr(t, cy * t->font->height + row);
-                    for (int col = 0; col < t->font->width; col++)
-                        put_px(t, line, cx * t->font->width + col, (glyph[row] & (0x8000u >> col)) ? fg : bg);
-                }
-            }
-        publish(t, 0, 0, t->native_width, t->native_height);
-        t->cursor_visible = false;
-        cursor_refresh(t);
+        t->graphics = false;
+        repaint_locked(t);
     }
     tty_unlock(t);
     return 0;

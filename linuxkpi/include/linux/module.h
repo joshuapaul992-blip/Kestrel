@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/kobject.h>
+#include <linux/elf.h>
 
 struct module { const char *name; };
 
@@ -41,8 +42,8 @@ static inline void __module_get(struct module *m) { }
 #define module_name(m)                  KBUILD_MODNAME
 #define symbol_get(x)                   (&(x))
 #define symbol_put(x)                   do { } while (0)
-#define request_module(...)             (-ENOENT)
-#define request_module_nowait(...)      (-ENOENT)
+static inline __printf(1, 2) int request_module(const char *fmt, ...) { return -ENOENT; }     /* nothing to load */
+static inline __printf(1, 2) int request_module_nowait(const char *fmt, ...) { return -ENOENT; }
 
 /* module_driver(drv, register, unregister, extra args): the init/exit pair of most drivers */
 #define module_driver(__driver, __register, __unregister, ...) \

@@ -101,7 +101,7 @@ LKPI_SRC := linuxkpi/src/printk.c linuxkpi/src/vsprintf.c linuxkpi/src/lib.c lin
             linuxkpi/src/dma.c linuxkpi/src/io.c linuxkpi/src/firmware.c linuxkpi/src/notifier.c \
             linuxkpi/src/chardev.c linuxkpi/src/watchdog.c linuxkpi/src/idr.c linuxkpi/src/module.c \
             linuxkpi/src/selftest.c linuxkpi/src/ww_mutex.c linuxkpi/src/dma-fence.c \
-            linuxkpi/src/sort.c
+            linuxkpi/src/sort.c linuxkpi/src/i2c.c
 LKPI_DRV_SRC := third_party/linux/drivers/misc/pvpanic/pvpanic.c \
                 third_party/linux/drivers/misc/pvpanic/pvpanic-pci.c \
                 third_party/linux/drivers/watchdog/i6300esb.c
@@ -127,7 +127,7 @@ LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c third_party/linux/
                 third_party/linux/drivers/gpu/drm/tiny/bochs.c
 LKPI_DRM_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_DRM_SRC))
 LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linux/include/uapi \
-                   -include linux/kernel.h -include linux/export.h -include linux/slab.h \
+                   -include linux/kernel.h -include linux/export.h -include linux/module.h -include linux/slab.h -include linux/rbtree.h \
                    -Werror=implicit-function-declaration -Werror=implicit-int -Werror=int-conversion \
                    -Werror=incompatible-pointer-types -Werror=return-type \
                    -Wno-pointer-sign -Wno-type-limits -Wno-maybe-uninitialized -Wno-unused-but-set-variable
@@ -138,8 +138,37 @@ lkpi_drm_prfmt = $(if $(filter %/ttm_device.c,$(1)),-D'pr_fmt(fmt)="[TTM DEVICE]
 # KBUILD_MODNAME as Linux's modules: drm, ttm, bochs; the library files by name
 lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1)))))))
 
+# Phase 2, nouveau: the driver as Linux's Kbuild builds it on x86 without
+# ACPI, debugfs, LEDs, backlight, SVM or the Tegra platform driver (the list
+# is in linuxkpi/nouveau/files.mk), plus the DRM pieces it needs on top of
+# bochs. Nouveau headers that carry no license are written in the KPI under
+# linuxkpi/nouveau/, which mirrors the driver's directories: each file also
+# gets its own directory's overlay on the include path.
+LKPI_NV_DIR := third_party/linux/drivers/gpu/drm/nouveau
+include linuxkpi/nouveau/files.mk
+LKPI_NV_SRC := third_party/linux/drivers/gpu/drm/display/drm_display_helper_mod.c \
+               third_party/linux/drivers/gpu/drm/display/drm_dp_helper.c \
+               third_party/linux/drivers/gpu/drm/display/drm_dp_mst_topology.c \
+               third_party/linux/drivers/gpu/drm/display/drm_dp_dual_mode_helper.c \
+               third_party/linux/drivers/gpu/drm/display/drm_dsc_helper.c \
+               third_party/linux/drivers/gpu/drm/display/drm_hdmi_helper.c \
+               third_party/linux/drivers/gpu/drm/display/drm_scdc_helper.c \
+               third_party/linux/drivers/gpu/drm/scheduler/sched_main.c \
+               third_party/linux/drivers/gpu/drm/scheduler/sched_entity.c \
+               third_party/linux/drivers/gpu/drm/scheduler/sched_fence.c \
+               third_party/linux/drivers/i2c/algos/i2c-algo-bit.c third_party/linux/lib/maple_tree.c \
+               $(addprefix $(LKPI_NV_DIR)/,$(LKPI_NV_FILES)) linuxkpi/nouveau/kestrel.c
+LKPI_NV_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_NV_SRC))
+LKPI_NV_CFLAGS := $(LKPI_DRM_CFLAGS) -Wno-address-of-packed-member -Wno-format-security -Wno-array-bounds -Ilinuxkpi/nouveau/include -Ilinuxkpi/nouveau/include/nvkm \
+                  -Ilinuxkpi/nouveau/nvkm -Ilinuxkpi/nouveau \
+                  -I$(LKPI_NV_DIR)/include -I$(LKPI_NV_DIR)/include/nvkm -I$(LKPI_NV_DIR)/nvkm -I$(LKPI_NV_DIR)
+# the file's own directory in the overlay, for its quoted includes ("priv.h")
+lkpi_nv_overlay = $(if $(findstring $(LKPI_NV_DIR)/,$(1)),-iquote $(patsubst $(LKPI_NV_DIR)/%,linuxkpi/nouveau/%,$(dir $(1))) -iquote $(dir $(1)))
+lkpi_nv_modname = $(if $(findstring /nouveau/,$(1)),nouveau,$(if $(findstring /display/,$(1)),drm_display_helper,$(if \
+                  $(findstring /scheduler/,$(1)),gpu_sched,$(subst -,_,$(basename $(notdir $(1)))))))
+
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC)) \
-          $(LKPI_OBJS) $(LKPI_DRV_OBJS) $(LKPI_DRM_OBJS)
+          $(LKPI_OBJS) $(LKPI_DRV_OBJS) $(LKPI_DRM_OBJS) $(if $(LKPI_NOUVEAU),$(LKPI_NV_OBJS))
 KERNEL := $(BUILD)/kernel.elf
 ISO    := $(BUILD)/kestrel.iso
 FLOPPY := $(BUILD)/kestrel-floppy.img
@@ -158,7 +187,7 @@ KERNEL_CMDLINE ?=
 ROOTFS_BASE ?=
 ROOTDISK    := $(BUILD)/rootdisk.ext2
 
-.PHONY: FORCE lkpi-drm-check xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
+.PHONY: FORCE lkpi-drm-check lkpi-nv-check lkpi-nv-cflags xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
 
 all: $(KERNEL)
 
@@ -184,6 +213,22 @@ $(LKPI_DRV_OBJS): $(BUILD)/%.o: %.c
 lkpi-drm-check:
 	@for f in $(LKPI_DRM_SRC); do \
 	    if out=$$($(CC) $(LKPI_DRM_CFLAGS) -DKBUILD_MODNAME='"drm"' -fsyntax-only -MF /dev/null $$f 2>&1 | grep -m1 'error'); \
+	    then echo "  FAIL    $$f: $$out"; else echo "  ok      $$f"; fi; \
+	done
+
+$(LKPI_NV_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC [N]  $<"
+	@$(CC) $(LKPI_NV_CFLAGS) $(call lkpi_nv_overlay,$<) -DKBUILD_MODNAME='"$(call lkpi_nv_modname,$<)"' -c $< -o $@
+
+lkpi-nv-cflags:
+	@echo '$(CC) $(LKPI_NV_CFLAGS)'
+
+# `make lkpi-nv-check`: compile each nouveau-side file, print its first error
+lkpi-nv-check:
+	@for f in $(LKPI_NV_SRC); do \
+	    ov=$$(case $$f in $(LKPI_NV_DIR)/*) echo "-iquote linuxkpi/nouveau/$$(dirname $${f#$(LKPI_NV_DIR)/}) -iquote $$(dirname $$f)";; esac); \
+	    if out=$$($(CC) $(LKPI_NV_CFLAGS) $$ov -DKBUILD_MODNAME='"nouveau"' -fsyntax-only -MF /dev/null $$f 2>&1 | grep -m1 'error'); \
 	    then echo "  FAIL    $$f: $$out"; else echo "  ok      $$f"; fi; \
 	done
 
@@ -223,7 +268,7 @@ $(BUILD)/ksyms0.c:
 $(BUILD)/ksyms0.o: $(BUILD)/ksyms0.c
 	@$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(OBJS) linker.ld tools/ksyms.py $(BUILD)/ksyms0.o
+$(KERNEL): $(OBJS) linker.ld tools/ksyms.py $(BUILD)/ksyms0.o $(BUILD)/nouveau.stamp
 	@echo "  LD      $@"
 	@$(LD) $(LDFLAGS) -o $(BUILD)/kernel.pass1.elf $(OBJS) $(BUILD)/ksyms0.o
 	@nm -n $(BUILD)/kernel.pass1.elf > $(BUILD)/kernel.pass1.nm
@@ -234,6 +279,11 @@ $(KERNEL): $(OBJS) linker.ld tools/ksyms.py $(BUILD)/ksyms0.o
 	@nm -n $@ | grep ' [Tt] ' | cmp -s - $(BUILD)/kernel.pass1.text || \
 	    { echo "ksyms: function addresses moved between the two links"; exit 1; }
 	@echo "  kernel: $$(stat -c %s $@) bytes"
+
+# Relinks the kernel when LKPI_NOUVEAU is switched on or off.
+$(BUILD)/nouveau.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(LKPI_NOUVEAU)' | cmp -s - $@ || echo '$(LKPI_NOUVEAU)' > $@
 
 # ---- bootable ISO (BIOS El Torito + UEFI, whatever GRUB platforms are installed)
 $(BUILD)/cmdline.stamp: FORCE
@@ -375,7 +425,16 @@ xterm:
 	@ports/xterm/build.sh $(XTERM_SRC) $(BUILD)
 
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp)
+# NVIDIA_FW=<linux-firmware-nvidia-graphics .deb, or a linux-firmware tree>:
+# NVIDIA's GPU firmware for nouveau in /lib/firmware/nvidia, with NVIDIA's
+# license (tools/nvfirmware.py). Not in the repository; off by default.
+NVIDIA_FW ?=
+$(BUILD)/nvfw.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(abspath $(NVIDIA_FW))' | cmp -s - $@ || echo '$(abspath $(NVIDIA_FW))' > $@
+
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp) \
+                       $(BUILD)/nvfw.stamp $(NVIDIA_FW) tools/nvfirmware.py
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
@@ -387,6 +446,7 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
+	@if [ -n "$(NVIDIA_FW)" ]; then $(PYTHON) tools/nvfirmware.py $(NVIDIA_FW) $(ROOTFS_STAGE); fi
 	@touch $@
 
 # The boot volume alone, as a Multiboot2 module for the ISO (kernel/ramdisk.c)

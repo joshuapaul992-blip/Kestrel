@@ -20,6 +20,7 @@
 #include <kernel/posix.h>
 #include <kernel/display.h>
 #include <kernel/tty.h>
+#include <kernel/report.h>
 #include "pci.h"
 #include "../include/lkpi/glue.h"
 
@@ -48,6 +49,14 @@ int lkpi_map_mmio(unsigned long phys, unsigned long size, int wc)
     if (wc && vmm_set_write_combining(phys, size)) return 0;
     return vmm_set_uncached(phys, size) ? 0 : -1;
 }
+
+void *lkpi_vmap(const unsigned long *frames, unsigned long n, unsigned long cache)
+{
+    _Static_assert(sizeof(unsigned long) == sizeof(uint64_t), "frame addresses");
+    return vmm_vmap((const uint64_t *)frames, n, VMM_WRITE | (cache & (VMM_PWT | VMM_PCD)));
+}
+void lkpi_vunmap(const void *addr) { vmm_vunmap((void *)addr); }
+unsigned long lkpi_vmap_phys(const void *addr) { return vmm_vmap_phys(addr); }
 
 /* ---- time ------------------------------------------------------------------ */
 unsigned long long lkpi_time_ns(void) { return time_ns(); }
@@ -178,9 +187,42 @@ int lkpi_display_add(const struct lkpi_display *d)
     h.shadow = (uint32_t *)(uintptr_t)shadow;
     strlcpy(h.name, d->name, sizeof h.name);
     strlcpy(h.monitor, d->monitor ? d->monitor : "", sizeof h.monitor);
-    int idx = display_register(&h);
+    int idx = display_replace(&h);                      /* the monitor the driver took over */
+    if (idx >= 0) return idx;
+    idx = display_register(&h);
     if (idx < 0) { pmm_free_contig(shadow, frames); return -1; }
     if (tty_add_monitor(idx) < 0) kprintf("linuxkpi: monitor %d has no terminal\n", idx);
+    return idx;
+}
+
+void lkpi_display_reclaim(void *handle)
+{
+    display_reclaim(handle);
+}
+
+/* While monitor 0 waits for the driver's first monitor the screen may stay
+ * dark, or the driver may hang: refresh REPORT.TXT every 10 s for two
+ * minutes so the log of a failed takeover reaches the boot stick. */
+static int handover_watch(void *arg)
+{
+    static char reason[64];
+    for (int s = 10; s <= 120; s += 10) {
+        task_sleep_ms(10000);
+        if (!display_handover_pending()) return 0;
+        snprintf(reason, sizeof reason, "monitor 0 still dark %d s after a Linux driver took it over", s);
+        report_save(reason);
+    }
+    return 0;
+}
+
+int lkpi_display_handover(void *handle)
+{
+    int idx = display_handover(handle);
+    /* A dark screen from here on leaves only the report on the boot stick */
+    if (idx >= 0 && !strstr(g_boot.cmdline, "kestrel.report=0") && report_locate()) {
+        report_save("a Linux driver takes over monitor 0");
+        task_create("handover-watch", handover_watch, NULL);
+    }
     return idx;
 }
 

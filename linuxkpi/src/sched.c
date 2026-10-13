@@ -133,6 +133,7 @@ static void task_init(struct task_struct *ts, void *thread)
     refcount_set(&ts->usage, 1);
     ts->prio = ts->static_prio = 120;
     ts->lkpi_thread = thread;
+    ts->group_leader = ts;
 }
 
 void lkpi_sched_init(void)
@@ -746,4 +747,26 @@ struct task_struct *lkpi_pid_task(struct pid *pid)
 {
     struct task_struct *t = current;
     return pid && t->tgid == pid->nr ? t : NULL;
+}
+
+/* ---- schedule_hrtimeout: whole jiffies, through schedule_timeout ------------------ */
+#include <linux/hrtimer.h>
+
+int schedule_hrtimeout_range(ktime_t *expires, u64 delta, const enum hrtimer_mode mode)
+{
+    long timeout = MAX_SCHEDULE_TIMEOUT;
+    if (expires) {
+        s64 ns = (mode & HRTIMER_MODE_REL) ? *expires : *expires - ktime_get();
+        if (ns <= 0) {
+            __set_current_state(TASK_RUNNING);
+            return 0;
+        }
+        timeout = (long)nsecs_to_jiffies((u64)ns + delta);
+    }
+    return schedule_timeout(timeout) ? -EINTR : 0;
+}
+
+int schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode)
+{
+    return schedule_hrtimeout_range(expires, 0, mode);
 }

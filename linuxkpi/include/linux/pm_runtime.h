@@ -30,5 +30,6 @@ static inline bool pm_runtime_suspended(struct device *d) { return false; }
 static inline bool pm_runtime_active(struct device *d) { return true; }
 static inline int pm_runtime_resume(struct device *d) { return 0; }
 static inline int pm_runtime_suspend(struct device *d) { return 0; }
+static inline int pm_runtime_autosuspend(struct device *d) { return 0; }
 static inline int pm_runtime_idle(struct device *d) { return 0; }
 #endif

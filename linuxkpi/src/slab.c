@@ -186,7 +186,11 @@ void kmem_cache_free(struct kmem_cache *s, void *obj)
 /* ---- vmalloc ---------------------------------------------------------------------- */
 void *vmalloc(unsigned long size) { return km_alloc(size, PAGE_SIZE, GFP_KERNEL, KM_VMALLOC); }
 void *vzalloc(unsigned long size) { return km_alloc(size, PAGE_SIZE, GFP_KERNEL | __GFP_ZERO, KM_VMALLOC); }
-void vfree(const void *addr) { lkpi_kfree(addr); }
+void vfree(const void *addr)
+{
+    if (WARN_ON_ONCE(lkpi_vmap_phys(addr))) return;     /* a vmap(): vunmap() it */
+    lkpi_kfree(addr);
+}
 
 void *vmalloc_array(size_t n, size_t size)
 {
@@ -203,24 +207,40 @@ void *vcalloc(size_t n, size_t size)
 /* only pointers vmalloc returned (page aligned, our header in front) count */
 bool lkpi_is_vmalloc_addr(const void *a)
 {
+    if (lkpi_vmap_phys(a)) return true;                 /* the vmap window */
     if (!a || ((unsigned long)a & (PAGE_SIZE - 1))) return false;
     const struct km_hdr *h = (const struct km_hdr *)a - 1;
     return h->magic == KM_MAGIC && (h->flags & KM_VMALLOC);
 }
 
-struct page *vmalloc_to_page(const void *addr) { return virt_to_page(addr); }
-unsigned long vmalloc_to_pfn(const void *addr) { return virt_to_pfn(addr); }
+unsigned long vmalloc_to_pfn(const void *addr)
+{
+    unsigned long phys = lkpi_vmap_phys(addr);
+    return phys ? phys >> PAGE_SHIFT : virt_to_pfn(addr);
+}
+struct page *vmalloc_to_page(const void *addr) { return pfn_to_page(vmalloc_to_pfn(addr)); }
 
-/* nothing to map: pages that happen to be contiguous are already a range */
+/* Write-back pages that happen to be contiguous are already a range in the
+ * identity map; anything else gets a mapping in Kestrel's vmap window. */
 void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot)
 {
-    for (unsigned int i = 1; i < count; i++) {
-        if (page_to_pfn(pages[i]) != page_to_pfn(pages[0]) + i) {
-            printk(KERN_ERR "linuxkpi: vmap of scattered pages is not supported\n");
-            return NULL;
-        }
-    }
-    return count ? page_address(pages[0]) : NULL;
+    unsigned long cache = pgprot_val(prot) & _LKPI_PROT_UC;
+    unsigned int i;
+
+    if (!count) return NULL;
+    for (i = 1; i < count && !cache; i++)
+        if (page_to_pfn(pages[i]) != page_to_pfn(pages[0]) + i) break;
+    if (i == count && !cache) return page_address(pages[0]);
+
+    unsigned long *frames = kmalloc_array(count, sizeof(*frames), GFP_KERNEL);
+    if (!frames) return NULL;
+    for (i = 0; i < count; i++) frames[i] = page_to_pfn(pages[i]) << PAGE_SHIFT;
+    void *va = lkpi_vmap(frames, count, cache);
+    kfree(frames);
+    return va;
 }
 
-void vunmap(const void *addr) { }
+void vunmap(const void *addr)
+{
+    if (lkpi_vmap_phys(addr)) lkpi_vunmap(addr);       /* identity-mapped ranges need nothing */
+}

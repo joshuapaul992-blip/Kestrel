@@ -14,7 +14,7 @@
 ATTR(a_ostype,     "%s\n", KESTREL_NAME)
 ATTR(a_osrelease,  "%s\n", KESTREL_VERSION)
 ATTR(a_hostname,   "%s\n", KESTREL_HOSTNAME)
-ATTR(a_fb_name,    "%s\n", g_boot.uefi ? "efi-gop" : "vesa-vbe")
+ATTR(a_fb_name,    "%s\n", g_fb.driver[0] ? g_fb.driver : g_boot.uefi ? "efi-gop" : "vesa-vbe")
 ATTR(a_fb_size,    "%u,%u\n", g_fb.width, g_fb.height)
 ATTR(a_fb_bpp,     "%u\n", g_fb.bpp)
 ATTR(a_fb_stride,  "%u\n", g_fb.pitch)

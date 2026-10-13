@@ -30,8 +30,8 @@ struct nvinit_ops {
     void     (*wr08)(void *ctx, uint32_t reg, uint8_t val);
     void     (*delay_us)(void *ctx, uint32_t us);
     /* DPCD over the AUX channel of DCB output `outp` (may be NULL). */
-    int      (*aux_rd)(void *ctx, const struct nvbios_output *outp, uint32_t addr, uint8_t *val);
-    int      (*aux_wr)(void *ctx, const struct nvbios_output *outp, uint32_t addr, uint8_t val);
+    int      (*aux_rd)(void *ctx, const struct kvbios_output *outp, uint32_t addr, uint8_t *val);
+    int      (*aux_wr)(void *ctx, const struct kvbios_output *outp, uint32_t addr, uint8_t val);
     /* Program a PLL (type < 0x100 or register) to kHz (may be NULL). */
     int      (*pll_set)(void *ctx, uint32_t type_or_reg, uint32_t khz);
     void     (*log)(void *ctx, const char *line);  /* one line, no newline; may be NULL */
@@ -41,7 +41,7 @@ struct nvinit {
     const struct nvbios *bios;
     const struct nvinit_ops *ops;
     uint32_t offset;                    /* script being executed */
-    const struct nvbios_output *outp;   /* context for OR/link/AUX opcodes, may be NULL */
+    const struct kvbios_output *outp;   /* context for OR/link/AUX opcodes, may be NULL */
     int      or, link, head;            /* -1 / 0 = not known */
     uint8_t  execute;
     int      nested;
@@ -56,7 +56,7 @@ struct nvinit {
 /* Run the script at `offset` with the given context. Returns 0, or < 0 if
  * the script could not be parsed (unknown opcode, runaway). */
 int nvinit_run(const struct nvbios *bios, const struct nvinit_ops *ops, uint32_t offset,
-               const struct nvbios_output *outp, int or, int link, int head, bool trace,
+               const struct kvbios_output *outp, int or, int link, int head, bool trace,
                struct nvinit *stats_out);
 
 #endif /* NVINIT_H */

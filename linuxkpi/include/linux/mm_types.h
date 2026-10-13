@@ -63,4 +63,10 @@ struct vm_operations_struct {
     int (*access)(struct vm_area_struct *vma, unsigned long addr, void *buf, int len, int write);
 };
 
+/* Linux's maple tree (third_party/linux/lib/maple_tree.c) comes with the
+ * memory types there; only builds that vendor it (DRM) have it. */
+#if __has_include(<linux/maple_tree.h>)
+#include <linux/maple_tree.h>
+#endif
+
 #endif

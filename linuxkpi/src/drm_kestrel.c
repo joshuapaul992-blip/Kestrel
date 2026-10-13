@@ -24,6 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/iosys-map.h>
+#include <linux/dma-resv.h>
 #include <drm/drm_client.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_connector.h>
@@ -34,17 +35,20 @@
 #include <drm/drm_fbdev_ttm.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 #include <drm/drm_rect.h>
 #include <lkpi/glue.h>
+#include "../../third_party/linux/drivers/gpu/drm/drm_internal.h"   /* drm_gem_vmap() */
 
 #define KDRM_MAX_HEADS  4
 
 struct kdrm_head {
     struct kdrm_client       *kc;
     struct drm_client_buffer *buffer;
+    struct drm_crtc          *crtc;
     struct iosys_map          map;
     int                       width, height, pitch;
     int                       monitor;          /* Kestrel's monitor number */
@@ -57,6 +61,7 @@ struct kdrm_client {
     struct drm_client_dev client;
     struct kdrm_head      heads[KDRM_MAX_HEADS];
     int                   nheads;
+    bool                  lit;                  /* frame buffers are on screen */
     bool                  gone;                 /* the driver unbound          */
 };
 
@@ -110,6 +115,47 @@ static void kdrm_monitor_name(struct drm_mode_set *ms, char *name, int size)
     mutex_unlock(&connector->dev->mode_config.mutex);
 }
 
+/* Map a frame buffer for good, where it is. drm_client_buffer_vmap() pins
+ * the buffer first through the driver's PRIME pin, which nouveau places in
+ * GART: a buffer the mode set already pinned in VRAM for scan-out then
+ * fails with "pinned elsewhere". Being on screen keeps it pinned, so map it
+ * in place. */
+static int kdrm_vmap(struct drm_client_buffer *buffer, struct iosys_map *map)
+{
+    struct drm_gem_object *gem = buffer->gem;
+    int ret;
+
+    dma_resv_lock(gem->resv, NULL);
+    ret = drm_gem_vmap(gem, &buffer->map);
+    dma_resv_unlock(gem->resv);
+    if (!ret) *map = buffer->map;
+    return ret;
+}
+
+/* The driver's own account of a frame buffer (nouveau: linuxkpi/nouveau/kestrel.c) */
+void __weak lkpi_drm_fb_where(struct drm_crtc *crtc, struct drm_framebuffer *fb, size_t last) { }
+
+/* A frame buffer drawn in place must take what is written: write a pattern
+ * to its first and last words and read it back, so a mapping that drops
+ * writes shows in the log rather than as a blank monitor. */
+static void kdrm_probe_vram(struct kdrm_head *h)
+{
+    struct drm_device *dev = h->kc->client.dev;
+    size_t last = (size_t)h->pitch * h->height - 4;
+    u32 a, b;
+
+    iosys_map_wr(&h->map, 0, u32, 0x00a5c35a);
+    iosys_map_wr(&h->map, last, u32, 0x005ac3a5);
+    a = iosys_map_rd(&h->map, 0, u32);
+    b = iosys_map_rd(&h->map, last, u32);
+    lkpi_drm_fb_where(h->crtc, h->buffer->fb, last);
+    iosys_map_wr(&h->map, 0, u32, 0);
+    iosys_map_wr(&h->map, last, u32, 0);
+    drm_info(dev, "kestrel: %dx%d frame buffer at %lx (GEM %zu KiB): read back %08x %08x%s\n", h->width,
+             h->height, (unsigned long)h->map.vaddr_iomem, h->buffer->gem->size >> 10, a, b,
+             a == 0x00a5c35a && b == 0x005ac3a5 ? "" : ", WRITES ARE LOST");
+}
+
 /* Light every CRTC the probe gave a mode, then hand each one to Kestrel. */
 static int kdrm_setup(struct kdrm_client *kc)
 {
@@ -136,6 +182,7 @@ static int kdrm_setup(struct kdrm_client *kc)
         struct kdrm_head *h = &kc->heads[n];
         h->kc = kc;
         h->buffer = buffer;
+        h->crtc = ms->crtc;
         h->width = ms->mode->hdisplay;
         h->height = ms->mode->vdisplay;
         h->pitch = buffer->fb->pitches[0];
@@ -159,10 +206,11 @@ static int kdrm_setup(struct kdrm_client *kc)
         drm_err(dev, "kestrel: mode set failed: %d\n", ret);
         goto err_delete;
     }
+    kc->lit = true;
 
     for (int i = 0; i < n; i++) {
         struct kdrm_head *h = &kc->heads[i];
-        ret = drm_client_buffer_vmap(h->buffer, &h->map);
+        ret = kdrm_vmap(h->buffer, &h->map);
         if (ret) {
             drm_err(dev, "kestrel: cannot map the frame buffer of %dx%d: %d\n", h->width, h->height, ret);
             continue;
@@ -182,6 +230,7 @@ static int kdrm_setup(struct kdrm_client *kc)
             .name = name, .monitor = monitors[i],
         };
         if (!direct) iosys_map_memset(&h->map, 0, 0, (size_t)h->pitch * h->height);
+        else kdrm_probe_vram(h);
         h->monitor = lkpi_display_add(&d);
         if (h->monitor < 0) drm_err(dev, "kestrel: Kestrel took no monitor for %s\n", name);
         else drm_info(dev, "kestrel: monitor %d (%s)\n", h->monitor, direct ? "drawn in VRAM" : "damage flushed");
@@ -200,14 +249,14 @@ static int kdrm_hotplug(struct drm_client_dev *client)
 {
     struct kdrm_client *kc = container_of(client, struct kdrm_client, client);
 
-    if (kc->nheads) return drm_client_modeset_commit(client);    /* keep what Kestrel draws on */
+    if (kc->lit) return drm_client_modeset_commit(client);       /* keep what Kestrel draws on */
     return kdrm_setup(kc);
 }
 
 static int kdrm_restore(struct drm_client_dev *client)
 {
     struct kdrm_client *kc = container_of(client, struct kdrm_client, client);
-    return kc->nheads ? drm_client_modeset_commit(client) : 0;
+    return kc->lit ? drm_client_modeset_commit(client) : 0;
 }
 
 static void kdrm_unregister(struct drm_client_dev *client)

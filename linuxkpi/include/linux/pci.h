@@ -62,6 +62,13 @@ struct pci_error_handlers {
     void (*cor_error_detected)(struct pci_dev *dev);
 };
 
+enum pci_bus_speed {
+    PCI_SPEED_33MHz = 0x00, PCI_SPEED_66MHz = 0x01,
+    PCIE_SPEED_2_5GT = 0x14, PCIE_SPEED_5_0GT = 0x15, PCIE_SPEED_8_0GT = 0x16,
+    PCIE_SPEED_16_0GT = 0x17, PCIE_SPEED_32_0GT = 0x18, PCIE_SPEED_64_0GT = 0x19,
+    PCI_SPEED_UNKNOWN = 0xff,
+};
+
 struct pci_bus {
     struct list_head    node;
     struct pci_bus     *parent;
@@ -70,6 +77,8 @@ struct pci_bus {
     unsigned char       number;
     unsigned char       primary;
     int                 domain_nr;
+    unsigned char       max_bus_speed;  /* enum pci_bus_speed: the bridge's PCIe link capability */
+    unsigned char       cur_bus_speed;
 };
 
 struct pci_dev {
@@ -84,7 +93,7 @@ struct pci_dev {
     u8                  revision;
     u8                  hdr_type;
     u8                  pin;
-    u8                  msi_cap, msix_cap, pcie_cap;
+    u8                  msi_cap, msix_cap, pcie_cap, pm_cap;
     u16                 pcie_flags_reg;
     struct pci_driver  *driver;
     u64                 dma_mask;
@@ -100,6 +109,8 @@ struct pci_dev {
     atomic_t            enable_cnt;
     u32                 saved_config_space[16];
     bool                state_saved;
+    resource_size_t     rom;            /* a ROM image the firmware left in RAM: none on PCs */
+    size_t              romlen;
     /* the KPI's own */
     void               *lkpi_handle;            /* Kestrel's struct pci_device */
     int                 lkpi_vector;            /* MSI vector, or -1 */
@@ -268,6 +279,19 @@ void pci_release_selected_regions(struct pci_dev *pdev, int bars);
 #define pci_request_regions_exclusive(p, n)     pci_request_regions(p, n)
 #define pci_request_selected_regions_exclusive(p, b, n) pci_request_selected_regions(p, b, n)
 void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long maxlen);
+/* The expansion ROM: pci_map_rom() turns its decoding on and returns the
+ * mapped image with *size its length (the images up to the last one), or
+ * NULL when the ROM BAR is unassigned or holds no image. */
+void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size);
+void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom);
+int  pci_enable_rom(struct pci_dev *pdev);
+void pci_disable_rom(struct pci_dev *pdev);
+static inline void __iomem *pci_platform_rom(struct pci_dev *pdev, size_t *size)
+{
+    *size = pdev->romlen;
+    return pdev->rom ? (void __iomem *)(uintptr_t)pdev->rom : NULL;        /* identity mapped */
+}
+static inline bool pci_is_thunderbolt_attached(struct pci_dev *pdev) { return false; }
 void __iomem *pci_iomap_wc(struct pci_dev *dev, int bar, unsigned long maxlen);
 void __iomem *pci_iomap_range(struct pci_dev *dev, int bar, unsigned long offset, unsigned long maxlen);
 void __iomem *pci_iomap_wc_range(struct pci_dev *dev, int bar, unsigned long offset, unsigned long maxlen);
