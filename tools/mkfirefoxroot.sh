@@ -1,5 +1,6 @@
 #!/bin/sh
 # tools/mkfirefoxroot.sh OUT.tar FIREFOX_DIR [DEBCACHE]
+# LOCAL_DEBS="build/lxpanel/lxpanel_*+kestrel1_amd64.deb" tools/mkfirefoxroot.sh ...
 #
 # Build a root file system of Ubuntu 24.04 (noble) runtime packages with
 # Firefox in /opt/firefox, as a tarball for
@@ -10,6 +11,9 @@
 # root (chroot runs the cache tools). FIREFOX_DIR is an unpacked Linux
 # x86_64 Firefox: the directory with firefox-bin, libxul.so and omni.ja
 # (Mozilla's tarball, or the conda-forge package's bin/FirefoxApp).
+# LOCAL_DEBS lists packages built here, unpacked over the archive's: the
+# patched LXPanel from ports/lxpanel/build.sh, without which the panel only
+# spans its plugins' width.
 #
 # What the root holds:
 # - glibc, bash, coreutils and the usual tools;
@@ -79,9 +83,20 @@ for p in $real; do
     done
 done
 
+for d in ${LOCAL_DEBS:-}; do
+    echo "mkfirefoxroot: $(basename "$d") over the archive's"
+    dpkg-deb --fsys-tarfile "$d" | tar -x --keep-directory-symlink -C "$ROOT"
+done
+case " ${LOCAL_DEBS:-} " in
+*/lxpanel_*) ;;
+*) echo "mkfirefoxroot: warning: no LXPanel from ports/lxpanel in LOCAL_DEBS; the panel will be narrow" ;;
+esac
+
 echo "mkfirefoxroot: configuring"
 [ -e "$ROOT/usr/bin/sh" ] || ln -s dash "$ROOT/usr/bin/sh"            # dpkg would make it
-[ -e "$ROOT/usr/bin/awk" ] || ln -s gawk "$ROOT/usr/bin/awk"           # so would update-alternatives
+# what update-alternatives would do; mawk rather than gawk, whose build
+# is not PIE (Kestrel does not load fixed-address programs yet)
+[ -e "$ROOT/usr/bin/awk" ] || ln -s mawk "$ROOT/usr/bin/awk"
 cat > "$ROOT/etc/asound.conf" <<'EOF'
 # ALSA programs (aplay, speaker-test) play through Kestrel's OSS devices
 pcm.!default { type oss device /dev/dsp }

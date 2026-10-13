@@ -1,0 +1,35 @@
+Description: Panel width from its settings with GTK 3.24
+ The panel's size comes from its edge, monitor and width settings, but
+ GtkWindow takes its content's height-for-width request mode, and GTK 3.24
+ then sizes the window through the width-for-height path, which lxpanel does
+ not implement: a full-width panel shrinks to its plugins' width. Upstream
+ lxpanel (git master) returns GTK_SIZE_REQUEST_CONSTANT_SIZE the same way.
+Forwarded: not-needed
+---
+--- a/src/panel.c
++++ b/src/panel.c
+@@ -293,6 +293,16 @@
+   if (natural_height)
+       *natural_height = requisition.height;
+ }
++
++/* The panel's size comes from its edge, monitor and width settings alone.
++   Without this GtkWindow inherits its content's height-for-width mode, and
++   GTK 3.24 then sizes the window through the width-for-height path, which
++   lxpanel does not implement: the panel shrinks to its plugins' width. */
++static GtkSizeRequestMode
++lxpanel_get_request_mode (GtkWidget *widget)
++{
++    return GTK_SIZE_REQUEST_CONSTANT_SIZE;
++}
+ #endif
+ 
+ static void lxpanel_size_allocate(GtkWidget *widget, GtkAllocation *a)
+@@ -413,6 +423,7 @@
+ #if GTK_CHECK_VERSION(3, 0, 0)
+     widget_class->get_preferred_width = lxpanel_get_preferred_width;
+     widget_class->get_preferred_height = lxpanel_get_preferred_height;
++    widget_class->get_request_mode = lxpanel_get_request_mode;
+ #else
+     widget_class->size_request = lxpanel_size_request;
+ #endif

@@ -13,6 +13,7 @@
 #  make icewm        build the IceWM window manager (see ports/icewm/build.sh)
 #  make busybox      build BusyBox: /bin/sh and tools (see ports/busybox/build.sh)
 #  make xterm        build xterm (see ports/xterm/build.sh)
+#  make lxpanel      patched LXPanel package for the Firefox image's LXDE
 #  make debug        QEMU halted with a gdb stub on :1234
 #  make check        verify the Multiboot2 header with grub-file
 #  make fonts        regenerate drivers/font_*.c from the BDF sources
@@ -423,6 +424,14 @@ XTERM_ROOT := $(BUILD)/xterm-root
 xterm:
 	@test -n "$(XTERM_SRC)" || { echo "usage: make xterm XTERM_SRC=<unpacked xterm release>"; exit 1; }
 	@ports/xterm/build.sh $(XTERM_SRC) $(BUILD)
+
+# LXPanel for the Firefox image's LXDE (ports/lxpanel), a patched Ubuntu
+# package that tools/mkfirefoxroot.sh takes in LOCAL_DEBS=:
+#   make lxpanel LXPANEL_SRC=<apt-get source lxpanel>
+LXPANEL_SRC ?=
+lxpanel:
+	@test -n "$(LXPANEL_SRC)" || { echo "usage: make lxpanel LXPANEL_SRC=<unpacked lxpanel source package>"; exit 1; }
+	@ports/lxpanel/build.sh $(LXPANEL_SRC) $(BUILD)
 
 ROOTFS_STAGE := $(BUILD)/rootfs
 # NVIDIA_FW=<linux-firmware-nvidia-graphics .deb, or a linux-firmware tree>:
