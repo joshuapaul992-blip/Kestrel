@@ -16,6 +16,16 @@ xpid=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 if command -v startlxde >/dev/null 2>&1; then
+    # LXDE's Shutdown and Reboot ask systemd-logind on the system bus:
+    # kestrel-logind answers in its place (the Firefox image's root has both)
+    if [ -x /usr/libexec/kestrel-logind ] && [ -f /etc/dbus-1/kestrel-system.conf ] &&
+       ! dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 \
+            org.freedesktop.login1.Manager.CanPowerOff >/dev/null 2>&1; then
+        mkdir -p /run/dbus
+        rm -f /run/dbus/system_bus_socket
+        dbus-daemon --config-file=/etc/dbus-1/kestrel-system.conf --fork --nopidfile
+        /usr/libexec/kestrel-logind &
+    fi
     startlxde
 else
     xterm &
