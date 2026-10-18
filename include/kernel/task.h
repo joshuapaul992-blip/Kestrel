@@ -199,7 +199,9 @@ void        sched_tick_fast(void);      /* the same without the kernel lock     
 bool        sched_tick_needs_lock(void);    /* the boot CPU: an interval timer is due   */
 void        sched_tick_boot_fast(void);     /* the boot CPU's tick without the lock     */
 void        sched_alarms(void);             /* due interval timers (big lock held)      */
-void        sched_alarm_armed(uint64_t at); /* ITIMER_REAL set to time_ms() `at`        */
+/* A process's ITIMER_REAL (time_ms; 0: off): the old interval and expiry
+ * into old[0..1] if old, and the new ones if set, at once (any lock) */
+void        itimer_real(struct signal_struct *g, bool set, uint64_t every, uint64_t at, uint64_t old[2]);
 void        sched_idle_loop(void) __attribute__((noreturn));
 
 void        sleep_on(void *chan);       /* call with interrupts disabled */

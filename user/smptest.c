@@ -798,16 +798,25 @@ static const char *volatile tt_why;
 static void tt_fail(const char *why) { if (!tt_errors++) tt_why = why; }
 static int tt_master[TT_PAIRS], tt_slave[TT_PAIRS];
 
+static char tt_open_why[96];                    /* the step of tt_open() that failed last */
+static int tt_open_fail(const char *step, const char *name)
+{
+    snprintf(tt_open_why, sizeof tt_open_why, "pty: %s %s: %s", step, name ? name : "", strerror(errno));
+    return -1;
+}
+
 static int tt_open(int *m, int *sl, int raw)
 {
-    *m = posix_openpt(O_RDWR | O_NOCTTY);
-    if (*m < 0 || grantpt(*m) || unlockpt(*m)) return -1;
-    *sl = open(ptsname(*m), O_RDWR | O_NOCTTY);
-    if (*sl < 0) return -1;
+    *sl = -1;
+    if ((*m = posix_openpt(O_RDWR | O_NOCTTY)) < 0) return tt_open_fail("open", "/dev/ptmx");
+    if (grantpt(*m) || unlockpt(*m)) return tt_open_fail("unlock", NULL);
+    const char *name = ptsname(*m);
+    if (!name) return tt_open_fail("ptsname", NULL);
+    if ((*sl = open(name, O_RDWR | O_NOCTTY)) < 0) return tt_open_fail("open", name);
     struct termios t;
     tcgetattr(*sl, &t);
     if (raw) cfmakeraw(&t); else t.c_lflag &= ~(tcflag_t)(ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE);
-    return tcsetattr(*sl, TCSANOW, &t);
+    return tcsetattr(*sl, TCSANOW, &t) ? tt_open_fail("tcsetattr", name) : 0;
 }
 
 static unsigned char tt_byte(int pair, int dir, long i) { return (unsigned char)(i * 7 + pair * 31 + dir * 101 + (i >> 9)); }
@@ -869,7 +878,7 @@ static void *tt_lines(void *arg)
 {
     (void)arg;
     int m, sl;
-    if (tt_open(&m, &sl, 0)) { tt_fail("canonical pty"); return NULL; }
+    if (tt_open(&m, &sl, 0)) { tt_fail(tt_open_why); return NULL; }
     char want[32], got[64];
     for (int i = 0; i < 400; i++) {
         int n = snprintf(want, sizeof want, "line %d of 400\n", i);
@@ -888,7 +897,7 @@ static void *tt_churn(void *arg)
     (void)arg;
     for (int i = 0; i < 150; i++) {
         int m, sl;
-        if (tt_open(&m, &sl, 1)) { tt_fail("open a pty pair"); if (m >= 0) close(m); return NULL; }
+        if (tt_open(&m, &sl, 1)) { tt_fail(tt_open_why); if (m >= 0) close(m); return NULL; }
         if (i % 3 == 0) {
             pid_t c = fork();
             if (c == 0) { char b; close(m); _exit(read(sl, &b, 1) == 0 ? 0 : 1); }   /* hung up: EOF */
@@ -942,7 +951,7 @@ static int tty_round(void)
     tt_errors = 0;
     tt_stop = 0;
     for (int i = 0; i < TT_PAIRS; i++)
-        if (tt_open(&tt_master[i], &tt_slave[i], 1)) { printf("  FAIL detail: cannot open a pty pair\n"); return 1; }
+        if (tt_open(&tt_master[i], &tt_slave[i], 1)) { printf("  FAIL detail: cannot open a pty pair (%s)\n", tt_open_why); return 1; }
     for (int k = 0; k < TT_PAIRS * 2; k++) {
         pthread_create(&r[k], NULL, tt_reader, (void *)(intptr_t)k);
         pthread_create(&w[k], NULL, tt_writer, (void *)(intptr_t)k);

@@ -1070,8 +1070,9 @@ struct file *vfs_file_get(struct file *f)
 #define MAX_FLOCKS 256
 static struct flock_ent { struct vnode *vn; struct file *owner; bool excl; } flocks[MAX_FLOCKS];
 static int flock_chan;
+static struct spinlock flock_lock;      /* flocks[] */
 
-static void flock_drop(struct file *f)
+static void flock_drop_locked(struct file *f)
 {
     bool any = false;
     for (int i = 0; i < MAX_FLOCKS; i++)
@@ -1079,13 +1080,20 @@ static void flock_drop(struct file *f)
     if (any) wakeup(&flock_chan);
 }
 
+static void flock_drop(struct file *f)
+{
+    uint64_t fl = spin_lock_irqsave(&flock_lock);
+    flock_drop_locked(f);
+    spin_unlock_irqrestore(&flock_lock, fl);
+}
+
 int vfs_flock(struct file *f, int op)
 {
     enum { LOCK_SH = 1, LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8 };
     int kind = op & ~LOCK_NB;
     if (kind != LOCK_SH && kind != LOCK_EX && kind != LOCK_UN) return -EINVAL;
-    uint64_t fl = irq_save();
-    if (kind == LOCK_UN) { flock_drop(f); irq_restore(fl); return 0; }
+    uint64_t fl = spin_lock_irqsave(&flock_lock);
+    if (kind == LOCK_UN) { flock_drop_locked(f); spin_unlock_irqrestore(&flock_lock, fl); return 0; }
     for (;;) {
         bool blocked = false;
         int mine = -1, slot = -1;
@@ -1097,18 +1105,18 @@ int vfs_flock(struct file *f, int op)
         }
         if (!blocked) {
             if (mine >= 0) flocks[mine].excl = kind == LOCK_EX;     /* conversion */
-            else if (slot < 0) { irq_restore(fl); return -ENOLCK; }
+            else if (slot < 0) { spin_unlock_irqrestore(&flock_lock, fl); return -ENOLCK; }
             else flocks[slot] = (struct flock_ent){ f->vn, f, kind == LOCK_EX };
             if (mine >= 0 && kind == LOCK_SH) wakeup(&flock_chan);
-            irq_restore(fl);
+            spin_unlock_irqrestore(&flock_lock, fl);
             return 0;
         }
         /* Linux drops a held lock before waiting to convert it, so two
          * holders upgrading at once cannot deadlock. */
         if (mine >= 0) { flocks[mine].owner = NULL; flocks[mine].vn = NULL; wakeup(&flock_chan); }
-        if (op & LOCK_NB) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -EINTR; }
-        sleep_on(&flock_chan);
+        if (op & LOCK_NB) { spin_unlock_irqrestore(&flock_lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&flock_lock, fl); return -EINTR; }
+        sleep_on_locked(&flock_chan, &flock_lock);
     }
 }
 
@@ -1118,8 +1126,10 @@ void vfs_close(struct file *f)
 {
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
     /* The last close runs file-system and driver code: under the big kernel
-     * lock, also from a call that runs without it (unix socket I/O). */
-    if (!bkl_depth()) { bkl_enter(); vfs_close_last(f); bkl_exit(); return; }
+     * lock unless the file locks itself (vnode_ops.nolock), also from a call
+     * that runs without it. The rest has locks of its own: the epoll
+     * watches, flock() and record locks, inotify, the node's references. */
+    if (!bkl_depth() && !file_nolock(f)) { bkl_enter(); vfs_close_last(f); bkl_exit(); return; }
     vfs_close_last(f);
 }
 
