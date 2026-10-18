@@ -779,9 +779,19 @@ int vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec)
     int r = 0;
     uint64_t i = 0;
     for (uint64_t va = addr; va < addr + len; va += PAGE, i++) {
-        if (!vma_find(mm, va)) { r = -ENOMEM; break; }
-        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        struct vma *v = vma_find(mm, va);
+        if (!v) { r = -ENOMEM; break; }
+        uint64_t *pte = pte_walk(mm->pml4, va, false), p;
         vec[i] = pte && has_frame(*pte) ? 1 : 0;
+        /* a private file page not mapped yet: resident if the page cache
+         * holds it, as on Linux (fincore and programs that check before
+         * they touch a file rely on this) */
+        if (!vec[i] && !(v->flags & VMA_SHARED) && v->file && va < v->file_end && v->file->vn->ops &&
+            v->file->vn->ops->getpage &&
+            v->file->vn->ops->getpage(v->file->vn, (v->off + (va - v->start)) / PAGE, false, &p) == 0 && p) {
+            vec[i] = 1;
+            page_unref(p);
+        }
     }
     mm_unlock(mm);
     return r;

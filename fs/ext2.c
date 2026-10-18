@@ -115,7 +115,6 @@
 #define RAW_INODE     256                   /* bytes of the on-disk inode kept */
 #define RA_PAGES      32                    /* a page cache miss reads up to 128 KiB, */
 #define RA_MAX_PAGES  256                   /* up to 1 MiB when reads are sequential  */
-#define RA_HINT_PAGES 128                   /* 512 KiB windows: a file said to be needed */
 
 /* One load or store each (the kernel is -ffreestanding: a plain memcpy
  * would be the byte loop in lib/string.c) */
@@ -140,7 +139,6 @@ struct e2ino {
     struct pcache *pc;                      /* regular files: cached pages, once read */
     uint64_t ra_next;                       /* the page after the last read-ahead run */
     uint32_t ra_win;                        /* that run's window (pages)              */
-    uint32_t hint_win;                      /* readahead() asked for more than we read */
     uint8_t  raw[RAW_INODE] __attribute__((aligned(8)));    /* the size halves load whole */
     struct e2ino *next;
 };
@@ -692,13 +690,15 @@ static int fill_blocks(struct e2fs *fs, struct e2ino *e, uint64_t idx, const uin
  * next to its own on the disk and they are not cached yet:
  * - in order (a file read from start to end; `want`: readahead()) the run
  *   goes forward from idx: `want` pages, or a window that starts at
- *   RA_PAGES and doubles while the misses come in order;
- * - otherwise (page faults in a mapped library jump about) it is the
- *   aligned window around idx, RA_PAGES or, for a file a program said it
- *   will need, the larger hint window: windows never overlap in part, so
- *   each is read in one request instead of the gaps between earlier runs.
+ *   RA_PAGES and doubles while read() misses come in order;
+ * - otherwise, and always for page faults (`mapped`: a mapped library
+ *   jumps about, and a fault that happens to land after the last window
+ *   says nothing about the next one; Linux reads around faults the same
+ *   way) it is the aligned window of RA_PAGES around idx: windows never
+ *   overlap in part, so each is read in one request instead of the gaps
+ *   between earlier runs.
  * All of it at most the read-ahead buffer. */
-static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t want, uint64_t *out)
+static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t want, bool mapped, uint64_t *out)
 {
     if (!e->pc) {                                       /* e2_getpage looks without fs->lock */
         struct pcache *pc = pcache_new();
@@ -721,8 +721,8 @@ static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t w
         *out = pcache_insert(e->pc, idx, p, false);
         return 0;
     }
-    bool seq = want || (idx == e->ra_next && e->ra_win);
-    uint32_t win = want ? want : seq ? e->ra_win * 2 : e->hint_win ? e->hint_win : RA_PAGES;
+    bool seq = want || (!mapped && idx == e->ra_next && e->ra_win);
+    uint32_t win = want ? want : seq ? e->ra_win * 2 : RA_PAGES;
     if (win > fs->ra_pages) win = fs->ra_pages;
     uint64_t wlo = seq ? idx : idx - idx % win, whi = wlo + win;
     uint32_t bpp = PAGE_SIZE / fs->bs, first = pb[0], next = pb[0] + bpp, nb[4];
@@ -738,8 +738,10 @@ static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t w
         hi++;
     }
     uint32_t n = (uint32_t)(hi - lo);
-    e->ra_next = hi;
-    e->ra_win = win;
+    if (!mapped) {
+        e->ra_next = hi;
+        e->ra_win = win;
+    }
     if (n == 1) {
         if (!(p = page_alloc())) return -ENOMEM;
         if (dev_io(fs, pb[0], bpp, (void *)p, false) < 0) { page_unref(p); return -EIO; }
@@ -761,24 +763,20 @@ static int getpage_ra(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t w
 
 static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64_t *out)
 {
-    return getpage_ra(fs, e, idx, 0, out);
+    return getpage_ra(fs, e, idx, 0, false, out);
 }
 
-/* readahead(), fadvise WILLNEED, MADV_WILLNEED: up to a megabyte, the
- * missing pages of the range now, in one request where the blocks allow;
- * more than that, larger read-around windows from now on. */
+/* readahead(), fadvise WILLNEED, MADV_WILLNEED: the missing pages of the
+ * range now, in one request where the blocks allow, but only its first
+ * megabyte. Linux caps it the same way: Firefox asks for all of libxul
+ * (187 MB) and both omni.ja files, of which it uses about half at
+ * start-up, and reading more of them up front (or in larger windows as
+ * they are used) read 40 MB more than Linux on a cold start. */
 static int e2_readahead(struct vnode *vn, uint64_t idx, uint64_t count)
 {
     struct e2fs *fs = fs_of(vn);
     struct e2ino *e = ino_of(vn);
-    if (count > RA_MAX_PAGES) {
-        /* A whole large file (Firefox: libxul, 187 MB, of which it uses
-         * well under half at start-up): read it in larger windows as it is
-         * used, not all of it now -- on a slow stick the unused part costs
-         * more than the requests it saves. */
-        e->hint_win = RA_HINT_PAGES;
-        return 0;
-    }
+    if (count > RA_MAX_PAGES) count = RA_MAX_PAGES;
     uint64_t end = idx + count < idx ? UINT64_MAX : idx + count;
     while (idx < end) {
         kmutex_lock(&fs->lock);
@@ -788,7 +786,7 @@ static int e2_readahead(struct vnode *vn, uint64_t idx, uint64_t count)
         int r = 0;
         if (idx < end) {
             uint64_t p, want = end - idx < RA_MAX_PAGES ? end - idx : RA_MAX_PAGES;
-            if ((r = getpage_ra(fs, e, idx, (uint32_t)want, &p)) == 0) page_unref(p);
+            if ((r = getpage_ra(fs, e, idx, (uint32_t)want, false, &p)) == 0) page_unref(p);
             idx++;
         }
         kmutex_unlock(&fs->lock);
@@ -807,7 +805,7 @@ static int e2_getpage(struct vnode *vn, uint64_t idx, bool io, uint64_t *phys)
     }
     struct e2fs *fs = fs_of(vn);
     kmutex_lock(&fs->lock);
-    int r = getpage_locked(fs, e, idx, phys);
+    int r = getpage_ra(fs, e, idx, 0, true, phys);     /* a page fault */
     kmutex_unlock(&fs->lock);
     return r;
 }
