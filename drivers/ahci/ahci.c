@@ -290,7 +290,7 @@ static int run_cmd(struct port_state *p, uint8_t ata_cmd, uint64_t lba, uint16_t
 
     if (!port_wait_idle(p, T_IDLE_US)) return AHCI_ERR_TIMEOUT;
     REG(r->is) = 0xFFFFFFFFu;
-    p->irq_is = 0;
+    __atomic_store_n(&p->irq_is, 0, __ATOMIC_RELAXED);
     mmio_barrier();                             /* table + header visible before CI */
     REG(r->ci) = 1u << slot;
 
@@ -300,7 +300,7 @@ static int run_cmd(struct port_state *p, uint8_t ata_cmd, uint64_t lba, uint16_t
     uint32_t limit = ata_cmd == ATA_CMD_FLUSH_CACHE_EXT ? T_FLUSH_US : T_CMD_US;
     int err = AHCI_OK;
     for (uint32_t spin = 0;; spin++) {
-        is = REG(r->is) | p->irq_is;
+        is = REG(r->is) | __atomic_load_n(&p->irq_is, __ATOMIC_ACQUIRE);
         if (is & AHCI_PxIS_TFES)                              { err = AHCI_ERR_IO;  break; }
         if (is & (AHCI_PxIS_HBFS | AHCI_PxIS_HBDS | AHCI_PxIS_IFS)) { err = AHCI_ERR_HBA; break; }
         if (!(REG(r->ci) & bit)) break;
@@ -827,7 +827,7 @@ void ahci_irq(int hi)
         struct port_state *p = &h->ports[n];
         if (!p->regs) continue;
         uint32_t pis = REG(p->regs->is);
-        p->irq_is |= pis;
+        __atomic_or_fetch(&p->irq_is, pis, __ATOMIC_RELEASE);     /* the waiter may run on another CPU */
         REG(p->regs->is) = pis;
         if (h->plat.wake) h->plat.wake(p);
     }

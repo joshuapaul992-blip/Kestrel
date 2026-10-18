@@ -349,7 +349,8 @@ void isr_dispatch(struct int_frame *f)
          * holder runs the handler as it lets go (msi.h: msi_defer) */
         lapic_eoi();                                    /* edge-triggered: EOI first */
         uint64_t t0 = rdtsc();
-        bkl_defer(1ull << (f->vector - VEC_MSI_BASE));
+        if (msi_lockless((int)f->vector)) msi_dispatch((int)f->vector);  /* locks its own state */
+        else bkl_defer(1ull << (f->vector - VEC_MSI_BASE));
         k->irq_n++;
         k->irq_cyc += rdtsc() - t0;
         return;

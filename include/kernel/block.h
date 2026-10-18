@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <kernel/lockcheck.h>
 
 #define BLK_NAME_MAX    16
 #define BLK_MAX         48
@@ -29,6 +30,10 @@ struct blkdev_ops {
     /* optional: write `count` blocks (buf DMA safe), and flush caches */
     int  (*write)(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf);
     int  (*flush)(struct blkdev *b);
+    /* The driver locks its own state, and its interrupt handler runs
+     * without the big kernel lock (msi_set_lockless): requests run without
+     * it. A driver without this gets the big lock for each request. */
+    bool nolock;
 };
 
 struct blkdev {
@@ -51,6 +56,7 @@ struct blkdev {
 
     bool      removed;
     volatile bool io_busy;                  /* one request at a time per disk  */
+    LOCKCHECK_TAG                           /* io_busy, for the lock-order checker */
     bool      partitions_scanned;
     uint32_t  errors;
     int       last_error;
