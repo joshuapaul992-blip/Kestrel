@@ -1,0 +1,22 @@
+#!/bin/busybox sh
+# /init of the benchmark's Linux initramfs (tools/mkbenchlinux.py): load the
+# drivers that reach the stick, find the root volume labelled kestrel-root,
+# and run the benchmark there as init.
+B=/bin/busybox
+$B mkdir -p /proc /sys /dev /newroot
+$B mount -t proc proc /proc
+$B mount -t sysfs sys /sys
+$B mount -t devtmpfs dev /dev
+for m in $($B cat /lib/modules.order); do $B insmod /lib/$m.ko 2>/dev/null; done
+n=0
+while ! dev=$($B findfs LABEL=kestrel-root 2>/dev/null); do
+    n=$((n + 1))
+    [ $n -gt 600 ] && { echo "initramfs: no volume labelled kestrel-root after 60 s"; exec $B sh; }
+    $B sleep 0.1
+done
+echo "initramfs: root on $dev"
+$B mount -t ext4 -o rw "$dev" /newroot || exec $B sh
+$B ip link set lo up 2>/dev/null || $B ifconfig lo 127.0.0.1 up
+$B mount --move /dev /newroot/dev
+$B umount /proc /sys
+exec $B switch_root /newroot /bin/kestrel-bench

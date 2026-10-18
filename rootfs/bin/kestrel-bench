@@ -1,0 +1,128 @@
+#!/bin/sh
+# /bin/kestrel-bench -- the native benchmark: the same steps on Kestrel and on
+# Linux, from the same root file system (the Firefox image's), run by the
+# stick's "Benchmark" GRUB entries with no one at the keyboard.
+#
+#   - boot to desktop: the kernel's uptime when the X server and the window
+#     manager are up (Kestrel's boot manager is skipped: kestrel.bootmgr=0)
+#   - memory in use at the idle desktop: MemTotal - MemAvailable
+#   - three Firefox starts on a local page, the first from a cold cache:
+#     time to its first window and to the page's load event, and what was
+#     read from the disk meanwhile
+#
+# Both kernels run the same X server, Xvfb (it draws into memory, so no
+# display driver takes part), and Openbox. The results go to the stick's
+# "KESTREL RPT" volume: Kestrel writes them into REPORT.TXT (/dev/report),
+# Linux into LINUX.TXT next to it, with its kernel log.
+export DISPLAY=:9 HOME=/root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export XDG_RUNTIME_DIR=/tmp/runtime-0 NO_AT_BRIDGE=1
+export FREETYPE_PROPERTIES=truetype:interpreter-version=35
+PAGE=/share/kestrel-bench/bench.html
+OUT=/tmp/bench.txt
+RUNS=3
+
+kernel=$(uname -s)
+linux=; [ "$kernel" = Linux ] && linux=1
+say() { echo "bench: $*"; }
+res() { echo "$*" >> $OUT; say "$*"; }
+
+if [ -n "$linux" ] && [ $$ = 1 ]; then          # init on Linux: the usual mounts
+    mount -t proc proc /proc; mount -t sysfs sys /sys
+    mount -t tmpfs -o mode=1777 tmp /tmp; mkdir -p /dev/shm /dev/pts /run
+    mount -t tmpfs -o mode=1777 shm /dev/shm; mount -t devpts pts /dev/pts; mount -t tmpfs run /run
+fi
+mkdir -p "$XDG_RUNTIME_DIR" /var/lib/xkb && chmod 700 "$XDG_RUNTIME_DIR"
+: > $OUT
+
+cs() { read u _ < /proc/uptime; echo "${u%.*}${u#*.}"; }       # uptime in 1/100 s
+secs() { echo "$(($1 / 100)).$(($1 % 100 / 10))"; }
+mem_used_mb() {
+    awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%d", (t - a) / 1024 }' /proc/meminfo
+}
+disk_read_kib() {       # everything read from the disks so far
+    if [ -n "$linux" ]; then
+        awk '$3 ~ /^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|mmcblk[0-9]+)$/ { s += $6 } END { printf "%d", s / 2 }' /proc/diskstats
+    else
+        tr ' ' '\n' < /proc/kstat | awk -F= '$1 == "read_kib" { s += $2 } END { printf "%d", s }'
+    fi
+}
+titles() {              # every managed window's title
+    for id in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | sed 's/.*#//; s/,/ /g'); do
+        xprop -id "$id" _NET_WM_NAME WM_NAME 2>/dev/null
+    done
+}
+
+finish() {
+    if [ -n "$linux" ]; then
+        dev=$(findfs 'LABEL=KESTREL RPT' 2>/dev/null || blkid -L 'KESTREL RPT' 2>/dev/null)
+        mkdir -p /mnt/rpt
+        if [ -n "$dev" ] && mount -t vfat "$dev" /mnt/rpt; then
+            { cat $OUT; echo; echo "== kernel log =="; dmesg; } | sed 's/$/\r/' > /mnt/rpt/LINUX.TXT
+            sync; umount /mnt/rpt && say "results written to LINUX.TXT on the KESTREL RPT volume"
+        else
+            say "no KESTREL RPT volume: the results are only on the screen"
+        fi
+    else
+        cat $OUT > /dev/report && say "results written to REPORT.TXT on the KESTREL RPT volume"
+    fi
+    say "done; the computer can be turned off"
+    cat $OUT
+    [ -n "$linux" ] && [ $$ = 1 ] && while :; do sleep 1000; done
+    exit 0
+}
+
+if [ -n "$linux" ]; then
+    res "kernel   Linux $(uname -r)"
+else
+    res "kernel   Kestrel $(uname -r)"
+fi
+res "cpu      $(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo), $(grep -c '^processor' /proc/cpuinfo) CPUs"
+res "memory   $(awk '/^MemTotal:/ { printf "%d MB", $2 / 1024 }' /proc/meminfo)"
+if [ ! -x /usr/local/bin/firefox ] || ! command -v Xvfb >/dev/null; then
+    res "error    this root has no Firefox or no Xvfb: use the Firefox image"
+    finish
+fi
+
+# -nolock: the lock file is made with link(2), which Kestrel's tmpfs lacks
+Xvfb $DISPLAY -screen 0 1920x1080x24 -nolisten tcp -nolock >/tmp/xvfb.log 2>&1 &
+i=0
+while [ ! -S /tmp/.X11-unix/X9 ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+if [ ! -S /tmp/.X11-unix/X9 ]; then
+    res "error    Xvfb did not start; its log:"; sed 's/^/  /' /tmp/xvfb.log >> $OUT; finish
+fi
+openbox --sm-disable >/dev/null 2>&1 &
+i=0
+while ! xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q window && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+res "boot to desktop          $(secs $(cs)) s"
+sleep 10
+res "memory at idle desktop   $(mem_used_mb) MB"
+
+run=1
+while [ $run -le $RUNS ]; do
+    [ $run = 1 ] && what="cold" || what="warm"
+    d0=$(disk_read_kib)
+    s=$(cs)
+    firefox "file://$PAGE" >/tmp/ff$run.log 2>&1 &
+    ff=$!
+    win=; load=
+    while :; do
+        t=$(titles)
+        if [ -z "$win" ] && echo "$t" | grep -q 'Mozilla Firefox\|LOADED'; then win=$(($(cs) - s)); fi
+        if echo "$t" | grep -q LOADED; then load=$(($(cs) - s)); break; fi
+        if [ $(($(cs) - s)) -ge 30000 ]; then break; fi
+        sleep 0.2
+    done
+    d1=$(disk_read_kib)
+    if [ -n "$load" ]; then
+        res "firefox $run ($what)  window $(secs $win) s, page loaded $(secs $load) s, disk read $(((d1 - d0) / 1024)) MB"
+    else
+        res "firefox $run ($what)  gave up after 300 s (window: ${win:+$(secs $win) s}${win:-none}); $(tail -1 /tmp/ff$run.log)"
+    fi
+    kill $ff 2>/dev/null
+    i=0
+    while kill -0 $ff 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -9 $ff 2>/dev/null
+    sleep 5                         # its other processes leave too
+    run=$((run + 1))
+done
+finish

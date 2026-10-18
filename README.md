@@ -75,7 +75,7 @@ On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`modu
 | Esc | Leave the Tools block / cancel the F8 screen |
 | any key | Stops the 10-second countdown; the countdown line disappears, as in bootmgr |
 
-When the countdown reaches 0, the highlighted entry starts.
+When the countdown reaches 0, the highlighted entry starts. `kestrel.bootmgr=0` skips the boot manager and starts the first entry at once, for runs with no one at the keyboard (the benchmark).
 
 The tools are:
 - **Memory Diagnostic**: three-pattern test over up to 64 MiB of free RAM, with a progress bar.
@@ -478,13 +478,14 @@ The shell's `recovery` command opens the same console at any time. `bootvol` and
 | LBA 0 | GRUB `boot.img` plus the option-B marker |
 | From LBA 1 | `core.img`, carrying a `grub.cfg` with `kestrel.root=usb` in its memdisk; the BIOS limits `core.img` to 480 KiB, which the kernel outgrew, so `grub.cfg` finds the EFI System Partition by its volume serial (`search --fs-uuid`) and loads the kernel from there (without `mtools` on the build host the kernel stays in the memdisk) |
 | LBA 2048 | the `0x4B` partition with the header and a ustar of `rootfs/` |
-| then | an EFI System Partition (`0xEF`, 8 MiB) with `EFI/BOOT/BOOTX64.EFI` (GRUB x86_64-efi with the same memdisk, so the stick also boots on UEFI machines) and `boot/kernel.elf` |
+| then | an EFI System Partition (`0xEF`, 8 MiB; 48 MiB on the benchmark stick, which also carries Linux) with `EFI/BOOT/BOOTX64.EFI` (GRUB x86_64-efi with the same memdisk, so the stick also boots on UEFI machines) and `boot/kernel.elf` |
 | last 24 MiB | the FAT16 report volume `KESTREL RPT` (`0x0E`, first table entry so that every OS mounts it) |
 
 **Report volume.** Many machines have no serial port, so Kestrel writes its diagnostics to the stick it booted from (`kernel/report.c`):
 - **The files:** `REPORT.TXT` (2 MiB) holds the kernel version, firmware, command line, CPU, every driver's report section (the NVIDIA report, for one) and the complete kernel log. `VBIOS.ROM` (1 MiB) holds the graphics card's video BIOS.
 - **How it writes them:** the kernel finds the volume by its FAT label, follows the two files' cluster chains and overwrites only their data sectors. Sizes, the FAT and the directory never change, so the stick stays valid for every OS.
 - **When:** at every boot (`kestrel.report=0` turns this off), and on demand with the shell command `report`.
+- **From programs:** what is written to `/dev/report` (root only) becomes a section of its own, "written by programs (/dev/report)", up to 32 KiB, and each write saves `REPORT.TXT` at once. The benchmark leaves its results there.
 - **Write path:** USB mass storage got WRITE(10)/WRITE(16) and SYNCHRONIZE CACHE for this, and the block layer got `blk_write()`/`blk_flush()`, also wired to SATA and NVMe.
 
 Options:
@@ -570,7 +571,7 @@ proc/exec.c                  hardened ELF64 loader (PT_INTERP, W^X), System V in
 proc/process.c               fork/vfork/clone (threads), execve, wait4, sessions, signals
 fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), file objects,
                              getdents64, ramfs files, generated "pseudo" files
-              devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor,
+              devfs.c        /dev: null zero random urandom kmsg tty console ttyS0 report, fbN per monitor,
                              ptmx and pts/ (fs/pty.c)
                              (KFB_GET_INFO, KDSETMODE, KFB_BLIT, KFB_GET_MODES,
                              KFB_SET_MODE) (+ block devices)
@@ -596,7 +597,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               klog.c         dmesg ring buffer, panic()
               stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               vbe_emu.c      VBE calls into the video BIOS through the x86emu emulator (no real mode)
-              report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
+              report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume, /dev/report
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
@@ -623,6 +624,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               recovery.c     diagnostic trace + recovery console (keyboard and COM1)
 lib/crc32.c                  CRC-32 (GPT, volume header, payload)
 tools/mkusbimg.py            bootable USB stick image builder
+tools/mkbenchlinux.py        Ubuntu's kernel and an initramfs for the benchmark stick (benchlinux-init)
 ports/xlibre/                X server port: sysroot/server build scripts, hw-kestrel DDX, patches,
                              xdemo test client
 ports/icewm/                 IceWM build script and Kestrel configuration
@@ -1131,6 +1133,27 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 - Slow under emulation: in QEMU without KVM (4 CPUs), Firefox's window appears about 30 s after it is started and a small local page has loaded after about 40 s. It waits about 6 s in all for the big kernel lock during that time, down from 76 s before the scheduler, sockets, epoll and memory-map calls were taken off it.
 - Non-PIE programs (linked at a fixed address, such as Ubuntu's `python3.12`) do not load yet.
 - No GLX, no D-Bus daemon, no recording.
+
+## Benchmark: Kestrel against Linux
+
+The benchmark stick runs the same test on Kestrel and on Linux, on the same PC, from the same root file system, and writes both sets of numbers to its report volume.
+
+```sh
+apt-get download linux-image-unsigned-6.8.0-146-generic linux-modules-6.8.0-146-generic
+tools/mkbenchlinux.py benchlinux/ build/busybox-root/bin/busybox linux-*.deb
+make usbimg ROOTFS_BASE=ffroot.tar ROOTDISK_MB=2400 BENCH_LINUX=benchlinux/
+```
+
+`tools/mkbenchlinux.py` takes Ubuntu 24.04's generic kernel as it is and makes a small initramfs for it: Kestrel's static BusyBox, the modules that reach the stick (the USB host controllers, `usb-storage`, `uas`, `vfat` and its code pages, with what they depend on, read from each module's `.modinfo`), and `tools/benchlinux-init` as `/init`, which loads them, finds the ext2 volume labelled `kestrel-root`, mounts it and makes `/bin/kestrel-bench` the init. With `BENCH_LINUX` set, `make usbimg` puts the kernel and the initramfs on the EFI System Partition and adds two entries at the bottom of the GRUB menu (`boot/grub/grub-bench.cfg`):
+- **Benchmark: Kestrel:** `kestrel.bootmgr=0 linuxkpi.drm=0 kestrel.exec=/bin/sh,/bin/kestrel-bench`.
+- **Benchmark: Linux (Ubuntu 24.04's kernel):** GRUB's `linux` and `initrd` commands.
+
+`/bin/kestrel-bench` (from `rootfs/`, so in every image; it needs the Firefox root) does the same on both:
+- **Boot to desktop:** starts Xvfb at 1920x1080 and Openbox, and records the kernel's uptime once the window manager is up. Xvfb draws into memory, so the display driver plays no part on either side.
+- **Memory at the idle desktop:** MemTotal minus MemAvailable, 10 s later.
+- **Firefox,** three times on a local page (`/share/kestrel-bench/bench.html`), the first with a cold cache: the time to its first window and to the page's load event (the page then sets its title to `LOADED`, which the script watches with `xprop`), and what was read from the disks meanwhile (`/proc/kstat` on Kestrel, `/proc/diskstats` on Linux). A start that has not loaded the page after 300 s is recorded as given up.
+
+Kestrel writes the results through `/dev/report` into `REPORT.TXT`; Linux mounts the `KESTREL RPT` volume and writes `LINUX.TXT` next to it (CRLF), with its kernel log. Both also show them on the screen, and the PC can then be turned off.
 
 ## Linux drivers: the Linux KPI (`linuxkpi/`)
 

@@ -20,7 +20,8 @@
 # - GTK 3, GLib, Pango, cairo, fontconfig with the DejaVu fonts (all of
 #   them: Sans, Serif and Mono, their Condensed and ExtraLight faces), Mesa (llvmpipe
 #   through EGL), the X client libraries and tools (xdpyinfo, xeyes,
-#   glxinfo/eglinfo), D-Bus, gtk3-demo;
+#   glxinfo/eglinfo), D-Bus, gtk3-demo, and Xvfb (for /bin/kestrel-bench,
+#   the same X server on Kestrel and on Linux);
 # - sound: ALSA with its OSS plugin and an asound.conf that sends ALSA
 #   programs to Kestrel's /dev/dsp and /dev/mixer, and PulseAudio with
 #   module-oss on /dev/dsp (/etc/pulse/kestrel.pa), because Firefox's
@@ -45,7 +46,7 @@ PKGS="bash dash coreutils findutils grep sed gawk procps util-linux xz-utils zst
       libgl1-mesa-dri libegl1 libegl-mesa0 mesa-utils x11-utils x11-apps x11-xserver-utils
       fonts-dejavu-core fonts-dejavu-extra fontconfig hicolor-icon-theme adwaita-icon-theme librsvg2-common shared-mime-info
       libpci3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxcursor1 libxi6 libxtst6 libxss1
-      libdbus-glib-1-2 pulseaudio pulseaudio-utils libpulse0 libasound2-plugins"
+      libdbus-glib-1-2 pulseaudio pulseaudio-utils libpulse0 libasound2-plugins xvfb"
 # The LXDE desktop (lxde-core without the screen locker), its theme and
 # icons, and the archivers Xarchiver drives
 LXDE_PKGS="openbox-lxde-session lxpanel pcmanfm xarchiver lxrandr lxterminal lxappearance lxtask
