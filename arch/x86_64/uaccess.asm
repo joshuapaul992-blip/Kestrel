@@ -25,34 +25,84 @@ section .text
 ; -----------------------------------------------------------------------------
 ; size_t uaccess_copy(void *dst, const void *src, size_t n)
 ; Returns the number of bytes NOT copied (0 on success). One of dst/src is a
-; user address. `rep movsb` leaves rcx = bytes left when it faults.
+; user address. Copies of 64 bytes or more align dst to 8 with `rep movsb`,
+; move the bulk with `rep movsq` and the tail with `rep movsb`: QEMU's
+; software CPU runs `rep movsb` a byte at a time, and real CPUs are as fast
+; or faster with quadwords. Each string instruction leaves rcx = units left
+; when it faults; the fixups turn that into bytes left. A fault in the middle
+; of a quadword can report up to 7 bytes too few as copied.
 ; -----------------------------------------------------------------------------
 global uaccess_copy
 uaccess_copy:
     mov     rcx, rdx
-.copy:
+    cmp     rdx, 64
+    jb      .bytes
+    mov     rcx, rdi
+    neg     rcx
+    and     ecx, 7                      ; head: bytes up to dst's alignment
+    sub     rdx, rcx
+.head:
+    rep movsb
+    mov     rcx, rdx
+    shr     rcx, 3
+    and     edx, 7
+.quads:
+    rep movsq
+    mov     rcx, rdx
+.bytes:
     rep movsb
     xor     eax, eax
     ret
-.fault:
+.fault_head:
+    lea     rax, [rcx + rdx]
+    ret
+.fault_quads:
+    lea     rax, [rdx + rcx * 8]
+    ret
+.fault_bytes:
     mov     rax, rcx
     ret
-    EXTABLE uaccess_copy.copy, uaccess_copy.fault
+    EXTABLE uaccess_copy.head, uaccess_copy.fault_head
+    EXTABLE uaccess_copy.quads, uaccess_copy.fault_quads
+    EXTABLE uaccess_copy.bytes, uaccess_copy.fault_bytes
 
 ; -----------------------------------------------------------------------------
 ; size_t uaccess_clear(void *dst, size_t n): zero user memory; bytes NOT cleared
+; (quadwords for the bulk, as uaccess_copy)
 ; -----------------------------------------------------------------------------
 global uaccess_clear
 uaccess_clear:
     mov     rcx, rsi
     xor     eax, eax
-.store:
+    cmp     rsi, 64
+    jb      .bytes
+    mov     rcx, rdi
+    neg     rcx
+    and     ecx, 7
+    sub     rsi, rcx
+.head:
+    rep stosb
+    mov     rcx, rsi
+    shr     rcx, 3
+    and     esi, 7
+.quads:
+    rep stosq
+    mov     rcx, rsi
+.bytes:
     rep stosb
     ret                                 ; rax = 0
-.fault:
+.fault_head:
+    lea     rax, [rcx + rsi]
+    ret
+.fault_quads:
+    lea     rax, [rsi + rcx * 8]
+    ret
+.fault_bytes:
     mov     rax, rcx
     ret
-    EXTABLE uaccess_clear.store, uaccess_clear.fault
+    EXTABLE uaccess_clear.head, uaccess_clear.fault_head
+    EXTABLE uaccess_clear.quads, uaccess_clear.fault_quads
+    EXTABLE uaccess_clear.bytes, uaccess_clear.fault_bytes
 
 ; -----------------------------------------------------------------------------
 ; int64_t uaccess_strncpy(char *dst, const char *usrc, size_t max)
