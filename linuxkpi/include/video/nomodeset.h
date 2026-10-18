@@ -4,6 +4,6 @@
 
 #include <linux/types.h>
 
-bool video_firmware_drivers_only(void);        /* true unless linuxkpi.drm=1 (linuxkpi/src/drm.c) */
+bool video_firmware_drivers_only(void);        /* true with linuxkpi.drm=0 or Safe Mode (linuxkpi/src/drm.c) */
 
 #endif

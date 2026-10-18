@@ -2,13 +2,13 @@
  *
  * Every display driver registers one head per connected monitor: the boot
  * frame buffer (VBE/GOP, set up by GRUB) is head 0, and drivers that can set
- * modes themselves (drivers/video/bochs_dispi.c today, a native GPU driver
- * later) add further heads at their monitors' native resolutions. The TTY
+ * modes themselves (Linux's DRM drivers through the Linux KPI, Kestrel's own
+ * NVIDIA code) add further heads at their monitors' native resolutions. The TTY
  * layer (tty.h) gives each head its own terminal; nothing above this layer
  * assumes a global screen size.
  *
- * Heads use 8-bit colour channels in 32-bpp pixels (every GOP, GPU and
- * DISPI scan-out format) or, on some VBE firmware, packed 24-bpp pixels. */
+ * Heads use 8-bit colour channels in 32-bpp pixels (every GOP and GPU
+ * scan-out format) or, on some VBE firmware, packed 24-bpp pixels. */
 #ifndef KESTREL_DISPLAY_H
 #define KESTREL_DISPLAY_H
 
@@ -64,7 +64,12 @@ const struct display_head *display_get(int index);
 struct pci_device;
 const char *display_pci_owner(const struct pci_device *dev);
 
-/* linuxkpi.drm=1: a Linux driver takes over the adapter behind the boot
+/* Whether Linux's DRM drivers drive the displays: yes, unless the command
+ * line has linuxkpi.drm=0 or the boot manager's Safe Mode was chosen (both
+ * keep to the firmware's frame buffer). */
+bool display_linux_drm(void);
+
+/* With them on, a Linux driver takes over the adapter behind the boot
  * frame buffer. display_handover() stops all writes to its VRAM (returns
  * the monitor given up, or -1 if the boot frame buffer is not on `dev`);
  * the driver's first monitor then takes that monitor's place and terminal
@@ -83,8 +88,8 @@ int display_set_mode(int index, const struct display_mode *mode);
  * before this returns, so the old frame buffer may then be freed. */
 int display_update(int index, const struct display_head *head);
 
-/* Boot: head 0 from the boot frame buffer (g_fb), then every secondary
- * display adapter a driver knows how to program. Call after pci_init(). */
+/* Boot: head 0 from the boot frame buffer (g_fb), then the monitors of
+ * Kestrel's own NVIDIA code. Call after pci_init(). */
 void display_probe(void);
 
 #endif

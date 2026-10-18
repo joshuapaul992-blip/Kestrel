@@ -5,10 +5,10 @@
  * memory-backed files for GEM objects, and the CPU and memory facts DRM and
  * TTM ask about.
  *
- * Linux's bochs driver (and any later DRM driver) only binds when the kernel
- * command line has linuxkpi.drm=1: video_firmware_drivers_only() is how
- * DRM drivers ask whether they may take over a display. Without it Kestrel's
- * own drivers keep the screens. */
+ * Linux's DRM drivers (bochs, nouveau) bind by default; linuxkpi.drm=0 or
+ * the boot manager's Safe Mode keep them off (display_linux_drm()), and the
+ * firmware's frame buffer stays the only screen. video_firmware_drivers_only()
+ * is how DRM drivers ask whether they may take over a display. */
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -420,7 +420,7 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
 /* Linux drivers call this (through aperture_remove_conflicting_*) before
  * they take over an adapter, so the firmware frame buffer's driver lets go.
  * Adapters Kestrel drives itself are never offered to Linux drivers
- * (pci_dev->lkpi_native), but with linuxkpi.drm=1 the one behind the boot
+ * (pci_dev->lkpi_native), but the one behind the boot
  * frame buffer is: Kestrel stops drawing to it here, and the driver's first
  * monitor becomes monitor 0 (drm_kestrel.c). */
 void sysfb_disable(struct device *dev)
@@ -491,6 +491,7 @@ void lkpi_drm_core_init(void)
 {
     cpu_fill();
     radix_tree_node_cachep = kmem_cache_create("radix_tree_node", sizeof(struct xa_node), 0, 0, NULL);
-    lkpi_drm_enabled = lkpi_cmdline_flag("linuxkpi.drm");
-    if (lkpi_drm_enabled) printk(KERN_INFO "linuxkpi: DRM drivers may take over displays (linuxkpi.drm=1)\n");
+    lkpi_drm_enabled = lkpi_display_drm();
+    printk(KERN_INFO "linuxkpi: DRM drivers %s\n", lkpi_drm_enabled ? "may take over displays"
+           : "are off (linuxkpi.drm=0 or Safe Mode): the firmware's frame buffer only");
 }

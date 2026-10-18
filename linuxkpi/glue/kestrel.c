@@ -259,6 +259,8 @@ static int handover_watch(void *arg)
     return 0;
 }
 
+bool lkpi_display_drm(void) { return display_linux_drm(); }
+
 int lkpi_display_handover(void *handle)
 {
     int idx = display_handover(handle);
