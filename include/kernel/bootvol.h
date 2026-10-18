@@ -19,8 +19,10 @@
  *   kestrel.root=auto   (default) use a volume if one is attached; boot on
  *                       without one. Waits only while USB ports are settling.
  *   kestrel.root=usb    a volume on USB storage is REQUIRED: wait up to
- *                       rootwait for it, else recovery
- *   kestrel.root=any    same, any disk (USB or SATA)
+ *                       rootwait for it, else recovery. A virtio disk
+ *                       counts too: in a virtual machine that is where
+ *                       the stick image goes
+ *   kestrel.root=any    same, any disk (USB, SATA, NVMe or virtio)
  *   kestrel.root=none   skip discovery
  *   kestrel.rootwait=MS settle/wait budget (default 3000, max 60000)
  *   kestrel.uuid=UUID   accept only the volume with this UUID

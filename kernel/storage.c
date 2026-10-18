@@ -1,5 +1,5 @@
 /* kernel/storage.c -- glue between the PCI enumerator, the standalone AHCI
- * and NVMe drivers and the rest of Kestrel.
+ * and NVMe drivers, the virtio block driver and the rest of Kestrel.
  *
  *   storage_init()              boot: find AHCI and NVMe controllers via PCI,
  *                               enable MMIO + bus mastering, map the register
@@ -36,6 +36,7 @@
 #include "pci.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "virtio_blk.h"
 
 /* ---- platform hooks for the AHCI driver -------------------------------- */
 
@@ -248,6 +249,7 @@ void storage_init(void)
 {
     ahci_bringup();
     nvme_bringup();
+    virtio_blk_init();
 }
 
 /* Message-signalled interrupts, once the local APIC is up: a finished
@@ -265,6 +267,7 @@ void storage_enable_irqs(void)
         int v = nvme_pci[i] ? msi_enable(nvme_pci[i], nvme_msi, (void *)(uintptr_t)i, "nvme") : -1;
         if (v >= 0) nvme_enable_interrupts(i, msi_is_msix(v));
     }
+    virtio_blk_enable_irqs();
 }
 
 void storage_shutdown(void)
@@ -363,6 +366,7 @@ void storage_register_devices(void)
         struct blkdev *b = blk_register_disk("nvme", BLK_DISK_NVME, ns->model, ns->block_size, ns->blocks, &nvme_ops, ns);
         if (b) blk_scan_partitions(b);
     }
+    virtio_blk_register();
     for (int i = 0; i < ahci_disk_count() && i < 26; i++) {
         char name[8] = "sda";
         name[2] = (char)('a' + i);
@@ -386,5 +390,7 @@ size_t storage_summary(char *buf, size_t cap)
     }
     if (nvme_namespace_count() && n < cap)
         n += (size_t)snprintf(buf + n, cap - n, "; %d NVMe namespace(s)", nvme_namespace_count());
+    if (virtio_blk_count() && n < cap)
+        n += (size_t)snprintf(buf + n, cap - n, "; %d virtio disk(s)", virtio_blk_count());
     return n;
 }

@@ -1,4 +1,4 @@
-/* include/kernel/storage.h -- block storage bring-up (AHCI and NVMe via PCI) */
+/* include/kernel/storage.h -- block storage bring-up (AHCI, NVMe and virtio via PCI) */
 #ifndef KESTREL_STORAGE_H
 #define KESTREL_STORAGE_H
 

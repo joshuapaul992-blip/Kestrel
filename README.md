@@ -364,6 +364,17 @@ Not implemented yet:
 - SGLs, metadata and end-to-end protection
 - Write Zeroes, Dataset Management (TRIM) and namespace management
 
+## virtio block driver (`drivers/virtio/`)
+
+The paravirtual disk of QEMU, KVM and most other hypervisors (PCI `1af4:1042`, or `1af4:1001` with subsystem 2), through the modern virtio 1.x interface.
+- **Requests:** one split virtqueue of up to 128 entries. A request is one descriptor chain: the 16-byte header, the data in as many segments as the device allows (`seg_max`, `size_max`; QEMU takes 126 segments of up to 1 MiB), and the status byte. Reads, writes and cache flushes (`VIRTIO_BLK_F_FLUSH`); a read-only device (`VIRTIO_BLK_F_RO`) refuses writes.
+- **Completion:** the queue gets MSI-X table entry 0 once the local APIC is up, and a request sleeps until that interrupt wakes it. Before then, or on a device without MSI-X, the driver polls the used ring.
+- **Block layer:** each device becomes `vd0`, `vd1`, … with MBR/GPT partitions (`vd0p4`). Boot volume discovery counts a virtio disk as USB storage, so the stick image boots as a virtual machine's disk: `qemu-system-x86_64 -machine q35 -drive file=kestrel-usb.img,format=raw,if=virtio`.
+
+Tested in QEMU 8.2 (`-device virtio-blk-pci`) under SeaBIOS: booting the small stick from a virtio disk, and all 11 regression suites on 4 CPUs.
+
+Not implemented yet: more than one request in flight, multiple queues, discard and write zeroes.
+
 ## xHCI USB driver (`drivers/usb/`)
 
 `xhci.h`, `usb.h` and `xhci.c` are standalone in the same way as the other drivers. Kestrel connects them in `kernel/usbhost.c`.
@@ -450,7 +461,7 @@ Once a header is found, its payload CRC is verified (unless `kestrel.rootverify=
 | Command line | Meaning |
 |---|---|
 | `kestrel.root=auto` (default) | Mount a volume if one is attached. Waits only while USB ports are still settling. |
-| `kestrel.root=usb` / `any` | The volume is **required** (USB disks only, or any disk). Wait up to `rootwait`, else recovery. |
+| `kestrel.root=usb` / `any` | The volume is **required** (USB disks only, or any disk). Wait up to `rootwait`, else recovery. A virtio disk counts as USB, so the stick image boots as a virtual machine's disk. |
 | `kestrel.root=none` | Skip discovery. |
 | `kestrel.rootwait=MS` | Wait budget, default 3000, max 60000. |
 | `kestrel.uuid=UUID` | Accept only this volume. |
@@ -547,6 +558,7 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
               nvme/          standalone NVMe driver: admin + I/O queue pair, PRP lists (nvme.h, nvme.c)
+              virtio/        virtio block driver: one virtqueue, MSI-X completion (virtio_blk.c)
               gpu/nvidia/    NVIDIA stage 1: VBIOS parser (nvbios.c), probe (nvidia.c): chip, VBIOS,
                              DP AUX/DPCD/EDID, firmware display state; host tests in test/
               net/           Ethernet cards: virtio_net.c, e1000.c (Intel 8254x/8257x), rtl8139.c,
@@ -612,8 +624,8 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               coreutils/     pwd cd ls mkdir rmdir touch rm cp mv cat head tail grep echo
                              chmod chown date uname neofetch (+ cu_lib.c helpers, table.c)
               ramdisk.c      Multiboot2 modules as read-only /dev/ramN (the ISO's boot volume)
-              storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
-                             NVMe self-test and shutdown, MSI hookup
+              storage.c      PCI -> AHCI, NVMe and virtio glue, boot-time MBR verify, /dev/sdX,
+                             nvmeN, vdN, NVMe self-test and shutdown, MSI hookup
               msi.c          MSI/MSI-X: vectors 0x50-0x6F for PCI devices, /proc/interrupts lines
               usbhost.c      PCI -> xHCI glue, key injection, mouse position, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
@@ -907,7 +919,7 @@ make usbimg
 - **Processes ending** (`proc/process.c`, `proc/task.c`): the process tree has a spinlock of its own (`proc_lock`) over parent links, thread counts, exit statuses and their collection, and the waits for them (`wait4`, `vfork`, `execve` ending the other threads, the kernel's `task_wait`). `exit`, `exit_group`, `wait4` and `waitid` run without the big lock: a thread that is not its process's last one ends without touching it at all, and the last one takes it only to close the process's descriptors and to send `SIGCHLD`. A parent collects a child's status under the tree's lock as soon as the child's last thread has left, and the zombie's kernel stack and state are freed under the big lock only if it is free at that moment; otherwise the next idle CPU frees them, and an idle CPU that finds the lock busy looks again after the next interrupt instead of waiting for it.
 - **Interrupts** never spin for the big lock. A disk's MSI, or the boot CPU's tick hooks and interval timers, that find it busy post their work (`bkl_defer()`), and the holder runs it as it lets go. Ticks on every CPU account and preempt without it.
 - **Memory.** The frame allocator and the kernel heap have spinlocks of their own. Most user page faults (a zero-filled page, a copy on write, a file page the page cache holds) are resolved straight from the exception under a per-address-space spinlock that the address-space changes wait for; a fault that needs the disk goes the slow way. Kernel mutexes are safe without the big lock.
-- **Disk I/O** does not hold it while the device works: USB, SATA and NVMe commands sleep until the controller's MSI wakes them (`io_pause()`/`io_wake()`).
+- **Disk I/O** does not hold it while the device works: USB, SATA, NVMe and virtio commands sleep until the controller's MSI wakes them (`io_pause()`/`io_wake()`).
 
 The lock order is: the file tree's lock, then a volume's mutex, then the big lock (a task that holds the big lock and has to wait for the tree sleeps, which lets the big lock go), then an address space's mutex, then object locks (the epoll lock before the watched files' locks; a pty's lock; `proc_lock`), then `sched_lock`, then the heap and frame allocator. Still under the big lock: the block devices under the file systems, `/dev/console` and the other devices, `ioctl` on them and the network ioctls, `statfs`, `truncate`, process creation, `execve`, signals sent to other processes, networking and most kernel threads. `/proc/kstat` shows how long each CPU holds the lock and waits for it, and `/proc/kprof` who waits for it (below).
 
