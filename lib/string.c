@@ -14,9 +14,20 @@ void *memset(void *dst, int c, size_t n)
     return dst;
 }
 
+/* Large copies align dst to 8 and move quadwords (`rep movsq`), then the
+ * tail bytes: QEMU's software CPU runs `rep movsb` a byte at a time, and
+ * real CPUs are no slower with quadwords. */
 void *memcpy(void *dst, const void *src, size_t n)
 {
     void *ret = dst;
+    if (n >= 64) {
+        size_t head = -(uintptr_t)dst & 7, q;
+        n -= head;
+        __asm__ volatile("rep movsb" : "+D"(dst), "+S"(src), "+c"(head) :: "memory");
+        q = n >> 3;
+        n &= 7;
+        __asm__ volatile("rep movsq" : "+D"(dst), "+S"(src), "+c"(q) :: "memory");
+    }
     __asm__ volatile("rep movsb" : "+D"(dst), "+S"(src), "+c"(n) :: "memory");
     return ret;
 }
