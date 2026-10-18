@@ -10,9 +10,19 @@
  * dropped. The name table is the big lock's (bind, connect and the last
  * close all run under it).
  *
+ * Data is copied once each way, between the ring and the caller's memory
+ * (user memory, which may fault), with the lock dropped. A sender claims
+ * the free space after the data (`filling`), copies into it and then
+ * makes it visible by adding to rx_count; a receiver claims the data
+ * (`draining`), copies it out and then consumes it. Readers never touch
+ * the free space and writers never touch the data, so one of each can
+ * copy at the same time; a second sender or receiver waits for its turn.
+ *
  * Lifetime: a usock lives while its file is open, or while it sits
  * unaccepted in a listener's queue. Closing detaches it from its peer
- * (which then reads EOF and gets EPIPE on write) and frees it. Names are
+ * (which then reads EOF and gets EPIPE on write) and frees it, unless a
+ * sender is copying into its ring: that sender holds a reference (`refs`)
+ * and the last reference frees it. Names are
  * kept in a small table: abstract names directly, path names by the inode
  * of their VSOCK node, so a socket file that was unlinked or replaced can
  * no longer be reached even if its vnode memory is reused.
@@ -74,6 +84,9 @@ struct usock {
     struct umsg *msgs, *msgs_tail;      /* marks, in stream order             */
     int      nmsgs;
     struct ucred cred;                  /* of the process that created it */
+    int      refs;                      /* its file (or queue slot), copying senders */
+    bool     dead;                      /* closed; freed with the last reference */
+    bool     filling, draining;         /* a sender / receiver is copying, unlocked */
 };
 
 static struct {
@@ -97,6 +110,7 @@ static struct usock *usock_new(int type)
     struct usock *s = kzalloc(sizeof *s);
     if (!s) return NULL;
     s->type = type;
+    s->refs = 1;
     s->rx = kmalloc(SOCK_BUF);
     if (!s->rx) { kfree(s); return NULL; }
     strlcpy(s->vn.name, "socket", sizeof s->vn.name);
@@ -131,6 +145,14 @@ static struct umsg *umsg_pop(struct usock *s)
     return m;
 }
 
+/* Drop a reference (lock held); the last one frees. */
+static void put_locked(struct usock *s)
+{
+    if (--s->refs) return;
+    kfree(s->rx);
+    kfree(s);
+}
+
 /* Detach from the peer and free (lock held). Undelivered descriptors go
  * on *dead, to be closed once the lock is dropped. */
 static void destroy_locked(struct usock *s, struct umsg **dead)
@@ -145,8 +167,8 @@ static void destroy_locked(struct usock *s, struct umsg **dead)
         wakeup(s->peer);
     }
     wakeup(s);
-    kfree(s->rx);
-    kfree(s);
+    s->dead = true;
+    put_locked(s);
 }
 
 static void usock_destroy(struct usock *s)
@@ -345,29 +367,22 @@ int usock_accept(struct file *f, int flags, struct file **out, struct sockaddr_u
     return 0;
 }
 
-/* Copy n bytes into p's ring at its tail (lock held, room checked). */
-static void ring_put(struct usock *p, const void *buf, size_t n)
+/* Copy n bytes between a ring, from position pos (wrapping), and io; out =
+ * from the ring to io. No lock held: the caller has claimed that part of
+ * the ring (filling or draining). */
+static int ring_copy(uint8_t *ring, size_t pos, struct sock_io *io, size_t n, bool out)
 {
-    size_t tail = (p->rx_head + p->rx_count) % SOCK_BUF;
-    size_t first = n < SOCK_BUF - tail ? n : SOCK_BUF - tail;
-    memcpy(p->rx + tail, buf, first);
-    memcpy(p->rx, (const uint8_t *)buf + first, n - first);
-    p->rx_count += n;
-    p->rx_in += n;
+    size_t first = n < SOCK_BUF - pos ? n : SOCK_BUF - pos;
+    if (sock_io_copy(io, ring + pos, first, out)) return -EFAULT;
+    if (n > first && sock_io_copy(io, ring, n - first, out)) return -EFAULT;
+    return 0;
 }
 
-static void ring_get(struct usock *s, void *buf, size_t n, bool consume)
+static void ring_consume(struct usock *s, size_t n)
 {
-    size_t first = n < SOCK_BUF - s->rx_head ? n : SOCK_BUF - s->rx_head;
-    if (buf) {
-        memcpy(buf, s->rx + s->rx_head, first);
-        memcpy((uint8_t *)buf + first, s->rx, n - first);
-    }
-    if (consume) {
-        s->rx_head = (s->rx_head + n) % SOCK_BUF;
-        s->rx_count -= n;
-        s->rx_out += n;
-    }
+    s->rx_head = (s->rx_head + n) % SOCK_BUF;
+    s->rx_count -= n;
+    s->rx_out += n;
 }
 
 static void umsg_append(struct usock *p, struct umsg *m)
@@ -383,10 +398,12 @@ static struct umsg *umsg_new(int nfiles)
     return kzalloc(sizeof(struct umsg) + (size_t)nfiles * sizeof(struct file *));
 }
 
-/* Send len bytes; on success the socket takes over the references in
- * files[] (delivered with the first byte). On failure they stay the
- * caller's. Records go whole or not at all. */
-long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struct file **files, int nfiles)
+/* Send len bytes from io; on success the socket takes over the references
+ * in files[] (delivered with the first byte). On failure they stay the
+ * caller's. Records go whole or not at all. A stream send returns once
+ * all is queued, or with what was queued when it would block, a signal
+ * came or the copy faulted. */
+long usock_sendmsg(struct file *f, struct sock_io *io, size_t len, int flags, struct file **files, int nfiles)
 {
     struct usock *s = us(f);
     bool nb = (f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT);
@@ -406,6 +423,7 @@ long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struc
     for (;;) {
         struct usock *p = s->peer;
         if (!p || p->shut_rd) { r = -EPIPE; break; }
+        if (p->filling) { sleep_on_locked(p, &lock); continue; }   /* another sender's turn */
         size_t room = SOCK_BUF - p->rx_count;
         bool fits = records(s) ? room >= len : room > 0;
         if (m && p->nmsgs >= MAX_MSGS) fits = false;
@@ -416,15 +434,29 @@ long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struc
             continue;
         }
         size_t n = len - done < room ? len - done : room;
+        size_t tail = (p->rx_head + p->rx_count) % SOCK_BUF;   /* the receiver moves the head, not the tail */
+        p->filling = true;
+        p->refs++;
+        spin_unlock_irqrestore(&lock, fl);
+        int e = ring_copy(p->rx, tail, io, n, false);
+        fl = spin_lock_irqsave(&lock);
+        p->filling = false;
+        wakeup(p);                                      /* the next sender; readers, below */
+        if (e || p->dead) {                             /* nothing of this piece was queued */
+            put_locked(p);
+            r = e ? e : -EPIPE;
+            break;
+        }
         if (m) {                                        /* the mark goes with the first byte */
             m->pos = p->rx_in;
             for (int i = 0; i < nfiles; i++) m->files[i] = files[i];
             umsg_append(p, m);
             m = NULL;
         }
-        ring_put(p, (const uint8_t *)buf + done, n);
+        p->rx_count += n;
+        p->rx_in += n;
+        put_locked(p);
         done += n;
-        wakeup(p);
         if (done == len) break;
     }
 out:
@@ -436,13 +468,14 @@ out:
 
 long usock_send(struct file *f, const void *buf, size_t len, int flags)
 {
-    return usock_sendmsg(f, buf, len, flags, NULL, 0);
+    struct sock_io io = SOCK_IO_KERNEL(buf);
+    return usock_sendmsg(f, &io, len, flags, NULL, 0);
 }
 
-/* Receive up to len bytes. Descriptors that came with them are stored in
- * files[] (up to maxfiles; the rest are closed and MSG_CTRUNC set) and
- * their number in *nfiles; the caller owns those references. */
-long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file **files, int *nfiles,
+/* Receive up to len bytes into io. Descriptors that came with them are
+ * stored in files[] (up to maxfiles; the rest are closed and MSG_CTRUNC
+ * set) and their number in *nfiles; the caller owns those references. */
+long usock_recvmsg(struct file *f, struct sock_io *io, size_t len, int flags, struct file **files, int *nfiles,
                    int maxfiles, int *msg_flags)
 {
     struct usock *s = us(f);
@@ -454,6 +487,7 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
     uint64_t fl = spin_lock_irqsave(&lock);
     if (s->state != US_CONNECTED && !s->peer_gone) { spin_unlock_irqrestore(&lock, fl); return -ENOTCONN; }
     for (;;) {
+        if (s->draining) { sleep_on_locked(s, &lock); continue; }  /* another receiver's turn */
         bool have = records(s) ? s->msgs != NULL : s->rx_count > 0;
         if (have) break;
         long r = 0;
@@ -465,16 +499,16 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
         return r;
     }
     struct umsg *m = s->msgs;
+    size_t n, take;                                     /* bytes to copy out, to consume */
     long ret;
     if (records(s)) {                                   /* one whole record */
-        size_t n = len < m->len ? len : m->len;
-        ring_get(s, buf, n, false);
+        n = len < m->len ? len : m->len;
         if (n < m->len && msg_flags) *msg_flags |= MSG_TRUNC;
         ret = (flags & MSG_TRUNC) ? (long)m->len : (long)n;
-        if (!peek) ring_get(s, NULL, m->len, true);
-        else m = NULL;
+        take = peek ? 0 : m->len;
+        if (peek) m = NULL;
     } else {                                            /* bytes up to the next mark */
-        size_t n = len < s->rx_count ? len : s->rx_count;
+        n = len < s->rx_count ? len : s->rx_count;
         if (m && m->pos > s->rx_out) {                  /* a mark ahead: stop before it */
             if (m->pos - s->rx_out < n) n = (size_t)(m->pos - s->rx_out);
             m = NULL;
@@ -483,9 +517,22 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
             if (nx && nx->pos - s->rx_out < n) n = (size_t)(nx->pos - s->rx_out);
             if (peek) m = NULL;
         }
-        ring_get(s, buf, n, !peek);
+        take = peek ? 0 : n;
         ret = (long)n;
     }
+    if (n && io) {                                      /* senders only add after the data */
+        s->draining = true;
+        spin_unlock_irqrestore(&lock, fl);
+        int e = ring_copy(s->rx, s->rx_head, io, n, true);
+        fl = spin_lock_irqsave(&lock);
+        s->draining = false;
+        if (e) {                                        /* left queued */
+            wakeup(s);
+            spin_unlock_irqrestore(&lock, fl);
+            return e;
+        }
+    }
+    if (take) ring_consume(s, take);
     if (m) {                                            /* consumed: hand over its descriptors */
         umsg_pop(s);
         for (int i = 0; i < m->nfiles; i++) {
@@ -493,7 +540,7 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
             else if (msg_flags) *msg_flags |= MSG_CTRUNC;
         }
     }
-    if (!peek) wakeup(s);                               /* writers waiting for room */
+    wakeup(s);                                          /* writers waiting for room, the next receiver */
     spin_unlock_irqrestore(&lock, fl);
     if (m) umsg_free(m);                                /* closes any not handed over */
     return ret;
@@ -501,7 +548,8 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
 
 long usock_recv(struct file *f, void *buf, size_t len, int flags)
 {
-    return usock_recvmsg(f, buf, len, flags, NULL, NULL, 0, NULL);
+    struct sock_io io = SOCK_IO_KERNEL(buf);
+    return usock_recvmsg(f, buf ? &io : NULL, len, flags, NULL, NULL, 0, NULL);
 }
 
 int usock_shutdown(struct file *f, int how)

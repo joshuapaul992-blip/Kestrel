@@ -135,11 +135,14 @@ static int get_path(uint64_t up, char *buf)
 }
 
 /* ---- file I/O ------------------------------------------------------------- */
+static int64_t sock_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags, bool send);
+
 /* Read through a bounce buffer. Regular files are read until the request is
  * satisfied or EOF; anything else (pipes, sockets, terminals, devices) gets
  * exactly one read, so the call returns as soon as some data is there. */
 static int64_t read_to_user(struct file *f, uint64_t ubuf, uint64_t len)
 {
+    if (usock_is(f)) return sock_xfer(f, ubuf, len, 0, false);     /* no bounce buffer */
     if (!len) return 0;
     if (!ubuf_ok(ubuf, len)) return -EFAULT;
     size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
@@ -164,6 +167,7 @@ static int64_t read_to_user(struct file *f, uint64_t ubuf, uint64_t len)
  * write comes up short (non-blocking pipe full, disk full, ...). */
 static int64_t write_from_user(struct file *f, uint64_t ubuf, uint64_t len)
 {
+    if (usock_is(f)) return sock_xfer(f, ubuf, len, 0, true);
     if (!len) return vfs_write(f, "", 0);
     if (!ubuf_ok(ubuf, len)) return -EFAULT;
     size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
@@ -1233,10 +1237,10 @@ static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t len, uint64_t umask,
     return (first & 1) ? 0 : -EINVAL;                   /* CPU 0 must be in it */
 }
 
-struct iovec { uint64_t base, len; };
-
 /* readv/writev: the vector is copied in whole, then each segment goes
- * through the same bounce-buffered path as read/write. */
+ * through the same bounce-buffered path as read/write. On an AF_UNIX
+ * socket the whole vector is one send or receive (one record, on the
+ * record types), copied straight to or from the ring. */
 static int64_t rw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, bool wr)
 {
     if (cnt > 1024) return -EINVAL;
@@ -1250,6 +1254,15 @@ static int64_t rw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, bool wr)
     for (uint64_t i = 0; i < cnt; i++) {
         if ((int64_t)v[i].len < 0 || sum + v[i].len < sum) { total = -EINVAL; goto out; }
         sum += v[i].len;
+    }
+    if (usock_is(f)) {
+        if (sum > 0x7ffff000) { total = -EINVAL; goto out; }
+        for (uint64_t i = 0; i < cnt; i++)
+            if (v[i].len && !ubuf_ok(v[i].base, v[i].len)) { total = -EFAULT; goto out; }
+        struct sock_io io = SOCK_IO_USER(v, cnt);
+        total = wr ? usock_sendmsg(f, &io, (size_t)sum, 0, NULL, 0)
+                   : usock_recvmsg(f, &io, (size_t)sum, 0, NULL, NULL, 0, NULL);
+        goto out;
     }
     for (uint64_t i = 0; i < cnt; i++) {
         if (!v[i].len) continue;
@@ -2019,33 +2032,17 @@ static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t f
 static int64_t sys_accept(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; return sys_accept4(fd, addr, lenp, 0, a5, a6); }
 
-/* Socket data through a bounce buffer: one send/receive per chunk, a stream
- * send continues until all is queued (or it would block, with MSG_DONTWAIT
- * after the first chunk). */
+/* AF_UNIX data, copied once between the caller's buffer and the socket's
+ * ring. A stream send queues everything (or what fits without blocking);
+ * a receive returns what one call gets. */
 static int64_t sock_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags, bool send)
 {
-    if (!len) return send ? usock_send(f, "", 0, flags) : usock_recv(f, NULL, 0, flags);
-    if (!ubuf_ok(ubuf, len)) return -EFAULT;
-    size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
-    uint8_t *kb = kmalloc(chunk);
-    if (!kb) return -ENOMEM;
-    int64_t total = 0;
-    while ((uint64_t)total < len) {
-        size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
-        long n;
-        if (send) {
-            if (copy_from_user(kb, (const void *)(ubuf + (uint64_t)total), want)) { if (!total) total = -EFAULT; break; }
-            n = usock_send(f, kb, want, flags | (total ? MSG_DONTWAIT : 0));
-        } else {
-            n = usock_recv(f, kb, want, flags | (total ? MSG_DONTWAIT : 0));
-            if (n > 0 && copy_to_user((void *)(ubuf + (uint64_t)total), kb, (size_t)n)) { if (!total) total = -EFAULT; break; }
-        }
-        if (n < 0) { if (!total) total = n; break; }
-        total += n;
-        if ((size_t)n < want || !send) break;           /* a receive returns what is there */
-    }
-    kfree(kb);
-    return total;
+    if (len && !ubuf_ok(ubuf, len)) return -EFAULT;
+    if (len > 0x7ffff000) len = 0x7ffff000;             /* Linux's limit for one call */
+    struct iovec v = { ubuf, len };
+    struct sock_io io = SOCK_IO_USER(&v, 1);
+    return send ? usock_sendmsg(f, &io, (size_t)len, flags, NULL, 0)
+                : usock_recvmsg(f, &io, (size_t)len, flags, NULL, NULL, 0, NULL);
 }
 
 /* AF_INET data through a bounce buffer. A datagram goes whole (up to 64 KiB);
@@ -2134,20 +2131,23 @@ struct msghdr_k {
 #define CMSG_HDR        16                              /* u64 len, i32 level, i32 type */
 #define MAX_CONTROL     8192
 
-struct msg_cursor { const struct iovec *v; uint64_t n, i, off; };
-
-/* Copy between the bounce buffer and the iovecs at the cursor. */
-static int iov_xfer(struct msg_cursor *c, uint8_t *kb, size_t len, bool to_user)
+int sock_io_copy(struct sock_io *c, void *k, size_t len, bool out)
 {
+    uint8_t *kb = k;
+    if (!c->v) {                                        /* kernel memory */
+        if (out) memcpy(c->kbuf + c->off, kb, len); else memcpy(kb, c->kbuf + c->off, len);
+        c->off += len;
+        return 0;
+    }
     size_t done = 0;
     while (done < len && c->i < c->n) {
         uint64_t room = c->v[c->i].len - c->off;
         if (!room) { c->i++; c->off = 0; continue; }
-        size_t k = len - done < room ? len - done : (size_t)room;
+        size_t n = len - done < room ? len - done : (size_t)room;
         void *u = (void *)(c->v[c->i].base + c->off);
-        if (to_user ? copy_to_user(u, kb + done, k) : copy_from_user(kb + done, u, k)) return -EFAULT;
-        done += k;
-        c->off += k;
+        if (out ? copy_to_user(u, kb + done, n) : copy_from_user(kb + done, u, n)) return -EFAULT;
+        done += n;
+        c->off += n;
     }
     return 0;
 }
@@ -2201,7 +2201,7 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
     }
     bool stream = inet_type(f) == SOCK_STREAM;
     if (!stream && send && len > 65535) { total = -EMSGSIZE; goto out; }
-    struct msg_cursor cur = { v, m->iovlen, 0, 0 };
+    struct sock_io cur = SOCK_IO_USER(v, m->iovlen);
     size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
     if (!stream && !send) chunk = 65536;
     if (!(kb = kmalloc(chunk ? chunk : 1))) { total = -ENOMEM; goto out; }
@@ -2212,7 +2212,7 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
         }
         do {
             size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
-            if (iov_xfer(&cur, kb, want, false)) { if (!total) total = -EFAULT; break; }
+            if (sock_io_copy(&cur, kb, want, false)) { if (!total) total = -EFAULT; break; }
             long n = inet_sendto(f, kb, want, (int)flags, m->name && m->namelen ? &to : NULL, m->namelen);
             if (n < 0) { if (!total) total = n; break; }
             total += n;
@@ -2224,7 +2224,7 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
         long n = inet_recvfrom(f, kb, chunk < len ? chunk : (size_t)len, (int)flags, &from, &mflags);
         if (n < 0) { total = n; goto out; }
         size_t got = (size_t)n < len ? (size_t)n : (size_t)len;
-        if (iov_xfer(&cur, kb, got, true)) { total = -EFAULT; goto out; }
+        if (sock_io_copy(&cur, kb, got, true)) { total = -EFAULT; goto out; }
         total = n;
         if (m->name) {
             uint32_t nl = m->namelen < sizeof from ? m->namelen : (uint32_t)sizeof from;
@@ -2252,7 +2252,6 @@ static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
     if (inet_is(f)) { rc = inet_msg_io(f, &m, umsg, flags, send); fput(f); return rc; }
     struct iovec *v = m.iovlen ? kmalloc(m.iovlen * sizeof *v) : NULL;
     uint8_t *ctl = m.controllen ? kmalloc(m.controllen) : NULL;
-    uint8_t *kb = NULL;
     struct file *files[SCM_MAX_FD];
     int nfiles = 0;
     int64_t total = 0;
@@ -2264,35 +2263,21 @@ static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
         if (v[i].len && !ubuf_ok(v[i].base, v[i].len)) { total = -EFAULT; goto out; }
         len += v[i].len;
     }
-    struct msg_cursor cur = { v, m.iovlen, 0, 0 };
-    size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
-    if (!(kb = kmalloc(chunk ? chunk : 1))) { total = -ENOMEM; goto out; }
+    struct sock_io cur = SOCK_IO_USER(v, m.iovlen);    /* copied once, straight to or from the ring */
 
     if (send) {
         if (m.controllen) {
             if (copy_from_user(ctl, (const void *)m.control, m.controllen)) { total = -EFAULT; goto out; }
             if ((total = take_rights(ctl, m.controllen, files, &nfiles))) goto out;
         }
-        int type = 0; uint32_t tl = sizeof type;
-        usock_getsockopt(f, SOL_SOCKET, SO_TYPE, &type, &tl);
-        if (type != SOCK_STREAM && len > IO_CHUNK) { total = -EMSGSIZE; goto out; }
-        do {                                            /* stream: piece by piece */
-            size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
-            if (iov_xfer(&cur, kb, want, false)) { if (!total) total = -EFAULT; break; }
-            long n = usock_sendmsg(f, kb, want, (int)flags | (total ? MSG_DONTWAIT : 0), files, nfiles);
-            if (n < 0) { if (!total) total = n; break; }
-            nfiles = 0;                                 /* the socket has them now */
-            total += n;
-            if ((size_t)n < want) break;
-        } while ((uint64_t)total < len);
+        total = usock_sendmsg(f, &cur, len, (int)flags, files, nfiles);
+        if (total >= 0) nfiles = 0;                     /* the socket has them now */
     } else {
         int maxfiles = m.controllen >= CMSG_HDR + 4 ? (int)((m.controllen - CMSG_HDR) / 4) : 0;
         if (maxfiles > SCM_MAX_FD) maxfiles = SCM_MAX_FD;
         int mflags = 0;
-        long n = usock_recvmsg(f, kb, chunk, (int)flags, files, &nfiles, maxfiles, &mflags);
+        long n = usock_recvmsg(f, &cur, len, (int)flags, files, &nfiles, maxfiles, &mflags);
         if (n < 0) { total = n; goto out; }
-        size_t got = (size_t)n < chunk ? (size_t)n : chunk;       /* MSG_TRUNC may report more */
-        if (iov_xfer(&cur, kb, got, true)) { total = -EFAULT; goto out; }
         total = n;
         uint64_t clen = 0;
         if (nfiles) {                                   /* install, then describe them */
@@ -2322,7 +2307,6 @@ static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
     }
 out:
     close_files(files, nfiles);                         /* not sent / not installed */
-    kfree(kb);
     kfree(ctl);
     kfree(v);
     fput(f);

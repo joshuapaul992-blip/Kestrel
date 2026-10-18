@@ -734,14 +734,14 @@ Kestrel runs x86_64 ELF programs in ring 3, statically or dynamically linked (`p
 **Unix-domain sockets** (`fs/unixsock.c`): `AF_UNIX` / `SOCK_STREAM`, the way X11 connects clients locally, plus `SOCK_SEQPACKET` and `SOCK_DGRAM` socket pairs.
 - **Names:** a path in the file system (a socket node, e.g. `/tmp/.X11-unix/X0`) or Linux's abstract namespace (`sun_path[0] == 0`), which xtrans tries first.
 - **Connecting:** `connect` completes at once by queueing a socket on the listener, and `accept` hands it out.
-- **Data:** each direction has a 64 KiB buffer, with blocking, `O_NONBLOCK`/`MSG_DONTWAIT`, `MSG_PEEK`, EOF, `EPIPE`, `FIONREAD` and `poll` readiness as on Linux.
+- **Data:** each direction has a 64 KiB buffer, with blocking, `O_NONBLOCK`/`MSG_DONTWAIT`, `MSG_PEEK`, EOF, `EPIPE`, `FIONREAD` and `poll` readiness as on Linux. Data is copied once each way: straight from the sender's memory into the buffer, and from the buffer into the receiver's memory, with no kernel bounce buffer (`read`, `write`, `readv`, `writev`, `send`, `recv`, `sendmsg` and `recvmsg` alike). On the record types `writev` sends the whole vector as one record.
 - **Credentials:** `SO_PEERCRED` reports the pid/uid/gid of the process that created the peer.
 - **Messages:** `SOCK_SEQPACKET` (sockets and pairs) and `SOCK_DGRAM` (pairs) keep record boundaries; a short buffer truncates the record and sets `MSG_TRUNC`.
 - **Descriptor passing:** `SCM_RIGHTS` on every type. The descriptors in flight are counted references to the open files; they arrive with the bytes they were sent with (a stream read never runs past them), `MSG_CMSG_CLOEXEC` works, and without room for them they are closed and `MSG_CTRUNC` is set. Up to 253 per message.
 - **Not yet:** unconnected datagram sockets (`sendto` with an address), and a garbage collector for sockets sent through themselves (in-flight descriptors are bounded per socket instead).
 
 `user/socktest.c` (`/boot/bin/socktest`) checks all of this, in one process or as two:
-- `socktest`: 20 checks in one process.
+- `socktest`: 25 checks in one process, including `readv`/`writev`, bad buffers (`EFAULT` with nothing lost) and two processes sending on one socket.
 - `socktest server` with `socktest client`: a real server and client, started together with `kestrel.exec=/boot/bin/socktest,server+/boot/bin/socktest,client` (`+` separates programs).
 
 **Processes** (`proc/process.c`, `include/kernel/process.h`):
