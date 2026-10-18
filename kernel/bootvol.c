@@ -236,7 +236,7 @@ static int try_disk(struct blkdev *disk)
 static bool wanted(const struct blkdev *b)
 {
     if (b->parent || b->removed) return false;
-    if (!strcmp(st.policy, "usb")) return b->kind == BLK_DISK_USB;
+    if (!strcmp(st.policy, "usb")) return b->kind == BLK_DISK_USB || b->kind == BLK_DISK_VIRTIO;   /* a VM's "stick" */
     return true;                                    /* auto / any */
 }
 

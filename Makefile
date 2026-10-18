@@ -54,7 +54,7 @@ CFLAGS := -std=gnu11 -O2 -g -pipe \
           -m64 -march=x86-64 -mcmodel=small -mno-red-zone \
           -mno-mmx -mno-sse -mno-sse2 -mno-80387 -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/gpu/nvidia -MMD -MP
+          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/virtio -Idrivers/usb -Idrivers/gpu/nvidia -MMD -MP
 # -mcmodel=small: the kernel is linked/identity-mapped at 2 MiB (below 2 GiB).
 # A future higher-half move (0xFFFFFFFF80000000) would switch to -mcmodel=kernel.
 
@@ -71,7 +71,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/sys
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/pci/pci.c \
-           drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
+           drivers/ahci/ahci.c drivers/nvme/nvme.c drivers/virtio/virtio_blk.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c \
