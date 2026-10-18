@@ -57,6 +57,9 @@ void bkl_enter(void)
     uint64_t f = irq_save();                            /* no migration, no nesting mid-acquire */
     struct percpu *c = this_cpu();
     if (c->bkl_depth == 0) {
+#ifdef LOCKCHECK
+        lockcheck_acquire((void *)&bkl_word, NULL, LC_BKL, false, (uint64_t)__builtin_return_address(0));
+#endif
         if (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) {
             uint64_t t0 = rdtsc();
             do {

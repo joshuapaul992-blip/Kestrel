@@ -430,6 +430,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
 
     pmm_init(mbi);
     heap_init(KERNEL_HEAP_SIZE);
+    lockcheck_selftest();       /* make LOCKCHECK=1: the checker sees a cycle made on purpose */
     time_init(mbi);             /* HPET / calibrated TSC: timeouts that work before sti */
     /* Page 0 becomes a guard page: a kernel NULL-pointer access faults (and
      * is reported) instead of scribbling over low memory. ACPI's search of

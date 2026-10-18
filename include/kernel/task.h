@@ -157,6 +157,10 @@ struct tcb {
     int       on_cpu;           /* until its registers are saved at a switch-out    */
     struct kstat_task ks;       /* performance counters (kstat.h)            */
     int       fault_kind;       /* what the page fault in progress did (enum kfault) */
+#ifdef LOCKCHECK
+    struct lc_held_task lc_held[LC_TASK_DEPTH];     /* sleeping locks held (lockcheck.h) */
+    int       lc_n;
+#endif
 };
 
 /* shared process state (proc/task.c) */

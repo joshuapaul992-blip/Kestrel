@@ -111,6 +111,7 @@ int pipe_create(struct file **rd, struct file **wr, int flags)
 {
     struct pipe *p = kzalloc(sizeof *p);
     if (!p) return -ENOMEM;
+    lockcheck_name(&p->lock, "pipe");
     struct vnode *v[2] = { &p->rd, &p->wr };
     for (int i = 0; i < 2; i++) {
         strlcpy(v[i]->name, i ? "pipe:[w]" : "pipe:[r]", sizeof v[i]->name);

@@ -1424,6 +1424,7 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
 {
     struct e2fs *fs = kzalloc(sizeof *fs);
     if (!fs) return -ENOMEM;
+    lockcheck_name(&fs->lock, "ext2 volume");
     fs->dev = dev;
     int r = -EINVAL;
     if (blk_read_bytes(dev, 1024, fs->sb, sizeof fs->sb) < 0) { r = -EIO; goto fail; }

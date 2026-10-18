@@ -7,8 +7,9 @@
 #     manager are up (Kestrel's boot manager is skipped: kestrel.bootmgr=0)
 #   - memory in use at the idle desktop: MemTotal - MemAvailable
 #   - three Firefox starts on a local page, the first from a cold cache:
-#     time to its first window and to the page's load event, and what was
-#     read from the disk meanwhile
+#     time to its first window and to the page's load event, what was
+#     read from the disk meanwhile, and on Kestrel how long the CPUs
+#     waited for the big kernel lock
 #
 # Both kernels run the same X server, Xvfb (it draws into memory, so no
 # display driver takes part), and Openbox. The results go to the stick's
@@ -45,6 +46,9 @@ disk_read_kib() {       # everything read from the disks so far
     else
         tr ' ' '\n' < /proc/kstat | awk -F= '$1 == "read_kib" { s += $2 } END { printf "%d", s }'
     fi
+}
+lock_wait_ms() {        # Kestrel: time all CPUs spent waiting for the big kernel lock
+    awk '$1 == "lock" { for (i = 2; i <= NF; i++) if (sub(/^wait_us=/, "", $i)) printf "%d", $i / 1000 }' /proc/kstat
 }
 titles() {              # every managed window's title
     for id in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | sed 's/.*#//; s/,/ /g'); do
@@ -101,6 +105,7 @@ run=1
 while [ $run -le $RUNS ]; do
     [ $run = 1 ] && what="cold" || what="warm"
     d0=$(disk_read_kib)
+    [ -z "$linux" ] && l0=$(lock_wait_ms)
     s=$(cs)
     firefox "file://$PAGE" >/tmp/ff$run.log 2>&1 &
     ff=$!
@@ -113,8 +118,9 @@ while [ $run -le $RUNS ]; do
         sleep 0.2
     done
     d1=$(disk_read_kib)
+    lw=; [ -z "$linux" ] && lw=", big-lock wait $(secs $((($(lock_wait_ms) - l0) / 10))) s"
     if [ -n "$load" ]; then
-        res "firefox $run ($what)  window $(secs $win) s, page loaded $(secs $load) s, disk read $(((d1 - d0) / 1024)) MB"
+        res "firefox $run ($what)  window $(secs $win) s, page loaded $(secs $load) s, disk read $(((d1 - d0) / 1024)) MB$lw"
     else
         res "firefox $run ($what)  gave up after 300 s (window: ${win:+$(secs $win) s}${win:-none}); $(tail -1 /tmp/ff$run.log)"
     fi

@@ -4,6 +4,7 @@
 #define KESTREL_KMUTEX_H
 
 #include <stdbool.h>
+#include <kernel/lockcheck.h>
 
 struct tcb;
 
@@ -14,6 +15,7 @@ struct kmutex {
     struct tcb *owner;
     int         depth;
     int         waiters;            /* asleep in kmutex_lock: unlock wakes them */
+    LOCKCHECK_TAG
 };
 void        kmutex_lock(struct kmutex *m);
 void        kmutex_unlock(struct kmutex *m);
@@ -29,6 +31,7 @@ struct krwlock {
     struct tcb *writer;
     int         wwait;              /* writers waiting                       */
     int         waiters;            /* asleep, readers and writers           */
+    LOCKCHECK_TAG
 };
 void        krw_rlock(struct krwlock *l);
 void        krw_runlock(struct krwlock *l);

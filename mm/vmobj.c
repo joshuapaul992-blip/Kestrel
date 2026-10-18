@@ -15,6 +15,8 @@ struct vm_object *vmobj_new(uint64_t size)
     if (size > VMOBJ_MAX_SIZE) return NULL;
     struct vm_object *o = kzalloc(sizeof *o);
     if (!o) return NULL;
+    lockcheck_name(&o->lock, "vm object pages");
+    lockcheck_name(&o->wlock, "vm object writers");
     o->refs = 1;
     o->size = size;
     return o;

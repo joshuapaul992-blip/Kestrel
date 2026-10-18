@@ -105,7 +105,7 @@ const char *task_state_name(enum task_state s)
 struct files_struct *files_new(void)
 {
     struct files_struct *f = kzalloc(sizeof *f);
-    if (f) f->refs = 1;
+    if (f) { f->refs = 1; lockcheck_name(&f->lock, "descriptor table"); }
     return f;
 }
 
@@ -463,6 +463,7 @@ void sched_switch_tail(void)
 void schedule(void)
 {
     if (!running) return;
+    lockcheck_schedule((uint64_t)__builtin_return_address(0));
     struct tcb *prev = cur;
     uint64_t f = spin_lock_irqsave(&sched_lock);
     need_resched = false;
@@ -659,12 +660,15 @@ static struct spinlock kmutex_spin;
 
 void kmutex_lock(struct kmutex *m)
 {
+    if (m->owner == cur) { m->depth++; return; }    /* ours already: only we change it */
+#ifdef LOCKCHECK
+    lockcheck_acquire(m, &m->lc, LC_MUTEX, false, (uint64_t)__builtin_return_address(0));
+#endif
     struct tcb *none = NULL;
     if (__atomic_compare_exchange_n(&m->owner, &none, cur, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         m->depth = 1;                           /* free: taken without the spinlock */
         return;
     }
-    if (none == cur) { m->depth++; return; }    /* ours already: only we change it */
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
     m->waiters++;
     for (;;) {
@@ -681,6 +685,9 @@ void kmutex_unlock(struct kmutex *m)
 {
     if (m->owner != cur) panic("kmutex_unlock: not the owner (pid %d)", cur->pid);
     if (--m->depth > 0) return;
+#ifdef LOCKCHECK
+    lockcheck_release(m, LC_MUTEX);
+#endif
     /* A waiter counts itself and re-checks the owner under kmutex_spin, so
      * a release under it either is seen or is followed by the wakeup. */
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
@@ -695,6 +702,9 @@ bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
  * sleep on the lock's address. */
 void krw_rlock(struct krwlock *l)
 {
+#ifdef LOCKCHECK
+    lockcheck_acquire(l, &l->lc, LC_RWLOCK, false, (uint64_t)__builtin_return_address(0));
+#endif
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
     while (l->writer || l->wwait) {
         l->waiters++;
@@ -707,6 +717,9 @@ void krw_rlock(struct krwlock *l)
 
 void krw_runlock(struct krwlock *l)
 {
+#ifdef LOCKCHECK
+    lockcheck_release(l, LC_RWLOCK);
+#endif
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
     if (--l->readers == 0 && l->waiters) wakeup_waiters(l);
     spin_unlock_irqrestore(&kmutex_spin, f);
@@ -714,6 +727,9 @@ void krw_runlock(struct krwlock *l)
 
 void krw_wlock(struct krwlock *l)
 {
+#ifdef LOCKCHECK
+    lockcheck_acquire(l, &l->lc, LC_RWLOCK, false, (uint64_t)__builtin_return_address(0));
+#endif
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
     l->wwait++;
     while (l->writer || l->readers) {
@@ -728,6 +744,9 @@ void krw_wlock(struct krwlock *l)
 
 void krw_wunlock(struct krwlock *l)
 {
+#ifdef LOCKCHECK
+    lockcheck_release(l, LC_RWLOCK);
+#endif
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
     if (l->writer != cur) panic("krw_wunlock: not the writer (pid %d)", cur->pid);
     l->writer = NULL;
@@ -856,6 +875,7 @@ void task_sleep_ms(uint64_t ms)
 void task_exit(int code)
 {
     cur->exit_code = code;
+    lockcheck_task_exit();
     /* User threads: clear_child_tid + futex wake, robust futexes -- while
      * the address space is still there (this touches user memory). */
     if (cur->user) { sti(); process_thread_exit(cur); }

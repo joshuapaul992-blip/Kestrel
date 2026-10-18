@@ -164,6 +164,7 @@ size_t kstat_gen(char *buf, size_t cap)
       kstat_us(sum.irq_cyc), tlb_all, ipi_all);
     P("lock acquired=%lu contended=%lu wait_us=%lu hold_us=%lu\n", sum.lock_acq, sum.lock_spin_n,
       kstat_us(sum.lock_spin_cyc), kstat_us(sum.lock_hold_cyc));
+    n += lockcheck_gen_stat(buf + n, n < cap ? cap - n : 0);
     P("sched switches=%lu\n", sched_context_switches());
     P("syscalls slow=%lu fast=%lu cpu_us=%lu\n", sum.sys_n, sum.fast_n, kstat_us(sum.sys_cyc));
     P("faults");

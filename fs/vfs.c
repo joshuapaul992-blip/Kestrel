@@ -901,6 +901,7 @@ static int open_node(struct vnode *vn, int flags, bool created, struct file **ou
     struct file *f = kzalloc(sizeof *f);
     if (!f) { r = -ENOMEM; goto out; }
     f->vn = vn; f->flags = flags; f->refcnt = 1;
+    lockcheck_name(&f->pos_lock, "file position");
     vfs_vnode_get(vn);
     *out = f;
     r = 0;
@@ -1141,6 +1142,7 @@ struct file *vfs_file_new(struct vnode *vn, int flags)
     struct file *f = kzalloc(sizeof *f);
     if (!f) return NULL;
     f->vn = vn; f->flags = flags; f->refcnt = 1;
+    lockcheck_name(&f->pos_lock, "file position");
     vfs_vnode_get(vn);
     return f;
 }

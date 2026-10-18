@@ -67,7 +67,7 @@ BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
            arch/x86_64/trampoline.asm arch/x86_64/vdso_blob.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/pci/pci.c \
@@ -179,6 +179,14 @@ OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,
           $(LKPI_OBJS) $(LKPI_DRV_OBJS) $(LKPI_DRM_OBJS) $(if $(LKPI_NOUVEAU),$(LKPI_NV_OBJS))
 KERNEL := $(BUILD)/kernel.elf
 ISO    := $(BUILD)/kestrel.iso
+
+# make LOCKCHECK=1: the lock-order checker (include/kernel/lockcheck.h) in
+# the kernel. Switching it on or off rebuilds the kernel's own files (the
+# lock structures change size); the Linux KPI has locks of its own.
+LOCKCHECK ?=
+ifeq ($(LOCKCHECK),1)
+CFLAGS += -DLOCKCHECK
+endif
 FLOPPY := $(BUILD)/kestrel-floppy.img
 
 QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
@@ -200,7 +208,7 @@ ROOTDISK    := $(BUILD)/rootdisk.ext2
 all: $(KERNEL)
 
 # ---- compile & link
-$(BUILD)/%.o: %.c
+$(BUILD)/%.o: %.c $(BUILD)/lockcheck.stamp
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
@@ -287,6 +295,10 @@ $(KERNEL): $(OBJS) linker.ld tools/ksyms.py $(BUILD)/ksyms0.o $(BUILD)/nouveau.s
 	@nm -n $@ | grep ' [Tt] ' | cmp -s - $(BUILD)/kernel.pass1.text || \
 	    { echo "ksyms: function addresses moved between the two links"; exit 1; }
 	@echo "  kernel: $$(stat -c %s $@) bytes"
+
+$(BUILD)/lockcheck.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(LOCKCHECK)' | cmp -s - $@ || echo '$(LOCKCHECK)' > $@
 
 # Relinks the kernel when LKPI_NOUVEAU is switched on or off.
 $(BUILD)/nouveau.stamp: FORCE

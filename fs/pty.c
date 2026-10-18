@@ -283,6 +283,7 @@ static int ptmx_open(struct vnode *vn, int flags, struct file **out)
     p->used = true;
     p->locked = true;
     p->index = idx;
+    lockcheck_name(&p->lock, "pty");
     pty_defaults(p);
     spin_unlock_irqrestore(&alloc_lock, fl);
 

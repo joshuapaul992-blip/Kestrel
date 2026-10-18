@@ -291,6 +291,8 @@ struct mm *mm_create(void)
 {
     struct mm *mm = kzalloc(sizeof *mm);
     if (!mm) return NULL;
+    lockcheck_name(&mm->lock, "mm");
+    lockcheck_name(&mm->fast, "mm fast faults");
     mm->pml4 = uvm_create();
     if (!mm->pml4) { kfree(mm); return NULL; }
     mm->users = 1;

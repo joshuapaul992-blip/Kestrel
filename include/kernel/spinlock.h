@@ -12,12 +12,16 @@
 
 #include <stdint.h>
 #include <kernel/cpu.h>
+#include <kernel/lockcheck.h>
 
-struct spinlock { volatile uint32_t locked; };
+struct spinlock { volatile uint32_t locked; LOCKCHECK_TAG };
 
 static inline uint64_t spin_lock_irqsave(struct spinlock *l)
 {
     uint64_t f = irq_save();
+#ifdef LOCKCHECK
+    lockcheck_acquire(l, &l->lc, LC_SPIN, false, 0);    /* 0: the code it is inlined in */
+#endif
     while (__atomic_exchange_n(&l->locked, 1, __ATOMIC_ACQUIRE))
         while (__atomic_load_n(&l->locked, __ATOMIC_RELAXED)) cpu_relax();   /* spin on a read, not a locked op */
     return f;
@@ -25,6 +29,9 @@ static inline uint64_t spin_lock_irqsave(struct spinlock *l)
 
 static inline void spin_unlock_irqrestore(struct spinlock *l, uint64_t f)
 {
+#ifdef LOCKCHECK
+    lockcheck_release(l, LC_SPIN);
+#endif
     __atomic_store_n(&l->locked, 0, __ATOMIC_RELEASE);
     irq_restore(f);
 }
@@ -32,6 +39,9 @@ static inline void spin_unlock_irqrestore(struct spinlock *l, uint64_t f)
 /* Release the lock but keep interrupts off (the caller restores them). */
 static inline void spin_unlock_keep_irqs(struct spinlock *l)
 {
+#ifdef LOCKCHECK
+    lockcheck_release(l, LC_SPIN);
+#endif
     __atomic_store_n(&l->locked, 0, __ATOMIC_RELEASE);
 }
 
