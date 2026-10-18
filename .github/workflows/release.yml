@@ -1,0 +1,85 @@
+# Release images: pushing a tag v* (or creating a release with a new tag on
+# GitHub) builds the ISO, the USB stick and the Firefox stick with
+# tools/release.sh and attaches them to that tag's release, creating the
+# release (with generated notes; a pre-release when the tag has a "-", as in
+# v0.3.3-alpha1) if there is none yet. "Run workflow" rebuilds a tag's images.
+# A pull request that changes this file or tools/release.sh builds the
+# images as a check and keeps them as a workflow artifact for a week.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and attach the images to (for example v0.3.3)
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/release.sh
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Version
+        id: v
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch) tag=$INPUT_TAG ;;
+            push)              tag=$GITHUB_REF_NAME ;;
+            *)                 tag=pr$PR ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install the build packages
+        run: sudo tools/release.sh --deps
+
+      - name: Build the images
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: sudo tools/release.sh "$VERSION" out
+
+      - name: Attach the images to the release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            pre=
+            case "$TAG" in *-*) pre=--prerelease ;; esac
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes $pre
+          fi
+          gh release upload "$TAG" out/* --clobber
+
+      - name: Keep the images
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: images
+          path: out/
+          retention-days: 7
