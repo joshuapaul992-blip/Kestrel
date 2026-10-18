@@ -13,7 +13,7 @@ Because I want to prove that vibe-coding operating systems isn't always a bad id
 
 ## Overview
 
-Kestrel (0.3.2-alpha1, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
+Kestrel (0.3.2, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -61,6 +61,8 @@ The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial 
 - **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, then LXDE where the root file system has it (the Firefox image, see "glibc programs, GTK and Firefox"), otherwise IceWM and an xterm. Logout in the desktop's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
 - **Text console:** a login shell (`/bin/sh`) on every monitor's terminal, no X. Type `startx` there for the desktop.
 - **Desktop** and **text console, basic display:** the same with `linuxkpi.drm=0`. Linux's DRM drivers (nouveau, bochs) drive the screens by default, the boot screen included (see "Phase 2" under "Linux drivers: the Linux KPI"); the basic display keeps to the firmware's frame buffer, one monitor at the mode GRUB set, as a fallback when a driver misbehaves. The boot manager's Safe Mode does the same.
+
+**Releases** are built by GitHub Actions (`.github/workflows/release.yml`). Pushing a tag such as `v0.3.3`, or publishing a release with a new tag on GitHub, runs `tools/release.sh` on Ubuntu 24.04. The script downloads every source and builds the ports, the Firefox root and three images, all with nouveau and NVIDIA's firmware. The images are `kestrel-<version>.iso`, `kestrel-<version>-usb.img.xz` and `kestrel-<version>-firefox-usb.img.xz`, the last with LXDE, Firefox and the benchmark entries. They are attached to the tag's release with `SHA256SUMS` and `LICENCE.nvidia`. If the tag has no release yet, one is created with generated notes, and a tag with a `-` (`v0.3.3-alpha1`) makes it a pre-release. "Run workflow" on the Release workflow rebuilds a tag's images. The same script runs locally as root on Ubuntu 24.04: `tools/release.sh --deps`, then `tools/release.sh 0.3.3 out/`. Pushes to `main` and pull requests get a quicker check (`.github/workflows/build.yml`): the kernel with and without nouveau, its Multiboot2 header and the unit tests.
 
 On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`module2 /boot/kestrel.vol`). `kernel/ramdisk.c` turns each module into a read-only `/dev/ramN`, and the usual boot-volume discovery mounts it on `/boot`, found through the volume's sector-0 signature. `tools/mkusbimg.py --ramdisk` writes that volume file. This has been checked under BIOS and UEFI (OVMF) in QEMU.
 
@@ -209,7 +211,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.2-alpha1`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.2`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
