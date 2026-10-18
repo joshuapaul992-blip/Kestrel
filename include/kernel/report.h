@@ -7,8 +7,8 @@
  * overwrites their contents in place:
  *
  *   REPORT.TXT   header (version, firmware, command line, CPU), every
- *                registered section (e.g. the NVIDIA report) and the
- *                complete kernel log
+ *                registered section (e.g. the NVIDIA report, text written
+ *                to /dev/report) and the complete kernel log
  *   VBIOS.ROM    a registered binary blob (the graphics card's video BIOS)
  *
  * File sizes, the FAT and the directory are never changed, so the volume
@@ -32,5 +32,9 @@ bool report_locate(void);
 int  report_save(const char *reason);
 /* One line for the shell: where the report goes, or why it cannot. */
 const char *report_where(void);
+/* /dev/report: text written there by programs (the benchmark's results)
+ * is kept, at most 32 KiB in all, as a section of REPORT.TXT, which is
+ * rewritten on every write. Returns len or -errno. */
+long report_user_write(const void *buf, size_t len);
 
 #endif

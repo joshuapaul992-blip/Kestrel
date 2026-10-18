@@ -7,6 +7,7 @@
 #include <kernel/console.h>
 #include <kernel/keyboard.h>
 #include <kernel/serial.h>
+#include <kernel/report.h>
 #include <kernel/fb.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
@@ -147,6 +148,14 @@ static ssize_t serial_dev_write(struct vnode *v, const void *buf, size_t n, uint
     return (ssize_t)n;
 }
 static const struct vnode_ops serial_ops = { .read = null_read, .write = serial_dev_write };
+
+/* ---- report: text for REPORT.TXT on the boot stick (report.h) ----------- */
+static ssize_t report_dev_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
+{
+    (void)v; (void)o;
+    return report_user_write(buf, n);
+}
+static const struct vnode_ops report_ops = { .read = null_read, .write = report_dev_write };
 
 /* ---- kmsg -------------------------------------------------------------- */
 static ssize_t kmsg_read(struct vnode *v, void *buf, size_t n, uint64_t off)
@@ -332,6 +341,7 @@ void devfs_init(const char *mountpoint)
         add_tty(r, name, 0620, MKDEV(4, (uint32_t)(i + 1)), &tty_ops, tty_get(i));
     }
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
+    add_dev(r, "report",  0600, MKDEV(10, 240), &report_ops);
     for (int i = 0; i < tty_count; i++) {              /* one per monitor */
         char name[8];
         snprintf(name, sizeof name, "fb%d", i);

@@ -489,9 +489,21 @@ $(ROOTDISK): $(ROOTFS_STAGE).stamp $(BUILD)/rootbase.stamp $(ROOTFS_BASE) tools/
 
 USBIMG := $(BUILD)/kestrel-usb.img
 USBIMG_FLAGS ?=
+# BENCH_LINUX=<dir from tools/mkbenchlinux.py>: the benchmark stick. Linux
+# (vmlinuz, initrd.gz) goes on the EFI System Partition, and GRUB's menu
+# starts with "Benchmark: Kestrel" and "Benchmark: Linux", which both run
+# /bin/kestrel-bench (boot/grub/grub-bench.cfg). Use it with the Firefox
+# root (ROOTFS_BASE), which has Firefox and Xvfb.
+BENCH_LINUX ?=
+ESP_MB := $(if $(BENCH_LINUX),48,8)
 USBIMG_ROOT  := $(if $(MKE2FS),$(ROOTDISK))
-USBIMG_SIZE  ?= $(if $(MKE2FS),$(shell echo $$(($(ROOTDISK_MB) + 64))),64)
-$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp $(USBIMG_ROOT)
+USBIMG_SIZE  ?= $(shell echo $$(($(if $(MKE2FS),$(ROOTDISK_MB),0) + 56 + $(ESP_MB))))
+$(BUILD)/bench.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(abspath $(BENCH_LINUX))' | cmp -s - $@ || echo '$(abspath $(BENCH_LINUX))' > $@
+
+$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg boot/grub/grub-bench.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp \
+           $(BUILD)/bench.stamp $(USBIMG_ROOT) $(if $(BENCH_LINUX),$(BENCH_LINUX)/vmlinuz $(BENCH_LINUX)/initrd.gz)
 	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
 	@rm -rf $(BUILD)/usbdir $(BUILD)/usb-esp.img
 	@mkdir -p $(BUILD)/usbdir/boot/grub
@@ -500,25 +512,29 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).
 	@# for the kernel. Without mtools it goes into the memdisk instead.
 	@serial=$$(od -An -N4 -tx4 /dev/urandom | tr -d ' '); \
 	if [ -d "$(GRUB_LIB)/x86_64-efi" ] && command -v mformat >/dev/null; then \
-	    truncate -s 8M $(BUILD)/usb-esp.img && \
-	    MTOOLS_SKIP_CHECK=1 mformat -i $(BUILD)/usb-esp.img -T 16384 -h 64 -s 32 -v KESTREL_EFI -N $$serial :: && \
+	    truncate -s $(ESP_MB)M $(BUILD)/usb-esp.img && \
+	    MTOOLS_SKIP_CHECK=1 mformat -i $(BUILD)/usb-esp.img -T $$(($(ESP_MB) * 2048)) -h 64 -s 32 -v KESTREL_EFI -N $$serial :: && \
 	    MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD)/usb-esp.img ::/EFI ::/EFI/BOOT ::/boot && \
-	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(STRIPPED) ::/boot/kernel.elf; \
-	else cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf; fi; \
+	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(STRIPPED) ::/boot/kernel.elf && \
+	    if [ -n "$(BENCH_LINUX)" ]; then MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD)/usb-esp.img ::/boot/linux && \
+	        MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BENCH_LINUX)/vmlinuz $(BENCH_LINUX)/initrd.gz ::/boot/linux/; fi; \
+	else test -z "$(BENCH_LINUX)" || { echo "error: BENCH_LINUX needs mtools and GRUB's x86_64-efi files"; exit 1; }; \
+	    cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf; fi; \
 	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
+	    $(if $(BENCH_LINUX),-e '/@BENCH_ENTRIES@/r boot/grub/grub-bench.cfg') -e '/@BENCH_ENTRIES@/d' \
 	    boot/grub/grub-usb.cfg > $(BUILD)/usbdir/boot/grub/grub.cfg
 	@tar --format=ustar -C $(BUILD)/usbdir -cf $(BUILD)/usb-memdisk.tar boot
 	@echo "  GRUB    core.img (USB, memdisk)"
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/usb-core.img \
 	    -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
 	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb test \
-	    part_msdos part_gpt fat search
+	    part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux)
 	@if [ -f $(BUILD)/usb-esp.img ]; then \
 	    echo "  GRUB    BOOTX64.EFI (USB, memdisk)"; \
 	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(BUILD)/usb-bootx64.efi \
 	        -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
 	        memdisk tar normal configfile multiboot2 efi_gop efi_uga video video_fb test \
-	        part_msdos part_gpt fat search && \
+	        part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux) && \
 	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
 	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
 	@echo "  USBIMG  $@"

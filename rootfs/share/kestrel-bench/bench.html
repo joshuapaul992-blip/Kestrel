@@ -1,0 +1,9 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>loading</title>
+<style>body{font-family:sans-serif;background:#eef;margin:2em} .g{width:200px;height:80px;border-radius:8px;background:linear-gradient(90deg,#c33,#33c)}</style>
+</head><body><h1>Kestrel benchmark</h1><p>Firefox start-up timing page.</p><div class="g"></div><canvas id="c" width="200" height="90"></canvas>
+<script>
+const x = document.getElementById('c').getContext('2d');
+x.fillStyle = '#2a2'; x.beginPath(); x.arc(45, 45, 40, 0, 7); x.fill();
+window.addEventListener('load', () => { document.title = 'LOADED'; });
+</script></body></html>

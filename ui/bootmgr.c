@@ -575,6 +575,10 @@ struct boot_choice bootmgr_run(void)
     uint64_t deadline = uptime_ms() + BOOTMGR_TIMEOUT_SEC * 1000ull;
     int shown = BOOTMGR_TIMEOUT_SEC;
 
+    /* kestrel.bootmgr=0: no menu, the first entry at once (unattended runs
+     * such as the benchmark, whose boot time should not include a countdown) */
+    if (strstr(g_boot.cmdline, "kestrel.bootmgr=0")) return launch(0, 0);
+
     keyboard_flush();
     draw_main(focus, sel_os, sel_tool, shown);
 

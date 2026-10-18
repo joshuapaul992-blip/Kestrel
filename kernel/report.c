@@ -264,3 +264,29 @@ int report_save(const char *reason)
         kprintf("report: writing to %s failed: %s\n", vol->name, blk_strerror(rc));
     return rc;
 }
+
+/* ---- /dev/report: text from programs ---------------------------------------- */
+#define USER_TEXT_MAX   (32 * 1024)
+static char   user_text[USER_TEXT_MAX];
+static size_t user_len;
+static bool   user_section;
+
+static size_t user_section_text(char *buf, size_t cap)
+{
+    size_t n = user_len < cap ? user_len : cap;
+    memcpy(buf, user_text, n);
+    return n;
+}
+
+long report_user_write(const void *buf, size_t len)
+{
+    if (!user_section) {
+        report_add_section("written by programs (/dev/report)", user_section_text);
+        user_section = true;
+    }
+    size_t k = len < USER_TEXT_MAX - user_len ? len : USER_TEXT_MAX - user_len;
+    memcpy(user_text + user_len, buf, k);
+    user_len += k;
+    int rc = report_save("written through /dev/report");
+    return rc ? rc : (long)len;
+}
