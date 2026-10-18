@@ -119,19 +119,6 @@ static void user_fault(struct int_frame *f)
     case 6:  sig = SIGILL;  code = ILL_ILLOPN; addr = f->rip; break;
     case 7:  sig = SIGILL;  code = SI_KERNEL; break;
     case 11: case 12: sig = SIGBUS; break;              /* segment / stack-segment not present */
-    case 14: {
-        addr = read_cr2();
-        sti();                                          /* resolving may sleep (file read, OOM) */
-        int r = vm_fault(addr, f->error, true);         /* demand paging, copy-on-write */
-        cli();
-        if (r == 0) return;
-        if (r == -EIO) { sig = SIGBUS; code = 2; break; }   /* BUS_ADRERR: past the end of a file */
-        if (r == -ENOMEM) return;                       /* SIGKILL is pending (OOM) */
-        /* Like Linux: anything outside the user half (the kernel's own
-         * supervisor-only mappings included) is "not mapped" for the process. */
-        code = r == -EACCES ? SEGV_ACCERR : SEGV_MAPERR;
-        break;
-    }
     case 16: sig = SIGFPE;  code = FPE_FLTINV; addr = f->rip; break;
     case 17: sig = SIGBUS;  code = BUS_ADRALN; break;
     case 19: sig = SIGFPE;  code = simd_code(); addr = f->rip; break;
@@ -139,6 +126,28 @@ static void user_fault(struct int_frame *f)
     default: break;                                     /* #GP, #OF, #BR, #TS: SIGSEGV */
     }
     signal_force_fault(sig, code, addr, (uint32_t)f->vector, f->error);
+}
+
+/* A page fault in ring 3 that vm_fault_fast() left: resolved without the big
+ * lock (demand paging from the disk, copy-on-write under memory pressure),
+ * which is taken only for a signal to raise or deliver on the way back. */
+static void user_page_fault(struct int_frame *f, uint64_t addr)
+{
+    sti();                                              /* resolving may sleep (file read, OOM) */
+    int r = vm_fault(addr, f->error, true);
+    cli();
+    if (r == 0 && !signal_pending()) return;
+    bkl_enter();
+    if (r == -EIO) {
+        signal_force_fault(SIGBUS, 2, addr, 14, f->error);     /* BUS_ADRERR: past the end of a file */
+    } else if (r && r != -ENOMEM) {                     /* -ENOMEM: SIGKILL is pending (OOM) */
+        /* Like Linux: anything outside the user half (the kernel's own
+         * supervisor-only mappings included) is "not mapped" for the process. */
+        signal_force_fault(SIGSEGV, r == -EACCES ? SEGV_ACCERR : SEGV_MAPERR, addr, 14, f->error);
+    }
+    signal_deliver(f, 0, false);
+    cli();
+    bkl_exit();
 }
 
 /* ---- faults in the kernel: diagnostics, never silent corruption ------------ */
@@ -265,25 +274,12 @@ static void exception(struct int_frame *f)
 {
     if (f->vector == 2) { nmi(f); return; }
     if ((f->cs & 3) == 3) { user_fault(f); return; }
-    if (f->vector == 14) {
-        /* A fault on a user address inside a uaccess routine: let the memory
-         * manager resolve it (demand paging, copy-on-write) unless the caller
-         * asked for no fault handling, else resume at the fixup (-EFAULT). */
-        uint64_t addr = read_cr2();
-        if (user_range_ok(addr, 1) && !pagefault_disabled()) {
-            if (f->rflags & 0x200) sti();               /* the copy ran with interrupts on */
-            int r = vm_fault(addr, f->error, false);
-            cli();
-            if (r == 0) return;
-        }
-        uint64_t fix = extable_fixup(f->rip);
-        if (fix && user_range_ok(addr, 1)) { f->rip = fix; return; }
-    }
-    kernel_exception(f);
+    kernel_exception(f);                                /* page faults: lockless() */
 }
 
 
-/* Vectors that need no kernel lock: they touch only this CPU's state. */
+/* Vectors that need no kernel lock: they touch only this CPU's state, or
+ * (page faults) take the locks of what they change. */
 static bool lockless(struct int_frame *f)
 {
     switch (f->vector) {
@@ -292,13 +288,24 @@ static bool lockless(struct int_frame *f)
         return true;
     case 8: case 18:                                    /* #DF, #MC: state unknown, stop */
         kernel_exception(f);
-    case 14: {                                          /* most user page faults (vm.c) */
-        if ((f->cs & 3) == 3) return vm_fault_fast(read_cr2(), f->error);
-        /* a no-fault user access (page faults off, maybe under a spinlock
-         * whose holder must not wait for the kernel lock): straight to the
-         * fixup */
-        uint64_t addr = read_cr2(), fix;
-        if (!pagefault_disabled() || !user_range_ok(addr, 1) || !(fix = extable_fixup(f->rip))) return false;
+    case 14: {                                          /* page faults (vm.c) */
+        uint64_t addr = read_cr2();
+        if ((f->cs & 3) == 3) {
+            if (!vm_fault_fast(addr, f->error)) user_page_fault(f, addr);
+            return true;
+        }
+        /* A fault on a user address inside a uaccess routine: let the memory
+         * manager resolve it (demand paging, copy-on-write) unless the caller
+         * asked for no fault handling (page faults off, maybe under a
+         * spinlock), else resume at the fixup (-EFAULT). */
+        if (user_range_ok(addr, 1) && !pagefault_disabled()) {
+            if (f->rflags & 0x200) sti();               /* the copy ran with interrupts on */
+            int r = vm_fault(addr, f->error, false);
+            cli();
+            if (r == 0) return true;
+        }
+        uint64_t fix = extable_fixup(f->rip);
+        if (!fix || !user_range_ok(addr, 1)) kernel_exception(f);
         f->rip = fix;
         return true;
     }
