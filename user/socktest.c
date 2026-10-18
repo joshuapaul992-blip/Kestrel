@@ -2,7 +2,8 @@
  * them: a listening socket named both in the file system
  * (/tmp/.X11-unix/X9) and in the abstract namespace, non-blocking accept
  * driven by poll(), SO_PEERCRED, short reads/writes of a large transfer,
- * EOF and EPIPE on close.
+ * EOF and EPIPE on close. Then the one-copy paths: readv/writev,
+ * bad buffers (EFAULT, nothing lost) and two senders on one socket.
  *
  *   socktest           everything inside one process
  *   socktest server    serve one client, then exit   } run both at once:
@@ -22,6 +23,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/uio.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 
 static int failures;
 static const char *who = "socktest";
@@ -162,6 +166,59 @@ static int selftest(void)
     int sv[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && write(sv[0], "pq", 2) == 2 && read(sv[1], b, 2) == 2 && b[1] == 'q',
           "socketpair");
+
+    /* readv/writev: a record type keeps the whole vector as one record */
+    int sp[2];
+    char r1[] = "one-", r2[] = "two-", r3[] = "three";
+    struct iovec wv[3] = { { r1, 4 }, { r2, 4 }, { r3, 5 } };
+    CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) == 0 && writev(sp[0], wv, 3) == 13 &&
+          recv(sp[1], b, sizeof b, 0) == 13 && !memcmp(b, "one-two-three", 13), "writev on SOCK_SEQPACKET: one record");
+    char h1[3], h2[16];
+    struct iovec rv[2] = { { h1, 3 }, { h2, sizeof h2 } };
+    CHECK(write(sv[0], "abcdefgh", 8) == 8 && readv(sv[1], rv, 2) == 8 && !memcmp(h1, "abc", 3) && !memcmp(h2, "defgh", 5),
+          "readv on a stream: spread over the vector");
+
+    /* bad buffers: EFAULT, and nothing queued or lost */
+    char *pg = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(pg + 4096, 4096);                    /* a hole after the first page */
+    memset(pg, 'z', 4096);
+    errno = 0;
+    CHECK(send(sv[0], pg + 4000, 200, MSG_DONTWAIT) < 0 && errno == EFAULT &&
+          recv(sv[1], b, sizeof b, MSG_DONTWAIT) < 0 && errno == EAGAIN, "send from a buffer running into a hole: EFAULT, nothing sent");
+    errno = 0;
+    CHECK(write(sv[0], "kept", 4) == 4 && recv(sv[1], pg + 4094, 4, 0) < 0 && errno == EFAULT &&
+          recv(sv[1], b, sizeof b, 0) == 4 && !memcmp(b, "kept", 4), "receive into a bad buffer: EFAULT, the data stays queued");
+    munmap(pg, 4096);
+
+    /* two senders on one socket: every record arrives whole */
+    enum { RECS = 100, RLEN = 40000 };
+    pid_t kids[2];
+    for (int k = 0; k < 2; k++)
+        if ((kids[k] = fork()) == 0) {
+            unsigned char *r = malloc(RLEN);
+            for (int i = 0; i < RECS; i++) {
+                for (int j = 0; j < RLEN; j++) r[j] = (unsigned char)(k * 101 + i + j);
+                if (send(sp[0], r, RLEN, 0) != RLEN) _exit(1);
+            }
+            _exit(0);
+        }
+    unsigned char *r = malloc(RLEN + 1);
+    int good = 0, next[2] = { 0, 0 };
+    for (int i = 0; i < 2 * RECS; i++) {
+        if (recv(sp[1], r, RLEN + 1, 0) != RLEN) break;
+        int k = r[0] == (unsigned char)(next[0]) ? 0 : 1;
+        int ok = 1;
+        for (int j = 0; j < RLEN && ok; j++) ok = r[j] == (unsigned char)(k * 101 + next[k] + j);
+        if (!ok) break;
+        next[k]++;
+        good++;
+    }
+    int st0 = -1, st1 = -1;
+    waitpid(kids[0], &st0, 0);
+    waitpid(kids[1], &st1, 0);
+    CHECK(good == 2 * RECS && next[0] == RECS && next[1] == RECS && st0 == 0 && st1 == 0,
+          "two processes send 100 records of 40 KB each on one socket: all whole, in order per sender");
+    free(r);
     unlink(SOCK_PATH);
     errno = 0;
     CHECK(connect_to(0) < 0 && errno == ENOENT, "after unlink the path name is gone");
