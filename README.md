@@ -1336,21 +1336,23 @@ With `linuxkpi.drm=1` nouveau takes the boot display over like bochs does (above
 
 ## Next steps
 
-Phase 1 (foundations for real applications) is done: user mode with fault-safe user access, demand-paged copy-on-write memory with W^X and NX, dynamic linking, threads and futexes, epoll and the other event descriptors, descriptor passing, and SMP. Next, in order:
+Phase 1 (foundations for real applications) is done: user mode with fault-safe user access, demand-paged copy-on-write memory with W^X and NX, dynamic linking, threads and futexes, epoll and the other event descriptors, descriptor passing, SMP, ext2 with a page cache, networking, and Linux's DRM drivers (bochs, nouveau) through the Linux KPI. The road to 0.4 has one milestone per version:
 
-1. **Finer kernel locking:** the scheduler, futexes, unix sockets, pipes, eventfds, epoll, poll and select, the memory-map calls, the input and sound devices, interrupts, file I/O on ext2 and tmpfs, the path calls, the terminals with their ioctls, and process exit, `wait4` and reaping are off the big kernel lock (see "Multiprocessor support"). Next: the remaining kernel threads.
-2. **A writable file system**: done for ext2, with symbolic links and the root on disk (see above). A page cache shares file pages between processes (see above). Next: ext4 extents, shared writable mappings of disk files, `mount(2)`.
-3. **Networking:** done (see Networking): IPv4, TCP, UDP, DHCP, and drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168. Next: IPv6, card interrupts and offloads, Intel I219 and Realtek RTL8125.
-4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
-5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.
-6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
-7. **Hardware support:** MSI/MSI-X interrupts for network and sound cards (storage and USB have them), USB hubs, an EHCI driver for machines without xHCI.
-8. **Firefox, properly:** seccomp-bpf and namespaces so its sandboxes can stay on, GLX in the X server, non-PIE executables, and finer locking so it starts quickly.
-9. **Linux drivers, phase 2:** enough of DRM in the Linux KPI for `drivers/gpu/drm/tiny/bochs.c`, then nouveau (see "Linux drivers: the Linux KPI").
+| Version | Milestone |
+|---|---|
+| 0.3.2 | LXDE, a shake-down of 0.3.1 on real hardware, and the native benchmark (Kestrel against Linux on one stick) |
+| 0.3.3 | Cheap speed wins: faster large copies, readahead tuned to read no more than Linux, fewer copies on Unix sockets, a virtio block driver |
+| 0.3.4 | Retire the big kernel lock: per-device locks for disk I/O, page faults that sleep on the page, socket locks, a lock-order checker |
+| 0.3.5 | Memory above 4 GiB, and XSAVE with AVX for programs |
+| 0.3.6 | The GPU from user space: `/dev/dri`, the DRM ioctls, XLibre's `modesetting` driver, nouveau acceleration and Mesa |
+| 0.3.7 | AppImages and more programs: FUSE, `mount(2)`, the system calls newer glibc needs, non-PIE executables |
+| 0.3.8 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes |
+| 0.3.9 | Smaller gaps: IPv6, MSI for network cards, ext4 extents, job control, sound capture and mixing |
+| 0.4.0 | The 0.4 release |
 
 ## Licenses
 
-Kestrel source: yours to license as you wish.
+Kestrel source: the GNU General Public License, version 3 (`LICENSE`).
 
 Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The x86emu real-mode emulator (`third_party/x86emu`, from X.org): SciTech/X11 permissive licence (`third_party/x86emu/LICENSE`), © SciTech Software, David Mosberger-Tang, Egbert Eich, Bart Trojanowski. The terminal fonts (`third_party/kestrel_font`) are the project's own.
 
