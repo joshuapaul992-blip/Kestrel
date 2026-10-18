@@ -3137,11 +3137,15 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_pipe: case SYS_pipe2: case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
     case SYS_eventfd: case SYS_eventfd2:
         return true;
-    /* the end of a thread or process, and waiting for a child's: the
-     * process tree's own lock (proc_lock, task.h). The last close of a
-     * process's files and the parent's SIGCHLD take the big lock there. */
+    /* the end of a thread or process, waiting for a child's, and signals:
+     * the process tree's own lock (proc_lock, task.h), which also guards
+     * what is pending and the handlers (proc/process.c). The last close of
+     * a file that needs the big lock takes it there (vfs_close). */
     case SYS_exit: case SYS_exit_group: case SYS_wait4: case SYS_waitid:
+    case SYS_rt_sigaction: case SYS_rt_sigreturn: case SYS_rt_sigpending:
+    case SYS_rt_sigsuspend: case SYS_pause: case SYS_tkill: case SYS_tgkill:
         return true;
+    case SYS_kill:           return f->rdi != 1;        /* the kernel may play init: poweroff */
     /* data through a file that locks itself: a unix socket, a pipe, an
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
      * file's position lock) */
@@ -3233,14 +3237,13 @@ int syscall_dispatch(struct int_frame *f)
         cli();
     }
     if (t->user && (f->cs & 3) == 3) {
-        /* signals are delivered under the lock: a lock-free call that has
-         * one to deliver (or a wait's mask to restore) takes it now, and so
-         * does one a signal interrupted: another thread may have taken that
-         * signal meanwhile, and the call is then restarted (signal_deliver) */
+        /* a signal to deliver, a wait's mask to restore, or a call a signal
+         * interrupted (another thread may have taken that signal meanwhile,
+         * and the call is then restarted): signal_deliver(), which takes
+         * proc_lock for what it changes */
         int64_t ret = (int64_t)f->rax;
         bool restart = ret == -ERESTARTSYS || ret == -ERESTARTNOHAND;
-        if (!locked && (signal_pending() || t->saved_mask_valid || restart)) { bkl_enter(); locked = true; }
-        if (locked) signal_deliver(f, nr, true);
+        if (signal_pending() || t->saved_mask_valid || restart) signal_deliver(f, nr, true);
     }
     int iret = t->iret_return;
     t->iret_return = false;
