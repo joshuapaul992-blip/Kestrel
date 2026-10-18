@@ -8,7 +8,8 @@
 #   make usbimg ROOTFS_BASE=OUT.tar ROOTDISK_MB=2400
 #
 # Runs on an Ubuntu 24.04 host (apt-get download with noble's sources) as
-# root (chroot runs the cache tools). FIREFOX_DIR is an unpacked Linux
+# root (chroot runs the cache tools), with gcc and libglib2.0-dev for
+# kestrel-logind. FIREFOX_DIR is an unpacked Linux
 # x86_64 Firefox: the directory with firefox-bin, libxul.so and omni.ja
 # (Mozilla's tarball, or the conda-forge package's bin/FirefoxApp).
 # LOCAL_DEBS lists packages built here, unpacked over the archive's: the
@@ -33,10 +34,14 @@
 # - the LXDE desktop, which /bin/startx runs when it finds startlxde:
 #   Openbox, LXPanel, LXSession, the PCManFM file manager (and desktop),
 #   Xarchiver, LXRandR (monitor settings, through xrandr), LXTerminal,
-#   LXAppearance and LXTask, with a panel that has Firefox on it.
+#   LXAppearance and LXTask, with a panel that has Firefox on it;
+# - kestrel-logind (ports/logind), which answers the logout dialog's
+#   Shutdown and Reboot in systemd-logind's place, and the D-Bus system
+#   bus configuration /bin/startx starts it on.
 set -e
 OUT=$1; FF=$2; CACHE=${3:-$(dirname "$OUT")/debcache}
 [ -n "$OUT" ] && [ -f "$FF/firefox-bin" ] || { echo "usage: $0 OUT.tar FIREFOX_DIR [DEBCACHE]"; exit 2; }
+SRCDIR=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ffroot.XXXXXX")
 trap 'rm -rf "${ROOT:?}"' EXIT
 
@@ -249,7 +254,18 @@ sed -i 's/^window_manager=.*/&\npolkit\/command=none/' "$ROOT/etc/xdg/lxsession/
 # the TrueType interpreter set below is what draws the text
 sed -i 's/^iXft\/Antialias=1$/iXft\/Antialias=1\niXft\/Hinting=1\nsXft\/HintStyle=hintfull\nsXft\/RGBA=none/' \
     "$ROOT/etc/xdg/lxsession/LXDE/desktop.conf"
+# The logout dialog offers Shutdown and Reboot only when systemd-logind on
+# the system bus says they are allowed: kestrel-logind takes its name there
+# and calls reboot(2), on a system bus of its own configuration (no
+# messagebus user, no services started on demand), both started by startx.
+mkdir -p "$ROOT/usr/libexec" "$ROOT/etc/dbus-1"
+gcc -O2 -o "$ROOT/usr/libexec/kestrel-logind" "$SRCDIR/ports/logind/kestrel-logind.c" \
+    $(pkg-config --cflags --libs gio-2.0)
+cp "$SRCDIR/ports/logind/system-bus.conf" "$ROOT/etc/dbus-1/kestrel-system.conf"
 for f in lxpolkit light-locker pulseaudio at-spi-dbus-bus xdg-user-dirs; do rm -f "$ROOT/etc/xdg/autostart/$f.desktop"; done
+# The logout dialog offers Lock Screen when it finds lxlock, which would
+# hand the screen to light-locker, and that needs LightDM.
+rm -f "$ROOT/usr/bin/lxlock"
 rm -f "$ROOT/usr/share/applications/python3.12.desktop"   # non-PIE: Kestrel cannot load it yet
 # xrdb, which lxsession runs for every settings change, passes resources
 # through cpp when it finds /usr/bin/cpp; GCC's cpp is not PIE either, so
