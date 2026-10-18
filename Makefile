@@ -54,7 +54,7 @@ CFLAGS := -std=gnu11 -O2 -g -pipe \
           -m64 -march=x86-64 -mcmodel=small -mno-red-zone \
           -mno-mmx -mno-sse -mno-sse2 -mno-80387 -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/video -Idrivers/gpu/nvidia -MMD -MP
+          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/gpu/nvidia -MMD -MP
 # -mcmodel=small: the kernel is linked/identity-mapped at 2 MiB (below 2 GiB).
 # A future higher-half move (0xFFFFFFFF80000000) would switch to -mcmodel=kernel.
 
@@ -74,7 +74,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/sys
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
-           drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \
+           drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c \
            kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/stopscreen.c kernel/vbe_emu.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \

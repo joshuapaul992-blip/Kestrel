@@ -136,6 +136,8 @@ int           lkpi_display_update(int monitor, const struct lkpi_display *d);
  * first lkpi_display_add() takes that monitor's place. Returns the monitor
  * given up, or -1. */
 int           lkpi_display_handover(void *handle);
+/* Whether DRM drivers may drive displays: on unless linuxkpi.drm=0 or Safe Mode */
+bool          lkpi_display_drm(void);
 /* ... and its driver failed to probe: Kestrel draws on the boot frame buffer again. */
 void          lkpi_display_reclaim(void *handle);
 

@@ -2,22 +2,21 @@
  *
  *   head 0     the boot frame buffer (VBE or GOP mode chosen by GRUB), drawn
  *              through its off-screen copy when double buffering is on
- *   head 1..   every secondary display adapter a driver can program; today
- *              QEMU/Bochs DISPI adapters (bochs-display, secondary-vga),
- *              each set to its monitor's EDID-preferred resolution
+ *   head 1..   the monitors of a driver that sets modes: Linux's DRM
+ *              drivers through the Linux KPI (bochs on QEMU's bochs-display
+ *              and secondary-vga, nouveau on NVIDIA cards), registered after
+ *              boot (linuxkpi/src/drm_kestrel.c), or Kestrel's own NVIDIA
+ *              code under nvidia.modeset=1; tty_add_monitor() gives each one
+ *              a terminal
  *
- * A native GPU driver adds its monitors the same way, through
- * display_register(). With linuxkpi.drm=1 the DISPI adapters are left to
- * Linux's bochs driver instead: the Linux KPI registers their heads after
- * boot (linuxkpi/src/drm_kestrel.c), and tty_add_monitor() gives each one a
- * terminal.
- *
- * linuxkpi.drm=1 also lets a Linux driver take over the adapter behind the
- * boot frame buffer (nouveau on a primary NVIDIA card, bochs on QEMU's std
- * VGA). When the driver claims it, display_handover() stops every write to
- * the old frame buffer: the terminal and the panic screen keep drawing into
+ * Linux's DRM drivers are on unless linuxkpi.drm=0 or Safe Mode (see
+ * display_linux_drm()). They also take over the adapter behind the boot
+ * frame buffer (nouveau on a primary NVIDIA card, bochs on QEMU's std VGA).
+ * When the driver claims it, display_handover() stops every write to the
+ * old frame buffer: the terminal and the panic screen keep drawing into
  * RAM. The driver's first monitor then takes monitor 0's place
- * (display_replace()), so tty1, the system console and /dev/fb0 move to it. */
+ * (display_replace()), so tty1, the system console and /dev/fb0 move to it.
+ * With them off, only the boot frame buffer is a monitor. */
 #include <kernel/display.h>
 #include <kernel/fb.h>
 #include <kernel/mm.h>
@@ -28,11 +27,6 @@
 #include <kernel/tty.h>
 #include <kernel/posix.h>
 #include "pci.h"
-#include "edid.h"
-#include "bochs_dispi.h"
-
-#define DISPI_FALLBACK_W    1024        /* no EDID: a mode every monitor accepts */
-#define DISPI_FALLBACK_H    768
 
 static struct display_head heads[MAX_MONITORS];
 static int nheads;
@@ -94,22 +88,23 @@ static bool in_mem_bar(const struct pci_device *dev, uint64_t phys)
     return false;
 }
 
-/* linuxkpi.drm=1: secondary adapters, and the boot adapter, are left to
- * Linux DRM drivers */
-static bool linux_drm_wanted(void)
+bool display_linux_drm(void)
 {
     const char *o = strstr(g_boot.cmdline, "linuxkpi.drm");
-    if (!o || (o != g_boot.cmdline && o[-1] != ' ')) return false;
+    while (o && o != g_boot.cmdline && o[-1] != ' ') o = strstr(o + 1, "linuxkpi.drm");
+    if (!o) return !(g_boot.boot_flags & BOOTOPT_SAFE_MODE);
     o += 12;
-    return !*o || *o == ' ' || (*o == '=' && (o[1] == '1' || o[1] == 'y' || o[1] == 'Y'));
+    if (*o != '=') return true;                         /* a bare linuxkpi.drm */
+    o++;
+    return !(*o == '0' || *o == 'n' || *o == 'N' || !strncmp(o, "off", 3));
 }
 
-/* The firmware's frame buffer is not Kestrel driving the adapter: with
- * linuxkpi.drm=1 a Linux driver may take it over (display_handover()). */
+/* The firmware's frame buffer is not Kestrel driving the adapter: with the
+ * Linux DRM drivers on, one may take it over (display_handover()). */
 const char *display_pci_owner(const struct pci_device *dev)
 {
     for (int i = 0; i < nheads; i++) {
-        if (!heads[i].phys || (i == boot_head && linux_drm_wanted())) continue;
+        if (!heads[i].phys || (i == boot_head && display_linux_drm())) continue;
         if (in_mem_bar(dev, heads[i].phys)) return heads[i].name;
     }
     return NULL;
@@ -305,145 +300,12 @@ static void probe_boot_fb(void)
     if (i >= 0 && g_fb.phys) boot_head = i;
 }
 
-/* ---- secondary heads: Bochs/QEMU DISPI adapters --------------------------- */
-/* The adapter takes any size; offer the usual ones that fit the monitor. */
-static const uint16_t dispi_sizes[][2] = {
-    { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 800 },
-    { 1280, 1024 }, { 1366, 768 }, { 1440, 900 }, { 1600, 900 }, { 1600, 1200 }, { 1680, 1050 },
-    { 1920, 1080 }, { 1920, 1200 }, { 2560, 1440 }, { 2560, 1600 }, { 3840, 2160 },
-};
-
-struct dispi_adapter {
-    volatile void *mmio;
-    uint64_t lfb, lfb_size;
-};
-static struct dispi_adapter dispi_adapters[MAX_MONITORS];
-static int ndispi;
-
-static bool dispi_fits(const struct dispi_adapter *a, int w, int h, uint32_t vram)
-{
-    return w <= DISPI_MAX_XRES && h <= DISPI_MAX_YRES && (uint64_t)w * h * 4 <= a->lfb_size &&
-           (!vram || (uint64_t)w * h * 4 <= vram);
-}
-
-static int dispi_switch(void *ctx, int index, const struct display_mode *m)
-{
-    struct dispi_adapter *a = ctx;
-    const struct display_head *cur = display_get(index);
-    struct dispi_mode mode;
-    if (!cur) return -ENODEV;
-    if (!dispi_set_mode(a->mmio, m->width, m->height, &mode) || (uint64_t)mode.pitch * mode.height > a->lfb_size) {
-        dispi_set_mode(a->mmio, cur->width, cur->height, &mode);       /* back to what works */
-        return -EINVAL;
-    }
-    struct display_head h = *cur;
-    h.width = mode.width; h.height = mode.height; h.pitch = mode.pitch;
-    h.refresh_mhz = m->refresh_mhz;
-    size_t frames = ((size_t)mode.pitch * mode.height + PAGE_SIZE - 1) / PAGE_SIZE;
-    size_t old_frames = ((size_t)cur->pitch * cur->height + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t shadow = pmm_alloc_contig(frames);             /* zeroed, identity mapped */
-    uint32_t *old = cur->shadow;
-    h.shadow = (uint32_t *)(uintptr_t)shadow;
-    int rc = display_update(index, &h);
-    if (rc) {
-        if (shadow) pmm_free_contig(shadow, frames);
-        dispi_set_mode(a->mmio, cur->width, cur->height, &mode);
-        return rc;
-    }
-    if (old) pmm_free_contig((uint64_t)(uintptr_t)old, old_frames);
-    return 0;
-}
-
-static void probe_dispi(struct pci_device *dev)
-{
-    const struct pci_bar *lfb = &dev->bars[0], *mmio_bar = &dev->bars[2];
-    if ((lfb->kind != PCI_BAR_MEM32 && lfb->kind != PCI_BAR_MEM64) || !lfb->base || !lfb->size) return;
-    /* The adapter GRUB already drives is head 0. */
-    if (g_fb.phys >= lfb->base && g_fb.phys < lfb->base + lfb->size) return;
-    if (linux_drm_wanted()) {
-        kprintf("display: %02x:%02x.%x left to Linux's bochs driver (linuxkpi.drm=1)\n",
-                dev->bus, dev->device, dev->function);
-        return;
-    }
-    if ((mmio_bar->kind != PCI_BAR_MEM32 && mmio_bar->kind != PCI_BAR_MEM64) || !mmio_bar->base) {
-        kprintf("display: %02x:%02x.%x has no MMIO BAR2 (ISA-style VGA), skipped\n",
-                dev->bus, dev->device, dev->function);
-        return;
-    }
-
-    pci_enable(dev, false, true, false);
-    if (!vmm_set_uncached(mmio_bar->base, 4096)) return;
-    if (lfb->base + lfb->size > PMM_MAX_PHYS && !vmm_identity_map(lfb->base, lfb->size, VMM_WRITE)) return;
-    volatile void *mmio = (volatile void *)(uintptr_t)mmio_bar->base;
-    if (!dispi_present(mmio)) {
-        kprintf("display: %02x:%02x.%x: no DISPI interface\n", dev->bus, dev->device, dev->function);
-        return;
-    }
-
-    uint8_t raw[EDID_BLOCK_SIZE];
-    struct edid_info edid;
-    dispi_read_edid(mmio, raw);
-    int w = DISPI_FALLBACK_W, h = DISPI_FALLBACK_H;
-    if (edid_parse(raw, &edid)) {
-        kprintf("display: %02x:%02x.%x: EDID %u.%u %s %04x \"%s\", native %dx%d @ %d Hz, %dx%d mm\n",
-                dev->bus, dev->device, dev->function, edid.version, edid.revision, edid.vendor,
-                edid.product, edid.name, edid.native_width, edid.native_height, edid.refresh_hz,
-                edid.width_mm, edid.height_mm);
-        w = edid.native_width;
-        h = edid.native_height;
-    } else {
-        kprintf("display: %02x:%02x.%x: no valid EDID, using %dx%d\n",
-                dev->bus, dev->device, dev->function, w, h);
-    }
-
-    struct dispi_mode mode;
-    if (!dispi_set_mode(mmio, w, h, &mode) || (uint64_t)mode.pitch * (uint64_t)mode.height > lfb->size) {
-        kprintf("display: %02x:%02x.%x: cannot set %dx%dx32\n", dev->bus, dev->device, dev->function, w, h);
-        return;
-    }
-
-    struct display_head head = {
-        .phys = lfb->base, .vram = (uint32_t *)(uintptr_t)lfb->base,
-        .width = mode.width, .height = mode.height, .pitch = mode.pitch, .bytes_pp = 4,
-        .r_pos = 16, .g_pos = 8, .b_pos = 0,                /* x8r8g8b8 */
-    };
-    size_t frames = ((size_t)mode.pitch * (size_t)mode.height + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t shadow = pmm_alloc_contig(frames);             /* zeroed, identity mapped */
-    head.shadow = (uint32_t *)(uintptr_t)shadow;
-    snprintf(head.name, sizeof head.name, "DISPI adapter %02x:%02x.%x", dev->bus, dev->device, dev->function);
-    strlcpy(head.monitor, edid.name, sizeof head.monitor);
-    head.refresh_mhz = edid.refresh_hz > 0 ? (uint32_t)edid.refresh_hz * 1000 : 60000;
-    head.width_mm = edid.width_mm;
-    head.height_mm = edid.height_mm;
-    if (ndispi < MAX_MONITORS) {                            /* the modes xrandr may switch to */
-        struct dispi_adapter *a = &dispi_adapters[ndispi];
-        uint32_t vram = mode.vram_bytes;
-        a->mmio = mmio;
-        a->lfb = lfb->base;
-        a->lfb_size = lfb->size;
-        head.modes[head.nmodes++] = (struct display_mode){ (uint16_t)w, (uint16_t)h, head.refresh_mhz, true };
-        for (size_t i = 0; i < sizeof dispi_sizes / sizeof dispi_sizes[0] && head.nmodes < DISPLAY_MAX_MODES; i++) {
-            int mw = dispi_sizes[i][0], mh = dispi_sizes[i][1];
-            if ((mw == w && mh == h) || mw > w || mh > h || !dispi_fits(a, mw, mh, vram)) continue;
-            head.modes[head.nmodes++] = (struct display_mode){ (uint16_t)mw, (uint16_t)mh, 60000, false };
-        }
-        head.set_mode = dispi_switch;
-        head.mode_ctx = a;
-        ndispi++;
-    }
-    if (display_register(&head) < 0 && shadow) pmm_free_contig(shadow, frames);
-}
-
 void display_probe(void)
 {
     gpu_probe();                    /* native GPU drivers: NVIDIA detection (stage 1) */
     probe_boot_fb();
     gpu_register_displays();        /* monitors lit by nvidia.modeset=1 */
-    for (size_t i = 0; i < pci_device_count(); i++) {
-        struct pci_device *dev = pci_device_at(i);
-        if (dev->vendor_id == DISPI_PCI_VENDOR && dev->device_id == DISPI_PCI_DEVICE &&
-            dev->class_code == PCI_CLASS_DISPLAY)
-            probe_dispi(dev);
-    }
+    kprintf("display: Linux display drivers %s\n", display_linux_drm() ? "on" :
+            (g_boot.boot_flags & BOOTOPT_SAFE_MODE) ? "off (Safe Mode)" : "off (linuxkpi.drm=0)");
     kprintf("display: %d monitor(s)\n", nheads);
 }
