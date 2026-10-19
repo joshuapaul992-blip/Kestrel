@@ -801,8 +801,9 @@ static int tt_master[TT_PAIRS], tt_slave[TT_PAIRS];
 static int tt_open(int *m, int *sl, int raw)
 {
     *m = posix_openpt(O_RDWR | O_NOCTTY);
-    if (*m < 0 || grantpt(*m) || unlockpt(*m)) return -1;
-    *sl = open(ptsname(*m), O_RDWR | O_NOCTTY);
+    char name[32];                                      /* ptsname()'s buffer is shared by the threads */
+    if (*m < 0 || grantpt(*m) || unlockpt(*m) || ptsname_r(*m, name, sizeof name)) return -1;
+    *sl = open(name, O_RDWR | O_NOCTTY);
     if (*sl < 0) return -1;
     struct termios t;
     tcgetattr(*sl, &t);
