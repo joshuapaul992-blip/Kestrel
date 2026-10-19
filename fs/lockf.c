@@ -6,13 +6,15 @@
  * when its last descriptor closes. A process's own locks never conflict
  * with each other: a new lock replaces whatever of its own it overlaps
  * (splitting what is left over). SQLite (Firefox's profile databases) and
- * Firefox's profile lock use these. */
+ * Firefox's profile lock use these. Every file's locks are on one list,
+ * under one spinlock (lk_lock); a waiter sleeps on lock_chan. */
 #include <kernel/vfs.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 
 #define F_RDLCK 0
 #define F_WRLCK 1
@@ -38,6 +40,7 @@ struct kflock {                     /* struct flock, x86-64 */
 
 static struct rlock *locks;
 static int lock_chan;
+static struct spinlock lk_lock;     /* locks */
 
 static bool overlaps(const struct rlock *l, uint64_t s, uint64_t e) { return l->start <= e && s <= l->end; }
 
@@ -113,8 +116,9 @@ int vfs_lock_get(struct file *f, void *kfl, bool ofd)
     if (ofd && k->l_pid) return -EINVAL;
     int r = range_of(f, k, &s, &e);
     if (r) return r;
-    uint64_t fl = irq_save();
-    struct rlock *l = conflict(f->vn, owner_of(f, ofd), k->l_type, s, e);
+    uintptr_t owner = owner_of(f, ofd);
+    uint64_t fl = spin_lock_irqsave(&lk_lock);
+    struct rlock *l = conflict(f->vn, owner, k->l_type, s, e);
     if (!l) {
         k->l_type = F_UNLCK;
     } else {
@@ -124,7 +128,7 @@ int vfs_lock_get(struct file *f, void *kfl, bool ofd)
         k->l_len = l->end == END_MAX ? 0 : (int64_t)(l->end - l->start + 1);
         k->l_pid = l->pid;
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lk_lock, fl);
     return 0;
 }
 
@@ -140,20 +144,20 @@ int vfs_lock_set(struct file *f, void *kfl, bool ofd, bool wait)
     int r = range_of(f, k, &s, &e);
     if (r) return r;
     uintptr_t owner = owner_of(f, ofd);
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&lk_lock);
     if (k->l_type == F_UNLCK) {
         r = cut(f->vn, owner, s, e);
         wakeup(&lock_chan);
-        irq_restore(fl);
+        spin_unlock_irqrestore(&lk_lock, fl);
         return r;
     }
     while (conflict(f->vn, owner, k->l_type, s, e)) {
-        if (!wait) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -EINTR; }
-        sleep_on(&lock_chan);
+        if (!wait) { spin_unlock_irqrestore(&lk_lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&lk_lock, fl); return -EINTR; }
+        sleep_on_locked(&lock_chan, &lk_lock);
     }
     struct rlock *n = kmalloc(sizeof *n);
-    if (!n || (r = cut(f->vn, owner, s, e)) < 0) { kfree(n); irq_restore(fl); return n ? r : -ENOLCK; }
+    if (!n || (r = cut(f->vn, owner, s, e)) < 0) { kfree(n); spin_unlock_irqrestore(&lk_lock, fl); return n ? r : -ENOLCK; }
     n->vn = f->vn;
     n->owner = owner;
     n->pid = ofd ? -1 : current_task()->tgid;
@@ -163,15 +167,15 @@ int vfs_lock_set(struct file *f, void *kfl, bool ofd, bool wait)
     n->next = locks;
     locks = n;
     if (k->l_type == F_RDLCK) wakeup(&lock_chan);       /* a write lock may have become a read lock */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lk_lock, fl);
     return 0;
 }
 
 /* Drop the locks owned by `owner` (on vn, or on every file if vn is NULL). */
 static void drop(struct vnode *vn, uintptr_t owner)
 {
-    if (!locks) return;
-    uint64_t fl = irq_save();
+    if (!__atomic_load_n(&locks, __ATOMIC_RELAXED)) return;
+    uint64_t fl = spin_lock_irqsave(&lk_lock);
     bool any = false;
     for (struct rlock **pp = &locks; *pp; ) {
         struct rlock *l = *pp;
@@ -179,17 +183,17 @@ static void drop(struct vnode *vn, uintptr_t owner)
         else pp = &l->next;
     }
     if (any) wakeup(&lock_chan);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lk_lock, fl);
 }
 
 /* A descriptor of f is being closed by the current process. */
 void vfs_locks_fd_closed(struct file *f)
 {
-    if (locks && f && f->vn) drop(f->vn, POSIX_OWNER(current_task()->tgid));
+    if (f && f->vn) drop(f->vn, POSIX_OWNER(current_task()->tgid));
 }
 
 /* The open file itself is going away: its OFD locks. */
 void vfs_locks_file_gone(struct file *f)
 {
-    if (locks) drop(NULL, (uintptr_t)f);
+    drop(NULL, (uintptr_t)f);
 }

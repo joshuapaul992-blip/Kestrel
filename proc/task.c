@@ -122,17 +122,14 @@ struct files_struct *files_dup(struct files_struct *src)
     return f;
 }
 
-/* The last reference closes every descriptor: under the big kernel lock
- * (record locks, and the files' last closes), also from exit(), which
- * runs without it. */
+/* The last reference closes every descriptor, also from exit(), which
+ * runs without the big kernel lock: a last close takes it if the file
+ * needs it (vfs_close). */
 void files_put(struct files_struct *f)
 {
     if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
-    bool lock = !bkl_depth();
-    if (lock) bkl_enter();
     for (int i = 0; i < MAX_FDS; i++)
         if (f->fd[i]) { struct file *x = f->fd[i]; f->fd[i] = NULL; vfs_locks_fd_closed(x); vfs_close(x); }
-    if (lock) bkl_exit();
     kfree(f);
 }
 
@@ -557,10 +554,18 @@ void sched_tick_fast(void)
  * early -- a timer since cancelled -- never late: the locked tick then
  * looks at every process and sets it again. */
 static uint64_t alarm_next;
+static struct spinlock itimer_lock;             /* every process's ITIMER_REAL, and alarm_next */
 
-void sched_alarm_armed(uint64_t at)             /* under the kernel lock */
+void itimer_real(struct signal_struct *g, bool set, uint64_t every, uint64_t at, uint64_t old[2])
 {
-    if (at && (!alarm_next || at < alarm_next)) alarm_next = at;
+    uint64_t f = spin_lock_irqsave(&itimer_lock);
+    if (old) { old[0] = g->alarm_every; old[1] = g->alarm_at; }
+    if (set) {
+        g->alarm_every = every;
+        g->alarm_at = at;
+        if (at && (!alarm_next || at < alarm_next)) __atomic_store_n(&alarm_next, at, __ATOMIC_RELAXED);
+    }
+    spin_unlock_irqrestore(&itimer_lock, f);
 }
 
 static void wake_sleepers(void)
@@ -582,12 +587,13 @@ void sched_tick(void)
     sched_tick_local();
 }
 
-/* ITIMER_REAL timers that are due (big lock held). */
+/* ITIMER_REAL timers that are due (big lock held: no process is freed) */
 void sched_alarms(void)
 {
     if (!running) return;
     uint64_t ms = time_ms();
     uint64_t next = 0;
+    uint64_t f = spin_lock_irqsave(&itimer_lock);
     for (int i = 1; i < MAX_TASKS; i++) {
         struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
         if (!g || !g->alarm_at || tasks[i].pid != tasks[i].tgid ||
@@ -598,7 +604,8 @@ void sched_alarms(void)
         }
         if (g->alarm_at && (!next || g->alarm_at < next)) next = g->alarm_at;
     }
-    alarm_next = next;
+    __atomic_store_n(&alarm_next, next, __ATOMIC_RELAXED);
+    spin_unlock_irqrestore(&itimer_lock, f);
 }
 
 /* The boot CPU's tick without the kernel lock (idt.c), when no interval

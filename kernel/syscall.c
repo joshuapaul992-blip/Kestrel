@@ -1306,8 +1306,14 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
         r = fd_alloc(t, (int)arg, vfs_file_get(f), cmd == F_DUPFD_CLOEXEC);
         if (r < 0) vfs_close(f);                        /* the reference meant for the table */
         break;
-    case F_GETFD: r = t->files->cloexec[fd] ? FD_CLOEXEC : 0; break;
-    case F_SETFD: t->files->cloexec[fd] = (arg & FD_CLOEXEC) != 0; r = 0; break;
+    case F_GETFD: r = __atomic_load_n(&t->files->cloexec[fd], __ATOMIC_RELAXED) ? FD_CLOEXEC : 0; break;
+    case F_SETFD: {
+        uint64_t fl = spin_lock_irqsave(&t->files->lock);
+        if (t->files->fd[fd] == f) t->files->cloexec[fd] = (arg & FD_CLOEXEC) != 0;  /* still that file */
+        spin_unlock_irqrestore(&t->files->lock, fl);
+        r = 0;
+        break;
+    }
     case F_GETFL: r = f->flags & ~O_CLOEXEC; break;
     case 1033: {                                        /* F_ADD_SEALS */
         struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
@@ -1315,7 +1321,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
         if (o->seals & 0x0001) { r = -EPERM; break; }           /* F_SEAL_SEAL */
         if (arg & ~0x3fULL) { r = -EINVAL; break; }     /* SEAL, SHRINK, GROW, WRITE, FUTURE_WRITE, EXEC */
         if ((f->flags & O_ACCMODE) == O_RDONLY) { r = -EPERM; break; }
-        o->seals |= (uint32_t)arg;
+        __atomic_or_fetch(&o->seals, (uint32_t)arg, __ATOMIC_RELAXED);
         r = 0;
         break;
     }
@@ -1338,10 +1344,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
         r = vfs_lock_set(f, k, cmd >= 37, cmd == 7 || cmd == 38);
         break;
     }
-    case F_SETFL:                                       /* only these two may change */
-        f->flags = (f->flags & ~(O_NONBLOCK | O_APPEND)) | ((int)arg & (O_NONBLOCK | O_APPEND));
+    case F_SETFL: {                                     /* only these two may change */
+        int old = __atomic_load_n(&f->flags, __ATOMIC_RELAXED), nf;
+        do nf = (old & ~(O_NONBLOCK | O_APPEND)) | ((int)arg & (O_NONBLOCK | O_APPEND));
+        while (!__atomic_compare_exchange_n(&f->flags, &old, nf, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
         r = 0;
         break;
+    }
     default: r = -EINVAL; break;
     }
     fput(f);
@@ -1733,19 +1742,20 @@ static int64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t len, uint64_t 
 struct ktimeval { int64_t sec, usec; };
 static uint64_t tv_ms(const struct ktimeval *tv) { return (uint64_t)tv->sec * 1000 + (uint64_t)(tv->usec + 999) / 1000; }
 static void ms_tv(uint64_t ms, struct ktimeval *tv) { tv->sec = (int64_t)(ms / 1000); tv->usec = (int64_t)(ms % 1000) * 1000; }
-static void timer_get(struct tcb *t, struct ktimeval out[2])
+static void timer_out(const uint64_t old[2], struct ktimeval out[2])
 {
     uint64_t now = time_ms();
-    struct signal_struct *g = t->signal;
-    ms_tv(g->alarm_every, &out[0]);
-    ms_tv(g->alarm_at > now ? g->alarm_at - now : (g->alarm_at ? 1 : 0), &out[1]);
+    ms_tv(old[0], &out[0]);
+    ms_tv(old[1] > now ? old[1] - now : (old[1] ? 1 : 0), &out[1]);
 }
 static int64_t sys_getitimer(uint64_t which, uint64_t cur, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
     if (which != 0) return -EINVAL;                     /* ITIMER_REAL only */
     struct ktimeval v[2];
-    timer_get(current_task(), v);
+    uint64_t old[2];
+    itimer_real(current_task()->signal, false, 0, 0, old);
+    timer_out(old, v);
     return copy_to_user((void *)cur, v, sizeof v) ? -EFAULT : 0;
 }
 static int64_t sys_setitimer(uint64_t which, uint64_t nv, uint64_t ov, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -1759,27 +1769,19 @@ static int64_t sys_setitimer(uint64_t which, uint64_t nv, uint64_t ov, uint64_t 
         if (v[0].sec < 0 || v[1].sec < 0 || v[0].usec < 0 || v[0].usec >= 1000000 || v[1].usec < 0 || v[1].usec >= 1000000)
             return -EINVAL;
     }
-    timer_get(t, old);
+    uint64_t was[2], value = nv ? tv_ms(&v[1]) : 0;
+    itimer_real(t->signal, nv != 0, nv ? tv_ms(&v[0]) : 0, value ? time_ms() + value : 0, was);
+    timer_out(was, old);
     if (ov && copy_to_user((void *)ov, old, sizeof old)) return -EFAULT;
-    if (nv) {
-        uint64_t value = tv_ms(&v[1]);
-        t->signal->alarm_every = tv_ms(&v[0]);
-        t->signal->alarm_at = value ? time_ms() + value : 0;
-        sched_alarm_armed(t->signal->alarm_at);
-    }
     return 0;
 }
 static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct tcb *t = current_task();
-    uint64_t now = time_ms();
-    struct signal_struct *g = t->signal;
-    int64_t left = g->alarm_at > now ? (int64_t)((g->alarm_at - now + 999) / 1000) : 0;
-    g->alarm_every = 0;
-    g->alarm_at = sec ? now + (sec > (1ull << 32) ? (1ull << 32) : sec) * 1000 : 0;
-    sched_alarm_armed(g->alarm_at);
-    return left;
+    uint64_t now = time_ms(), was[2];
+    itimer_real(t->signal, true, 0, sec ? now + (sec > (1ull << 32) ? (1ull << 32) : sec) * 1000 : 0, was);
+    return was[1] > now ? (int64_t)((was[1] - now + 999) / 1000) : 0;
 }
 
 /* prctl: process names (busybox renames its no-exec applets), and a few
@@ -3114,6 +3116,26 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_getpid:         case SYS_gettid:         case SYS_getppid:
     case SYS_getuid:         case SYS_geteuid:        case SYS_getgid:        case SYS_getegid:
     case SYS_sched_getaffinity:
+    /* fixed answers, or the caller's own fields (another task's are read
+     * from the task table, which never moves: at worst a stale value) */
+    case SYS_uname:          case SYS_sysinfo:        case SYS_getrusage:
+    case SYS_getresuid:      case SYS_getresgid:      case SYS_getgroups:
+    case SYS_getpgrp:        case SYS_getpgid:        case SYS_getsid:
+    case SYS_prlimit64:      case SYS_getrlimit:      case SYS_setrlimit:
+    case SYS_getpriority:    case SYS_setpriority:
+    case SYS_sched_getscheduler: case SYS_sched_setscheduler:
+    case SYS_sched_getparam: case SYS_sched_setparam:
+    /* interval timers: their own lock (proc/task.c: itimer_lock) */
+    case SYS_setitimer:      case SYS_getitimer:      case SYS_alarm:
+        return true;
+    /* the descriptor table: its own lock. A last close takes the big lock
+     * if the file's release needs it (vfs_close); record locks and flock()
+     * have locks of their own (fs/lockf.c, fs/vfs.c), and fget takes the
+     * big lock for a file that needs it, as for I/O. */
+    case SYS_close: case SYS_dup: case SYS_dup2: case SYS_dup3: case SYS_fcntl: case SYS_flock:
+    /* new pipes, epoll sets and eventfds, and the epoll watches (ep_lock) */
+    case SYS_pipe: case SYS_pipe2: case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
+    case SYS_eventfd: case SYS_eventfd2:
         return true;
     /* the end of a thread or process, and waiting for a child's: the
      * process tree's own lock (proc_lock, task.h). The last close of a
