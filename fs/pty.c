@@ -42,6 +42,7 @@
 #include <kernel/uvm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
+#include <kernel/tty.h>
 #include <kernel/spinlock.h>
 #include <kernel/smp.h>
 
@@ -543,6 +544,7 @@ static int slave_poll(struct file *f, int events)
 static void slave_release(struct file *f)
 {
     struct pty *p = pty_of(f);
+    if (p->console) vt_release(f);                      /* a VT/KD mode this file set */
     uint64_t fl = spin_lock_irqsave(&p->lock);
     if (p->slaves) p->slaves--;
     wakeup(&p->out);                                    /* master readers see EIO/HUP */
@@ -689,7 +691,13 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         if (*(const int32_t *)arg) __atomic_or_fetch(&f->flags, O_NONBLOCK, __ATOMIC_RELAXED);
         else __atomic_and_fetch(&f->flags, ~O_NONBLOCK, __ATOMIC_RELAXED);
         return 0;
-    default:
+    default:                            /* a text terminal: Linux's VT and KD ioctls (fs/devfs.c) */
+        if (p->console && !master) {
+            int n = 0;
+            const char *s = p->slave_vn ? p->slave_vn->name : "";
+            if (!strncmp(s, "tty", 3)) for (s += 3; *s >= '0' && *s <= '9'; s++) n = n * 10 + (*s - '0');
+            return n > 0 ? vt_console_ioctl(f, n - 1, req, arg) : -ENOTTY;
+        }
         return -ENOTTY;
     }
 }

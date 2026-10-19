@@ -210,16 +210,20 @@ static int vt_ioctl(struct file *f, int idx, unsigned long req, void *arg)
         kmutex_unlock(&vt_lock);
         return r;
     }
-    return devtty_ioctl(f->vn, req, arg);
+    return -ENOTTY;                     /* not one of these */
 }
+
+/* The same on a text terminal's console pty (fs/pty.c), whose slave /dev/ttyN is */
+int vt_console_ioctl(struct file *f, int idx, unsigned long req, void *arg) { return vt_ioctl(f, idx, req, arg); }
 
 static int vt_fioctl(struct file *f, unsigned long req, void *arg)
 {
     struct kestrel_tty *t = vnode_tty(f->vn);
-    return vt_ioctl(f, t ? t->index : 0, req, arg);
+    int r = vt_ioctl(f, t ? t->index : 0, req, arg);
+    return r == -ENOTTY ? devtty_ioctl(f->vn, req, arg) : r;
 }
 
-static void vt_release(struct file *f)
+void vt_release(struct file *f)
 {
     kmutex_lock(&vt_lock);
     if (vt_owner == f) {
@@ -244,7 +248,11 @@ static ssize_t tty0_write(struct vnode *v, const void *buf, size_t n, uint64_t o
     if (t) tty_write(t, buf, n);
     return (ssize_t)n;
 }
-static int tty0_fioctl(struct file *f, unsigned long req, void *arg) { return vt_ioctl(f, active_keyboard_tty, req, arg); }
+static int tty0_fioctl(struct file *f, unsigned long req, void *arg)
+{
+    int r = vt_ioctl(f, active_keyboard_tty, req, arg);
+    return r == -ENOTTY ? devtty_ioctl(f->vn, req, arg) : r;
+}
 static const struct vnode_ops tty0_ops    = { .read = null_read, .write = tty0_write, .fioctl = tty0_fioctl,
                                               .release = vt_release };
 
