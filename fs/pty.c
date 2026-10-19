@@ -54,6 +54,7 @@ struct pty {
     struct spinlock lock;
     uint32_t sigs;                  /* for the foreground group, not sent yet  */
     bool     used, locked;
+    bool     freeing;               /* pty_free_if_unused() is letting it go  */
     int      index;
     int      masters, slaves;       /* open files on each side                */
     bool     slave_seen;            /* a slave was opened (master reads EIO after) */
@@ -255,18 +256,26 @@ static void pty_defaults(struct pty *p)
     p->ws.ws_col = 80;
 }
 
-/* The big lock is held, so no slave can be opened meanwhile. */
+/* The last master and slave are closed: the slot goes back. Decided under
+ * both locks, once: a master and a slave closing at once (the big lock
+ * does not keep them apart across a preemption) must not both free it, or
+ * the second would free the pty a new ptmx_open() took meanwhile. A pty
+ * with no master open refuses slave opens, so none starts meanwhile. */
 static void pty_free_if_unused(struct pty *p)
 {
-    uint64_t fl = spin_lock_irqsave(&p->lock);
-    bool unused = p->used && !p->masters && !p->slaves;
-    spin_unlock_irqrestore(&p->lock, fl);
+    uint64_t fl = spin_lock_irqsave(&alloc_lock);
+    spin_lock_irqsave(&p->lock);
+    bool unused = p->used && !p->freeing && !p->masters && !p->slaves;
+    if (unused) p->freeing = true;
+    spin_unlock_keep_irqs(&p->lock);
+    spin_unlock_irqrestore(&alloc_lock, fl);
     if (!unused) return;
     for (int i = 0; i < MAX_TASKS; i++) {               /* nobody's controlling tty any more */
         struct tcb *t = task_slot(i);
         if (t->state != TASK_UNUSED && t->ctty == p->index + 1) t->ctty = 0;
     }
     fl = spin_lock_irqsave(&alloc_lock);
+    p->freeing = false;
     p->used = false;
     spin_unlock_irqrestore(&alloc_lock, fl);
 }
@@ -281,6 +290,7 @@ static int ptmx_open(struct vnode *vn, int flags, struct file **out)
     int idx = (int)(p - ptys);
     memset(p, 0, __builtin_offsetof(struct pty, master_vn));   /* nobody holds an unused pty's lock */
     p->used = true;
+    p->masters = 1;                                     /* ours from here: not free to take */
     p->locked = true;
     p->index = idx;
     lockcheck_name(&p->lock, "pty");
@@ -299,11 +309,11 @@ static int ptmx_open(struct vnode *vn, int flags, struct file **out)
     struct file *f = vfs_file_new(m, flags);
     if (!f) {
         fl = spin_lock_irqsave(&alloc_lock);
+        p->masters = 0;
         p->used = false;
         spin_unlock_irqrestore(&alloc_lock, fl);
         return -ENOMEM;
     }
-    p->masters = 1;
     *out = f;
     return 0;
 }
@@ -322,20 +332,28 @@ static int slave_open(struct vnode *vn, int flags, struct file **out)
 {
     int idx = (int)(intptr_t)vn->ctx;
     struct pty *p = &ptys[idx];
-    bkl_enter();                                        /* the slot, and the session it may join */
+    bkl_enter();                                        /* the session it may join */
+    /* counted as open before the file exists: a master closing meanwhile
+     * then does not free the slot under us (pty_free_if_unused) */
+    uint64_t fl = spin_lock_irqsave(&p->lock);
+    bool ok = p->used && !p->freeing && !p->locked && p->masters;
+    if (ok) p->slaves++;
+    spin_unlock_irqrestore(&p->lock, fl);
     int r = -EIO;
-    if (p->used && !p->locked && p->masters) {
+    if (ok) {
         struct file *f = vfs_file_new(vn, flags);
-        r = -ENOMEM;
+        fl = spin_lock_irqsave(&p->lock);
+        if (f) p->slave_seen = true;
+        else p->slaves--;
+        spin_unlock_irqrestore(&p->lock, fl);
         if (f) {
-            uint64_t fl = spin_lock_irqsave(&p->lock);
-            p->slaves++;
-            p->slave_seen = true;
-            spin_unlock_irqrestore(&p->lock, fl);
             struct tcb *t = current_task();
             if (!(flags & O_NOCTTY) && t->user && t->sid == t->pid && !t->ctty && !p->session) acquire_ctty(p);
             *out = f;
             r = 0;
+        } else {
+            pty_free_if_unused(p);
+            r = -ENOMEM;
         }
     }
     bkl_exit();
