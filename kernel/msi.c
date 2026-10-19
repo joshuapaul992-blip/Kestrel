@@ -17,6 +17,7 @@ struct msi_slot {
     const char   *name;
     uint64_t      count;
     bool          msix;
+    bool          lockless;             /* msi_set_lockless */
 };
 static struct msi_slot slots[VEC_MSI_COUNT];
 
@@ -105,7 +106,19 @@ void msi_disable(struct pci_device *dev, int vector)
     s->fn = NULL;
     s->arg = NULL;
     s->msix = false;
+    s->lockless = false;
     irq_restore(f);
+}
+
+void msi_set_lockless(int vector)
+{
+    if (vector >= VEC_MSI_BASE && vector < VEC_MSI_BASE + VEC_MSI_COUNT)
+        __atomic_store_n(&slots[vector - VEC_MSI_BASE].lockless, true, __ATOMIC_RELEASE);
+}
+
+bool msi_lockless(int vector)
+{
+    return __atomic_load_n(&slots[vector - VEC_MSI_BASE].lockless, __ATOMIC_ACQUIRE);
 }
 
 bool msi_is_msix(int vector)
@@ -116,7 +129,7 @@ bool msi_is_msix(int vector)
 void msi_dispatch(int vector)
 {
     struct msi_slot *s = &slots[vector - VEC_MSI_BASE];
-    s->count++;
+    __atomic_add_fetch(&s->count, 1, __ATOMIC_RELAXED);
     if (s->fn) s->fn(s->arg);
 }
 

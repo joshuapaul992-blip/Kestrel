@@ -179,6 +179,7 @@ static struct {
     /* boot settling: per-port state machine */
     struct { uint8_t state, attempts; uint64_t when; } track[XHCI_MAX_PORTS + 1];
     volatile bool busy;                       /* a thread is issuing commands   */
+    volatile int  ev_lock;                    /* the event ring, HID endpoints  */
     uint64_t fake_ms;                         /* time base without a now_ms hook */
     uint32_t generation;
     /* diagnostics */
@@ -202,16 +203,13 @@ static void pause_us(const volatile void *chan, uint32_t us)    /* chan: an addr
 }
 static void wake(const volatile void *chan) { if (X.plat.wake) X.plat.wake((void *)(uintptr_t)chan); }
 
-/* Serialise command/transfer users (single CPU: a flag set with IRQs off).
- * Waiting threads poll with short delays; on a preemptive kernel the holder
- * gets the CPU back, on a cooperative one it never gives it up mid-way. */
+/* Serialise command/transfer users: one thread at a time issues commands
+ * and transfers (taken with a locked exchange, so on any CPU). Waiting
+ * threads sleep in short pauses; the holder may sleep too, waiting for
+ * its completion event. */
 static bool try_acquire(void)
 {
-    irqstate_t s = irq_off();
-    bool ok = !X.busy;
-    if (ok) X.busy = true;
-    irq_restore(s);
-    return ok;
+    return !__atomic_exchange_n(&X.busy, true, __ATOMIC_ACQUIRE);
 }
 static bool acquire(uint32_t timeout_ms)
 {
@@ -222,7 +220,24 @@ static bool acquire(uint32_t timeout_ms)
     }
     return true;
 }
-static void release(void) { X.busy = false; wake(&X.busy); }
+static void release(void) { __atomic_store_n(&X.busy, false, __ATOMIC_RELEASE); wake(&X.busy); }
+
+/* The event ring and what its events change (completions, the HID
+ * endpoints and their rings, key repeat): xhci_poll() drains it from any
+ * CPU (a thread waiting for its completion, the timer tick, the
+ * interrupt), so a spinlock, held with interrupts off. */
+static irqstate_t ev_lock(void)
+{
+    irqstate_t s = irq_off();
+    while (__atomic_exchange_n(&X.ev_lock, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&X.ev_lock, __ATOMIC_RELAXED)) __asm__ volatile("pause" ::: "memory");
+    return s;
+}
+static void ev_unlock(irqstate_t s)
+{
+    __atomic_store_n(&X.ev_lock, 0, __ATOMIC_RELEASE);
+    irq_restore(s);
+}
 
 static void *dma(size_t size, size_t align, uint64_t *phys)
 {
@@ -423,7 +438,7 @@ static void handle_transfer_event(const struct xhci_trb *ev)
              * commands, which may not run here; hand it to xhci_service() */
             h->active = false;
             h->needs_reset = true;
-            X.ep_pending = true;
+            __atomic_store_n(&X.ep_pending, true, __ATOMIC_RELEASE);
         }
         return;
     }
@@ -445,7 +460,7 @@ static void handle_event(const struct xhci_trb *ev)
         break;
     case TRB_EV_PORT_STATUS: {
         uint32_t port = (uint32_t)(ev->param >> 24) & 0xFF;
-        if (port >= 1 && port <= X.max_ports && port <= 32) X.port_pending |= 1u << (port - 1);
+        if (port >= 1 && port <= X.max_ports && port <= 32) __atomic_or_fetch(&X.port_pending, 1u << (port - 1), __ATOMIC_RELAXED);
         break;
     }
     case TRB_EV_HOST_CONTROLLER:
@@ -470,7 +485,7 @@ void xhci_enable_interrupts(uint16_t moderation_250ns)
 void xhci_poll(void)
 {
     if (!X.up) return;
-    irqstate_t s = irq_off();
+    irqstate_t s = ev_lock();
     struct xhci_trb ev;
     bool any = false;
     while (xhci_event_dequeue(&X.ev, &ev)) { handle_event(&ev); any = true; }
@@ -483,7 +498,7 @@ void xhci_poll(void)
     if (REG(ir->iman) & XHCI_IMAN_IP) REG(ir->iman) = XHCI_IMAN_IP | XHCI_IMAN_IE;
     if (REG(X.op->usbsts) & XHCI_STS_EINT) REG(X.op->usbsts) = XHCI_STS_EINT;
     key_repeat();
-    irq_restore(s);
+    ev_unlock(s);
 }
 
 /* ======================================================================== */
@@ -952,11 +967,13 @@ static int configure_endpoints(struct usb_dev *d)
 
 static void start_reports(struct usb_dev *d, struct hid_if *h)
 {
+    irqstate_t s = ev_lock();                   /* the ring is xhci_poll()'s once active */
     mem_zero(h->prev, sizeof h->prev);
     h->repeat_usage = 0;
     h->needs_reset = false;
     h->active = true;
     for (unsigned b = 0; b < XHCI_HID_BUFFERS; b++) requeue_report(d, h, b);
+    ev_unlock(s);
 }
 
 static int enumerate_port(uint32_t port)
@@ -1095,13 +1112,13 @@ static void release_port(uint32_t port)
     uint8_t slot = X.port_slot[port];
     if (!slot) return;
     struct usb_dev *d = &X.devs[slot];
-    irqstate_t s = irq_off();
+    irqstate_t s = ev_lock();
     for (int i = 0; i < d->nhid; i++) d->hid[i].active = false;
     d->msc.present = false;
     d->msc.in_addr = d->msc.out_addr = 0;
     d->used = false;
     d->info.present = false;
-    irq_restore(s);
+    ev_unlock(s);
     command(TRB_TYPE(TRB_DISABLE_SLOT) | TRB_SLOT(slot), 0, NULL);
     X.dcbaa[slot] = 0;
     X.port_slot[port] = 0;
@@ -1118,7 +1135,7 @@ static void release_port(uint32_t port)
 static int settle_locked(void)
 {
     xhci_poll();
-    X.port_pending = 0;
+    __atomic_store_n(&X.port_pending, 0, __ATOMIC_RELAXED);
     uint64_t now = now_ms();
     int pending = 0;
 
@@ -1184,8 +1201,7 @@ int xhci_settle_step(void)
 
 static void recover_endpoints_locked(void)
 {
-    if (!X.ep_pending) return;
-    X.ep_pending = false;
+    if (!__atomic_exchange_n(&X.ep_pending, false, __ATOMIC_ACQUIRE)) return;
     for (uint32_t slot = 1; slot <= X.max_slots; slot++) {
         struct usb_dev *d = &X.devs[slot];
         if (!d->used) continue;

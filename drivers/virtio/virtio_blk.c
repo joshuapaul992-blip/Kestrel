@@ -259,7 +259,9 @@ static int vblk_flush(struct blkdev *b)
     return v->features & F_FLUSH ? submit(v, T_FLUSH, 0, NULL, 0) : 0;
 }
 
-static const struct blkdev_ops vblk_ops = { .read = vblk_read, .write = vblk_write, .flush = vblk_flush };
+/* One request per disk at a time (block.c: disk_lock), one queue per disk */
+static const struct blkdev_ops vblk_ops = { .read = vblk_read, .write = vblk_write, .flush = vblk_flush,
+                                            .nolock = true };
 
 /* ---- bring-up -------------------------------------------------------------- */
 static bool vblk_init(struct pci_device *d)
@@ -342,6 +344,7 @@ void virtio_blk_enable_irqs(void)
         C16(v, QSEL) = 0;
         C16(v, QMSIX) = 0;                              /* table entry 0 */
         if (C16(v, QMSIX) != 0) { msi_disable(v->pci, vec); continue; }    /* the device refused it */
+        msi_set_lockless(vec);                          /* it only wakes the waiter */
         v->avail->flags = 0;                            /* interrupts on */
         barrier();
         v->vector = vec;

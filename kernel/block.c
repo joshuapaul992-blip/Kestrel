@@ -62,24 +62,29 @@ void blk_guid_str(const uint8_t g[16], char out[37])
  * request itself may sleep while the device works: see io_pause.) */
 static void disk_lock(struct blkdev *d)
 {
-    for (;;) {
-        uint64_t f = irq_save();
-        bool ok = !d->io_busy;
-        if (ok) d->io_busy = true;
-        irq_restore(f);
-        if (ok) return;
-        io_pause(d, 20);
-    }
+#ifdef LOCKCHECK
+    lockcheck_name_once(d, "disk");
+    lockcheck_acquire(d, &d->lc, LC_MUTEX, false, (uint64_t)__builtin_return_address(0));
+#endif
+    while (__atomic_exchange_n(&d->io_busy, true, __ATOMIC_ACQUIRE)) io_pause(d, 20);
 }
-static void disk_unlock(struct blkdev *d) { d->io_busy = false; io_wake(d); }
-
-/* The disk drivers (and the xHCI one, which USB input shares) still
- * expect the big kernel lock: a caller without it (a file read that missed
- * the page cache) takes it for the request. A request sleeps while the
- * device works, and the lock is let go meanwhile. */
-static bool io_lock(void)
+static void disk_unlock(struct blkdev *d)
 {
-    if (bkl_depth()) return false;
+#ifdef LOCKCHECK
+    lockcheck_release(d, LC_MUTEX);
+#endif
+    __atomic_store_n(&d->io_busy, false, __ATOMIC_RELEASE);
+    io_wake(d);
+}
+
+/* A driver that is not nolock (blkdev_ops) expects the big kernel lock: a
+ * caller without it (a file read that missed the page cache) takes it for
+ * the request. A request sleeps while the device works, and the lock is
+ * let go meanwhile. */
+static bool io_lock(struct blkdev *b)
+{
+    struct blkdev *disk = blk_disk_of(b);
+    if (bkl_depth() || (disk && disk->ops->nolock)) return false;
     bkl_enter();
     return true;
 }
@@ -91,7 +96,7 @@ static int flush_locked(struct blkdev *b);
 
 int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
 {
-    bool took = io_lock();
+    bool took = io_lock(b);
     int r = read_locked(b, lba, count, buf);
     io_unlock(took);
     return r;
@@ -99,7 +104,7 @@ int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
 
 int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
 {
-    bool took = io_lock();
+    bool took = io_lock(b);
     int r = write_locked(b, lba, count, buf);
     io_unlock(took);
     return r;
@@ -107,7 +112,7 @@ int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
 
 int blk_flush(struct blkdev *b)
 {
-    bool took = io_lock();
+    bool took = io_lock(b);
     int r = flush_locked(b);
     io_unlock(took);
     return r;
@@ -227,7 +232,9 @@ static ssize_t node_write(struct vnode *vn, const void *buf, size_t len, uint64_
     return -EROFS;
 }
 static uint64_t node_size(struct vnode *vn) { return blk_size_bytes(vn->ctx); }
-static const struct vnode_ops node_ops = { .read = node_read, .write = node_write, .size = node_size };
+/* blk_read takes the big lock itself for a driver that needs it */
+static const struct vnode_ops node_ops = { .read = node_read, .write = node_write, .size = node_size,
+                                           .nolock = true };
 
 void blk_publish(void)
 {
