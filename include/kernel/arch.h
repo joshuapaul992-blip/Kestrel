@@ -40,6 +40,9 @@ typedef void (*irq_handler_t)(struct int_frame *f);
 
 void idt_init(void);
 void idt_load(void);                 /* this CPU (APs share the IDT) */
+/* The kernel function containing addr and the offset into it, or NULL
+ * (the symbol table of the second link, tools/ksyms.py). */
+const char *ksym(uint64_t a, uint64_t *off);
 void irq_register(int irq, irq_handler_t h);
 uint64_t irq_count(int irq);
 

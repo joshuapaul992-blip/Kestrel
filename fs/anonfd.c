@@ -117,6 +117,7 @@ int eventfd_create(uint32_t initval, int flags, struct file **out)
     if (flags & ~(EFD_SEMAPHORE | NONBLOCK_FLAG | CLOEXEC_FLAG)) return -EINVAL;
     struct eventfd *e = kzalloc(sizeof *e);
     if (!e) return -ENOMEM;
+    lockcheck_name(&e->lock, "eventfd");
     e->count = initval;
     e->semaphore = flags & EFD_SEMAPHORE;
     int r = new_file(anon_vnode(&e->vn, "anon_inode:[eventfd]", &efd_ops, e), flags, out);

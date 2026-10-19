@@ -63,7 +63,9 @@ static struct bucket {
 static struct bucket *bucket_of(const struct futex_key *k)
 {
     uint64_t h = k->a * 0x9E3779B97F4A7C15ull ^ (k->b >> 2) * 0xC2B2AE3D27D4EB4Full;
-    return &buckets[(h >> 32) % NBUCKETS];
+    struct bucket *b = &buckets[(h >> 32) % NBUCKETS];
+    lockcheck_name_once(&b->lock, "futex bucket");
+    return b;
 }
 
 static bool key_eq(const struct futex_key *x, const struct futex_key *y) { return x->a == y->a && x->b == y->b; }

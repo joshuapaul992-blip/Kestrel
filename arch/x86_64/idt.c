@@ -167,7 +167,7 @@ extern const uint64_t ksym_addr[];
 extern const uint32_t ksym_off[];
 extern const char ksym_names[];
 
-static const char *ksym(uint64_t a, uint64_t *off)
+const char *ksym(uint64_t a, uint64_t *off)
 {
     if (!ksym_count || a < ksym_addr[0]) return NULL;
     unsigned lo = 0, hi = ksym_count;                   /* last symbol <= a */
