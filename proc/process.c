@@ -657,27 +657,28 @@ static void set_ids(struct tcb *t, int pgid, int sid, bool drop_ctty)
 int64_t proc_setsid(void)
 {
     struct tcb *t = current_task();
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* the tree's ids */
     for (int i = 0; i < MAX_TASKS; i++) {               /* must not lead a group already */
         struct tcb *o = task_slot(i);
-        if (o->state != TASK_UNUSED && o->user && o->pgid == t->tgid) { irq_restore(fl); return -EPERM; }
+        if (o->state != TASK_UNUSED && o->user && o->pgid == t->tgid) { spin_unlock_irqrestore(&proc_lock, fl); return -EPERM; }
     }
     set_ids(t, t->tgid, t->tgid, true);                 /* a new session has no terminal */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&proc_lock, fl);
     return t->sid;
 }
 
 int64_t proc_setpgid(int64_t pid, int64_t pgid)
 {
     struct tcb *self = current_task();
-    struct tcb *t = pid ? process_of((int)pid) : self;
-    if (!proc_alive(t) || !t->user || (!same_group(t, self) && t->ppid != self->tgid)) return -ESRCH;
     if (pgid < 0) return -EINVAL;
-    if (t->sid == t->tgid) return -EPERM;               /* session leader */
-    uint64_t fl = irq_save();
-    set_ids(t, pgid ? (int)pgid : t->tgid, 0, false);
-    irq_restore(fl);
-    return 0;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* found and changed in one hold */
+    struct tcb *t = pid ? process_of((int)pid) : self;
+    int64_t r = 0;
+    if (!proc_alive(t) || !t->user || (!same_group(t, self) && t->ppid != self->tgid)) r = -ESRCH;
+    else if (t->sid == t->tgid) r = -EPERM;             /* session leader */
+    else set_ids(t, pgid ? (int)pgid : t->tgid, 0, false);
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
 }
 
 int64_t proc_getpgid(int64_t pid)
@@ -825,6 +826,17 @@ uint64_t signal_pending_mask(void)
 {
     struct tcb *t = current_task();
     return t->user ? pending_of(t) : 0;
+}
+
+/* Sleep until a signal in mask is pending (signalfd), or one to deliver. */
+void signal_wait_mask(uint64_t mask)
+{
+    struct tcb *t = current_task();
+    if (!t->user) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* senders set pending, and wake, under it */
+    while (!(pending_of(t) & mask & ~UNBLOCKABLE) && !signal_pending())
+        sleep_on_locked(&signal_wait_chan, &proc_lock);
+    spin_unlock_irqrestore(&proc_lock, fl);
 }
 
 int signal_dequeue(uint64_t mask, struct ksig_info *info)

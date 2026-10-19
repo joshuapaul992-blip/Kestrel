@@ -691,6 +691,22 @@ void sleep_on_locked(void *chan, struct spinlock *l)
     spin_lock_irqsave(l);                       /* interrupts are off already */
 }
 
+/* sleep_on_until(), letting l go meanwhile, as sleep_on_locked() does. */
+void sleep_on_until_locked(void *chan, uint64_t deadline_ms, struct spinlock *l)
+{
+    if (!running || cur->pid == 0) {
+        spin_unlock_keep_irqs(l);
+        sti(); hlt(); cli();
+        spin_lock_irqsave(l);
+        return;
+    }
+    task_block_self(chan, deadline_ms);
+    spin_unlock_keep_irqs(l);
+    schedule();
+    cur->wait_chan = NULL;
+    spin_lock_irqsave(l);
+}
+
 void sleep_on_until(void *chan, uint64_t deadline_ms)
 {
     if (!running || cur->pid == 0) { sti(); hlt(); cli(); return; }

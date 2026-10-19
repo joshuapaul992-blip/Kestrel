@@ -214,6 +214,7 @@ void        sleep_on(void *chan);       /* call with interrupts disabled */
 void        sleep_on_locked(void *chan, struct spinlock *l);
 /* sleep_on() that also ends at deadline_ms of time_ms() (0: none) */
 void        sleep_on_until(void *chan, uint64_t deadline_ms);
+void        sleep_on_until_locked(void *chan, uint64_t deadline_ms, struct spinlock *l);
 void        wakeup(void *chan);
 /* Wake only the tasks sleeping on chan, not every poll()/epoll sleeper as
  * wakeup() does: for things nobody polls (mutexes, device completions). */

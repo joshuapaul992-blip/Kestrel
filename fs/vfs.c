@@ -802,7 +802,13 @@ int vfs_statfs(struct vnode *vn, struct kstatfs *st)
     st->f_namelen = VFS_NAME_MAX - 1;
     st->f_type = 0x858458f6;                            /* RAMFS_MAGIC unless the fs says else */
     if (m) { st->f_fsid[0] = (int32_t)m->dev; if (m->flags & MNT_RDONLY) st->f_flags |= 1; }
-    if (m && m->statfs) return m->statfs(m, st);
+    if (m && m->statfs) {
+        bool bkl = vn->ops && !vn->ops->nolock && !bkl_depth();    /* statfs(2) by name */
+        if (bkl) bkl_enter();
+        int r = m->statfs(m, st);
+        if (bkl) bkl_exit();
+        return r;
+    }
     st->f_blocks = st->f_bfree = st->f_bavail = pmm_free_bytes() / 4096;   /* memory is the limit */
     return 0;
 }
@@ -1277,7 +1283,10 @@ int vfs_truncate(struct vnode *vn, uint64_t size)
     if (vn->type != VREG) return -EINVAL;
     if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
     if (!vn->ops || !vn->ops->truncate) return -EINVAL;
+    bool bkl = !vn->ops->nolock && !bkl_depth();        /* truncate(2) by name: no fget took it */
+    if (bkl) bkl_enter();
     int r = vn->ops->truncate(vn, size);
+    if (bkl) bkl_exit();
     if (!r) { vn->mtime = (uint64_t)time_realtime_sec(); inotify_self(vn, IN_MODIFY); }
     return r;
 }

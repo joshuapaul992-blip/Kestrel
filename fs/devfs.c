@@ -22,22 +22,26 @@ static ssize_t null_read(struct vnode *v, void *b, size_t n, uint64_t o)        
 static ssize_t sink_write(struct vnode *v, const void *b, size_t n, uint64_t o) { (void)v; (void)b; (void)o; return (ssize_t)n; }
 static ssize_t zero_read(struct vnode *v, void *b, size_t n, uint64_t o)        { (void)v; (void)o; memset(b, 0, n); return (ssize_t)n; }
 
-static uint64_t rng_state;
+/* Each read its own xorshift stream, seeded from a shared counter and the
+ * clock: readers on several CPUs never share a state. */
+static uint64_t rng_seed;
 static ssize_t random_read(struct vnode *v, void *b, size_t n, uint64_t o)
 {
     (void)v; (void)o;
-    if (!rng_state) rng_state = rdtsc() | 1;
+    uint64_t s = __atomic_add_fetch(&rng_seed, 0x9e3779b97f4a7c15ull, __ATOMIC_RELAXED) ^ rdtsc();
+    if (!s) s = 1;
     uint8_t *p = b;
     for (size_t i = 0; i < n; i++) {
-        rng_state ^= rng_state << 13; rng_state ^= rng_state >> 7; rng_state ^= rng_state << 17;
-        p[i] = (uint8_t)(rng_state >> 24);
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        p[i] = (uint8_t)(s >> 24);
     }
     return (ssize_t)n;
 }
 
-static const struct vnode_ops null_ops   = { .read = null_read,   .write = sink_write };
-static const struct vnode_ops zero_ops   = { .read = zero_read,   .write = sink_write };
-static const struct vnode_ops random_ops = { .read = random_read, .write = sink_write };
+/* these, the serial port and kmsg need no big kernel lock (nolock) */
+static const struct vnode_ops null_ops   = { .read = null_read,   .write = sink_write, .nolock = true };
+static const struct vnode_ops zero_ops   = { .read = zero_read,   .write = sink_write, .nolock = true };
+static const struct vnode_ops random_ops = { .read = random_read, .write = sink_write, .nolock = true };
 
 /* ---- tty: one terminal per monitor --------------------------------------
  *
@@ -147,7 +151,7 @@ static ssize_t serial_dev_write(struct vnode *v, const void *buf, size_t n, uint
     for (size_t i = 0; i < n; i++) serial_putc(s[i]);
     return (ssize_t)n;
 }
-static const struct vnode_ops serial_ops = { .read = null_read, .write = serial_dev_write };
+static const struct vnode_ops serial_ops = { .read = null_read, .write = serial_dev_write, .nolock = true };
 
 /* ---- report: text for REPORT.TXT on the boot stick (report.h) ----------- */
 static ssize_t report_dev_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
@@ -176,7 +180,7 @@ static ssize_t kmsg_write(struct vnode *v, const void *buf, size_t n, uint64_t o
     return (ssize_t)n;
 }
 static uint64_t kmsg_size(struct vnode *v) { (void)v; return klog_size(); }
-static const struct vnode_ops kmsg_ops = { .read = kmsg_read, .write = kmsg_write, .size = kmsg_size };
+static const struct vnode_ops kmsg_ops = { .read = kmsg_read, .write = kmsg_write, .size = kmsg_size, .nolock = true };   /* log_lock */
 
 /* ---- fbN: one per monitor, for graphics clients (see kfb.h) ------------- */
 static int fb_owner[MAX_MONITORS];          /* pid holding KD_GRAPHICS, 0 = none */

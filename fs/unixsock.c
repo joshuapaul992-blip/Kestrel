@@ -7,8 +7,9 @@
  * uses sleep_on_locked()/wakeup() on the usock whose state matters (its
  * receive buffer, or its accept queue). Nothing under the lock sleeps,
  * faults or closes a file: descriptors in flight are closed after it is
- * dropped. The name table is the big lock's (bind, connect and the last
- * close all run under it).
+ * dropped. The name table is the same lock's: bind fills a slot, connect
+ * finds its listener and queues on it, and the last close empties it, each
+ * in one hold.
  *
  * Data is copied once each way, between the ring and the caller's memory
  * (user memory, which may fault), with the lock dropped. A sender claims
@@ -247,18 +248,22 @@ int usock_bind(struct file *f, const struct sockaddr_un *a, uint32_t len)
     int rc = parse_addr(a, len, &abstract, name, &nl);
     if (rc) return rc;
     if (s->bound || s->state != US_NEW) return -EINVAL;
-    int slot = -1;
-    for (int i = 0; i < MAX_NAMES; i++) {
-        if (!names[i].used) { if (slot < 0) slot = i; continue; }
-        if (abstract && names[i].abstract && names[i].namelen == nl && !memcmp(names[i].name, name, nl)) return -EADDRINUSE;
-    }
-    if (slot < 0) return -ENOMEM;
     uint64_t ino = 0;
-    if (!abstract) {
+    if (!abstract) {                            /* the node first: an existing file is EADDRINUSE */
         struct vnode *node;
-        if ((rc = vfs_mksock(name, 0777, &node)) < 0) return rc;    /* existing file: EADDRINUSE */
+        if ((rc = vfs_mksock(name, 0777, &node)) < 0) return rc;
         ino = node->ino;
     }
+    uint64_t fl = spin_lock_irqsave(&lock);
+    int slot = -1;
+    rc = 0;
+    if (s->bound || s->state != US_NEW) rc = -EINVAL;   /* another thread bound it meanwhile */
+    for (int i = 0; i < MAX_NAMES && !rc; i++) {
+        if (!names[i].used) { if (slot < 0) slot = i; continue; }
+        if (abstract && names[i].abstract && names[i].namelen == nl && !memcmp(names[i].name, name, nl)) rc = -EADDRINUSE;
+    }
+    if (!rc && slot < 0) rc = -ENOMEM;
+    if (rc) { spin_unlock_irqrestore(&lock, fl); return rc; }   /* a path's node stays, as on Linux */
     names[slot].used = true;
     names[slot].abstract = abstract;
     names[slot].ino = ino;
@@ -268,6 +273,7 @@ int usock_bind(struct file *f, const struct sockaddr_un *a, uint32_t len)
     memcpy(&s->addr, a, len);
     s->addrlen = len;
     s->bound = true;
+    spin_unlock_irqrestore(&lock, fl);
     return 0;
 }
 
@@ -285,17 +291,9 @@ int usock_listen(struct file *f, int backlog)
     return r;
 }
 
-static struct usock *find_listener(bool abstract, const char *name, uint32_t nl)
+/* The socket bound to a name (lock held); ino: a path's VSOCK node. */
+static struct usock *find_listener(bool abstract, const char *name, uint32_t nl, uint64_t ino)
 {
-    uint64_t ino = 0;
-    if (!abstract) {
-        struct vnode *node;
-        if (vfs_lookup(name, &node) < 0) return NULL;
-        bool sock = node->type == VSOCK;
-        ino = node->ino;
-        vfs_vnode_put(node);
-        if (!sock) return NULL;
-    }
     for (int i = 0; i < MAX_NAMES; i++) {
         if (!names[i].used || names[i].abstract != abstract) continue;
         if (abstract ? (names[i].namelen == nl && !memcmp(names[i].name, name, nl)) : names[i].ino == ino)
@@ -312,19 +310,21 @@ int usock_connect(struct file *f, const struct sockaddr_un *a, uint32_t len)
     if (rc) return rc;
     if (s->state == US_CONNECTED) return -EISCONN;
     if (s->state == US_LISTEN) return -EINVAL;
+    uint64_t ino = 0;
     if (!abstract) {
         struct vnode *node;
         if ((rc = vfs_lookup(name, &node)) < 0) return rc;
         bool sock = node->type == VSOCK;
+        ino = node->ino;
         vfs_vnode_put(node);
         if (!sock) return -ECONNREFUSED;
     }
-    struct usock *l = find_listener(abstract, name, nl);        /* the name table: big lock */
-    if (!l) return -ECONNREFUSED;
     struct usock *srv = usock_new(s->type);     /* before the lock: it allocates */
     if (!srv) return -ENOMEM;
-    uint64_t fl = spin_lock_irqsave(&lock);
-    if (s->state == US_CONNECTED) rc = -EISCONN;
+    uint64_t fl = spin_lock_irqsave(&lock);     /* the listener stays while it is held */
+    struct usock *l = find_listener(abstract, name, nl, ino);
+    if (!l) rc = -ECONNREFUSED;
+    else if (s->state == US_CONNECTED) rc = -EISCONN;
     else if (l->state != US_LISTEN) rc = -ECONNREFUSED;
     else if (l->type != s->type) rc = -EPROTOTYPE;
     else if (l->qlen >= l->backlog) rc = (f->flags & O_NONBLOCK) ? -EAGAIN : -ECONNREFUSED;
