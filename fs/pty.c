@@ -25,11 +25,12 @@
  * Locking: each pty has its own spinlock over its queues, settings and
  * open counts, so reads, writes, polls and the common ioctls (settings,
  * window size, bytes waiting) run without the big kernel lock. What reaches
- * other processes takes the big lock, never inside the pty's: the signals
- * of the line discipline (collected in `sigs` and sent after the pty's lock
- * is let go), the controlling terminal and foreground group (TIOCSCTTY,
- * TIOCNOTTY, TIOCSPGRP, opening a slave) and the last close of a side.
- * Slots are claimed and freed under alloc_lock. */
+ * other processes takes the process tree's lock (proc_lock), never inside
+ * the pty's: the signals of the line discipline (collected in `sigs` and
+ * sent after the pty's lock is let go), and the session, foreground group
+ * and controlling terminals (`session`, `fg_pgrp`, each task's `ctty`):
+ * TIOCSCTTY, TIOCNOTTY, TIOCSPGRP, opening a slave and the hang-up at the
+ * master's last close. Slots are claimed and freed under alloc_lock. */
 #include <kernel/vfs.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
@@ -143,7 +144,7 @@ static void erase_one(struct pty *p)
     }
 }
 
-/* The big lock is held: these reach other processes. */
+/* proc_lock held: these reach other processes. */
 static void group_signal(struct pty *p, int sig)
 {
     if (!p->fg_pgrp) return;
@@ -151,7 +152,7 @@ static void group_signal(struct pty *p, int sig)
         struct tcb *t = task_slot(i);
         if (t->state != TASK_UNUSED && t->user && t->pid == t->tgid && t->signal->nr_threads > 0 &&
             t->pgid == p->fg_pgrp)
-            signal_send(t, sig);                        /* to each process once, via its leader */
+            signal_send_locked(t, sig);                 /* to each process once, via its leader */
     }
 }
 
@@ -211,25 +212,25 @@ static void set_termios(struct pty *p, const struct ktermios *n)
 }
 
 /* The line discipline's signals, collected under p->lock (take_sigs),
- * sent after it is let go, with the big lock. */
+ * sent after it is let go, under proc_lock. */
 static uint32_t take_sigs(struct pty *p) { uint32_t s = p->sigs; p->sigs = 0; return s; }
 
 static void send_sigs(struct pty *p, uint32_t sigs)
 {
     if (!sigs) return;
-    bkl_enter();
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int sig = 1; sig < 32; sig++) if (sigs & (1u << sig)) group_signal(p, sig);
-    bkl_exit();
+    spin_unlock_irqrestore(&proc_lock, fl);
 }
 
 /* The session loses its terminal: SIGHUP for its foreground group and its
- * leader. The big lock is held. */
+ * leader. proc_lock held. */
 static void hangup_session(struct pty *p)
 {
     if (!p->session) return;
     group_signal(p, SIGHUP);
     struct tcb *lead = task_find(p->session);
-    if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
+    if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send_locked(lead, SIGHUP);
 }
 
 static size_t slave_readable(const struct pty *p)
@@ -257,8 +258,7 @@ static void pty_defaults(struct pty *p)
 }
 
 /* The last master and slave are closed: the slot goes back. Decided under
- * both locks, once: a master and a slave closing at once (the big lock
- * does not keep them apart across a preemption) must not both free it, or
+ * both locks, once: a master and a slave closing at once must not both free it, or
  * the second would free the pty a new ptmx_open() took meanwhile. A pty
  * with no master open refuses slave opens, so none starts meanwhile. */
 static void pty_free_if_unused(struct pty *p)
@@ -270,10 +270,12 @@ static void pty_free_if_unused(struct pty *p)
     spin_unlock_keep_irqs(&p->lock);
     spin_unlock_irqrestore(&alloc_lock, fl);
     if (!unused) return;
+    fl = spin_lock_irqsave(&proc_lock);
     for (int i = 0; i < MAX_TASKS; i++) {               /* nobody's controlling tty any more */
         struct tcb *t = task_slot(i);
         if (t->state != TASK_UNUSED && t->ctty == p->index + 1) t->ctty = 0;
     }
+    spin_unlock_irqrestore(&proc_lock, fl);
     fl = spin_lock_irqsave(&alloc_lock);
     p->freeing = false;
     p->used = false;
@@ -319,7 +321,7 @@ static int ptmx_open(struct vnode *vn, int flags, struct file **out)
 }
 
 /* The calling process takes `p` as its session's controlling terminal.
- * The big lock is held. */
+ * proc_lock held. */
 static void acquire_ctty(struct pty *p)
 {
     struct tcb *t = current_task();
@@ -332,7 +334,6 @@ static int slave_open(struct vnode *vn, int flags, struct file **out)
 {
     int idx = (int)(intptr_t)vn->ctx;
     struct pty *p = &ptys[idx];
-    bkl_enter();                                        /* the session it may join */
     /* counted as open before the file exists: a master closing meanwhile
      * then does not free the slot under us (pty_free_if_unused) */
     uint64_t fl = spin_lock_irqsave(&p->lock);
@@ -348,7 +349,9 @@ static int slave_open(struct vnode *vn, int flags, struct file **out)
         spin_unlock_irqrestore(&p->lock, fl);
         if (f) {
             struct tcb *t = current_task();
+            fl = spin_lock_irqsave(&proc_lock);         /* the session it may join */
             if (!(flags & O_NOCTTY) && t->user && t->sid == t->pid && !t->ctty && !p->session) acquire_ctty(p);
+            spin_unlock_irqrestore(&proc_lock, fl);
             *out = f;
             r = 0;
         } else {
@@ -356,7 +359,6 @@ static int slave_open(struct vnode *vn, int flags, struct file **out)
             r = -ENOMEM;
         }
     }
-    bkl_exit();
     return r;
 }
 
@@ -446,15 +448,15 @@ static int master_poll(struct file *f, int events)
 static void master_release(struct file *f)
 {
     struct pty *p = pty_of(f);
-    bkl_enter();                                        /* the session's processes, the slot */
     uint64_t fl = spin_lock_irqsave(&p->lock);
     p->masters = 0;
     wakeup(&p->in);
     wakeup(&p->out);
     spin_unlock_irqrestore(&p->lock, fl);
+    fl = spin_lock_irqsave(&proc_lock);
     hangup_session(p);                                  /* its foreground group and leader: SIGHUP */
+    spin_unlock_irqrestore(&proc_lock, fl);
     pty_free_if_unused(p);
-    bkl_exit();
 }
 
 /* ---- slave side ------------------------------------------------------------ */
@@ -541,13 +543,11 @@ static int slave_poll(struct file *f, int events)
 static void slave_release(struct file *f)
 {
     struct pty *p = pty_of(f);
-    bkl_enter();                                        /* the slot */
     uint64_t fl = spin_lock_irqsave(&p->lock);
     if (p->slaves) p->slaves--;
     wakeup(&p->out);                                    /* master readers see EIO/HUP */
     spin_unlock_irqrestore(&p->lock, fl);
     pty_free_if_unused(p);
-    bkl_exit();
 }
 
 /* ---- ioctls (both sides) ------------------------------------------------- */
@@ -556,7 +556,7 @@ static void slave_release(struct file *f)
 static bool uptr(void *arg, size_t len) { (void)len; return arg != NULL; }
 
 /* Who owns the terminal: these change other processes' view of it, so they
- * run with the big lock (pty_ioctl takes it). */
+ * run under proc_lock (pty_ioctl takes it). */
 static int pty_ioctl_owner(struct pty *p, bool master, unsigned long req, void *arg)
 {
     struct tcb *t = current_task();
@@ -592,9 +592,9 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
     bool master = f->vn->ops == &master_ops;
     struct tcb *t = current_task();
     if (req == TIOCSCTTY || req == TIOCNOTTY || req == TIOCSPGRP) {
-        bkl_enter();
+        uint64_t fl = spin_lock_irqsave(&proc_lock);
         int r = pty_ioctl_owner(p, master, req, arg);
-        bkl_exit();
+        spin_unlock_irqrestore(&proc_lock, fl);
         return r;
     }
     uint64_t fl;
@@ -666,7 +666,7 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
     }
     case TCSBRK: case TCSBRKP: case TCXONC:
         return 0;                                       /* nothing is ever pending */
-    /* reading who owns it: single words, set with the big lock */
+    /* reading who owns it: single words, set under proc_lock */
     case TIOCGPGRP:
         if (!uptr(arg, 4)) return -EFAULT;
         if (!master && t->ctty != p->index + 1) return -ENOTTY;
@@ -702,21 +702,28 @@ static const struct vnode_ops slave_ops = {
     .open = slave_open, .fread = slave_read, .fwrite = slave_write, .poll = slave_poll,
     .release = slave_release, .fioctl = pty_ioctl, .nolock = true,
 };
-static const struct vnode_ops ptmx_ops = { .open = ptmx_open };
+static const struct vnode_ops ptmx_ops = { .open = ptmx_open, .nolock = true };    /* alloc_lock */
 
-/* /dev/tty for a process whose controlling terminal is a pty. The big lock
- * is held (devfs's open). */
+/* /dev/tty for a process whose controlling terminal is a pty. Counted as
+ * open before the file exists, as slave_open() does. */
 int pty_open_ctty(int flags, struct file **out)
 {
-    struct tcb *t = current_task();
-    if (!t->ctty || t->ctty > PTY_MAX) return -ENXIO;
-    struct pty *p = &ptys[t->ctty - 1];
-    if (!p->used || !p->masters) return -EIO;
-    struct file *f = vfs_file_new(slave_node(p), flags);
-    if (!f) return -ENOMEM;
+    int ctty = current_task()->ctty;
+    if (!ctty || ctty > PTY_MAX) return -ENXIO;
+    struct pty *p = &ptys[ctty - 1];
     uint64_t fl = spin_lock_irqsave(&p->lock);
-    p->slaves++;
+    bool ok = p->used && !p->freeing && p->masters;
+    if (ok) p->slaves++;
     spin_unlock_irqrestore(&p->lock, fl);
+    if (!ok) return -EIO;
+    struct file *f = vfs_file_new(slave_node(p), flags);
+    if (!f) {
+        fl = spin_lock_irqsave(&p->lock);
+        p->slaves--;
+        spin_unlock_irqrestore(&p->lock, fl);
+        pty_free_if_unused(p);
+        return -ENOMEM;
+    }
     *out = f;
     return 0;
 }
@@ -753,24 +760,24 @@ void pty_console_input(int idx, const void *buf, size_t len) { in_write(&ptys[id
 void pty_console_hangup(int idx)
 {
     struct pty *p = &ptys[idx];
-    bkl_enter();                                        /* the session's processes */
+    uint64_t fl = spin_lock_irqsave(&proc_lock);       /* the session's processes */
     hangup_session(p);
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
         if (t->state != TASK_UNUSED && t->ctty == idx + 1) t->ctty = 0;
     }
-    uint64_t fl = spin_lock_irqsave(&p->lock);
+    p->session = p->fg_pgrp = 0;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    fl = spin_lock_irqsave(&p->lock);
     struct kwinsize ws = p->ws;
     pty_defaults(p);
     p->ws = ws;
-    p->session = p->fg_pgrp = 0;
     p->slave_seen = false;
     flush_input(p);
     p->sigs = 0;
     wakeup(&p->in);
     wakeup(&p->out);
     spin_unlock_irqrestore(&p->lock, fl);
-    bkl_exit();
 }
 
 void pty_init(struct vnode *devroot)
