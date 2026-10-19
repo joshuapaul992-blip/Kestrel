@@ -8,12 +8,15 @@
  * an idle network costs one memory read per tick. "lo" (127.0.0.1/8) is
  * built in.
  *
- * Context. All stack state is changed with interrupts off on the CPU that
- * holds the big kernel lock, as in the rest of the kernel, so neither a
- * preemption nor the network thread can run in the middle of an update.
- * The network thread ("netd") receives, runs the timers (ARP, TCP
+ * Context. All stack state (interfaces, routes, ARP, sockets and their
+ * connections, the drivers' rings) is changed under the stack's own lock,
+ * net_lock(), not the big kernel lock: one holder at a time, with
+ * interrupts off, taken again freely by its holder. A socket call takes it
+ * at its entry point and gives it up while it sleeps (net_sleep). The
+ * network thread ("netd") receives, runs the timers (ARP, TCP
  * retransmission, DHCP) and sleeps until the next deadline or new frames.
- * System calls send directly.
+ * System calls send directly. The stack never touches user memory: the
+ * system calls copy through kernel buffers.
  *
  * Byte order. Addresses and ports are kept in network byte order
  * everywhere (as in struct sockaddr_in); `be32`/`be16` convert numbers.
@@ -29,6 +32,10 @@ static inline uint16_t be16(uint16_t v) { return __builtin_bswap16(v); }
 static inline uint32_t be32(uint32_t v) { return __builtin_bswap32(v); }
 static inline int mask_bits(uint32_t m) { int n = 0; while (m) { m &= m - 1; n++; } return n; }
 #define IP4(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
+
+uint64_t net_lock(void);                        /* the interrupt flag, for net_unlock */
+void     net_unlock(uint64_t flags);
+void     net_sleep(void *chan, uint64_t deadline_ms);  /* lock held: all of it let go while asleep */
 
 #define ETH_ALEN        6
 #define ETH_HLEN        14

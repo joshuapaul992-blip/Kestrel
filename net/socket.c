@@ -41,7 +41,7 @@ int sock_wait(void *chan, uint64_t deadline)
     if (net_lo_flush()) return 0;
     if (signal_pending()) return -ERESTARTSYS;
     if (deadline && time_ms() >= deadline) return -EAGAIN;
-    sleep_on_until(chan, deadline);
+    net_sleep(chan, deadline);                         /* the entry point holds net_lock */
     if (signal_pending()) return -ERESTARTSYS;
     return 0;
 }
@@ -107,16 +107,16 @@ int inet_create(int type, int protocol, struct file **out)
     }
     struct isock *s = isock_new(type, proto);
     if (!s) return -ENOMEM;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     if (proto == IPPROTO_TCP) {
         int rc = tcp_attach(s);
-        if (rc) { irq_restore(f); kfree(s); return rc; }
+        if (rc) { net_unlock(f); kfree(s); return rc; }
     } else {
         dgram_register(s);
     }
-    irq_restore(f);
+    net_unlock(f);
     struct file *file = vfs_file_new(&s->vn, O_RDWR | ((flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0));
-    if (!file) { uint64_t g = irq_save(); if (s->tcb) tcp_close(s); else dgram_unregister(s); irq_restore(g); kfree(s); return -ENOMEM; }
+    if (!file) { uint64_t g = net_lock(); if (s->tcb) tcp_close(s); else dgram_unregister(s); net_unlock(g); kfree(s); return -ENOMEM; }
     *out = file;
     return 0;
 }
@@ -150,7 +150,7 @@ int inet_bind(struct file *f, const void *addr, uint32_t len)
     if (len < sizeof sin) return -EINVAL;
     memcpy(&sin, addr, sizeof sin);
     if (sin.sin_family != AF_INET && !(sin.sin_family == 0 && sin.sin_addr == 0)) return -EAFNOSUPPORT;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     int rc = 0;
     if (s->lport && s->type != SOCK_RAW) { rc = -EINVAL; goto out; }
     if (sin.sin_addr && !ip_is_local(sin.sin_addr) && sin.sin_addr != 0xffffffffu && (sin.sin_addr & 0xf0) != 0xe0) {
@@ -169,7 +169,7 @@ int inet_bind(struct file *f, const void *addr, uint32_t len)
     s->laddr = sin.sin_addr;
     s->lport = port;
 out:
-    irq_restore(fl);
+    net_unlock(fl);
     return rc;
 }
 
@@ -177,9 +177,9 @@ int inet_listen(struct file *f, int backlog)
 {
     struct isock *s = isk(f);
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     int rc = tcp_listen(s, backlog);
-    irq_restore(fl);
+    net_unlock(fl);
     return rc;
 }
 
@@ -199,16 +199,16 @@ static int inet_connect_(struct file *f, const void *addr, uint32_t len)
     int rc = get_sin(addr, len, &sin);
     if (rc) return rc;
     if (s->type == SOCK_STREAM) return tcp_connect(s, f, sin.sin_addr, sin.sin_port);
-    uint64_t fl = irq_save();
-    if (sin.sin_addr == 0xffffffffu && !s->broadcast) { irq_restore(fl); return -EACCES; }
-    if ((rc = autobind(s))) { irq_restore(fl); return rc; }
+    uint64_t fl = net_lock();
+    if (sin.sin_addr == 0xffffffffu && !s->broadcast) { net_unlock(fl); return -EACCES; }
+    if ((rc = autobind(s))) { net_unlock(fl); return rc; }
     uint32_t dst = sin.sin_addr ? sin.sin_addr : IP4(127, 0, 0, 1);
-    if (!s->laddr && !ip_source_for(dst) && dst != 0xffffffffu) { irq_restore(fl); return -ENETUNREACH; }
+    if (!s->laddr && !ip_source_for(dst) && dst != 0xffffffffu) { net_unlock(fl); return -ENETUNREACH; }
     s->raddr = dst;
     s->rport = sin.sin_port;
     s->connected = true;
     dgram_flush(s);                                     /* Linux keeps them; nobody depends on it */
-    irq_restore(fl);
+    net_unlock(fl);
     return 0;
 }
 
@@ -220,7 +220,7 @@ static int inet_accept_(struct file *f, int flags, struct file **out, struct soc
     int rc = tcp_accept(s, f, &ns);
     if (rc) return rc;
     struct file *nf = vfs_file_new(&ns->vn, O_RDWR | ((flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0));
-    if (!nf) { uint64_t g = irq_save(); tcp_close(ns); irq_restore(g); kfree(ns); return -ENOMEM; }
+    if (!nf) { uint64_t g = net_lock(); tcp_close(ns); net_unlock(g); kfree(ns); return -ENOMEM; }
     if (peer) {
         memset(peer, 0, sizeof *peer);
         peer->sin_family = AF_INET;
@@ -251,14 +251,14 @@ static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags,
         dst = s->raddr;
         dport = s->rport;
     }
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     long rc = autobind(s);
     if (!rc) {
         if (s->err) { rc = -s->err; s->err = 0; }       /* report an ICMP error from an earlier send */
         else if (s->proto == IPPROTO_UDP) rc = udp_send(s, buf, len, dst, dport);
         else rc = icmp_sock_send(s, buf, len, dst);
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return rc;
 }
 
@@ -289,7 +289,7 @@ static int inet_shutdown_(struct file *f, int how)
     return 0;
 }
 
-int inet_name(struct file *f, bool peer, struct sockaddr_in *out)
+static int inet_name_(struct file *f, bool peer, struct sockaddr_in *out)
 {
     struct isock *s = isk(f);
     memset(out, 0, sizeof *out);
@@ -354,7 +354,7 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
         case SO_BROADCAST: s->broadcast = v != 0; return 0;
         case SO_KEEPALIVE:
             s->keepalive = v != 0;
-            if (s->tcb) { uint64_t fl = irq_save(); tcp_setopt_nodelay(s); irq_restore(fl); }
+            if (s->tcb) { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
             return 0;
         case SO_RCVBUF: case SO_RCVBUFFORCE:
             if (v < 256) v = 256;
@@ -379,7 +379,7 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
         case IP_RECVERR: case IP_MTU_DISCOVER: case IP_MULTICAST_TTL: case IP_MULTICAST_LOOP: break;
         default: return -ENOPROTOOPT;
         }
-        if (s->tcb) { uint64_t fl = irq_save(); tcp_setopt_nodelay(s); irq_restore(fl); }
+        if (s->tcb) { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
         return 0;
     }
     if (level == SOL_TCP) {
@@ -389,7 +389,7 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
         switch (opt) {
         case TCP_NODELAY:
             s->nodelay = v != 0;
-            { uint64_t fl = irq_save(); tcp_setopt_nodelay(s); irq_restore(fl); }
+            { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
             return 0;
         case TCP_CORK: case TCP_KEEPIDLE: case TCP_KEEPINTVL: case TCP_KEEPCNT: case TCP_QUICKACK:
         case TCP_MAXSEG: case TCP_USER_TIMEOUT: case TCP_FASTOPEN:
@@ -401,7 +401,7 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
     return -ENOPROTOOPT;
 }
 
-int inet_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *len)
+static int inet_getsockopt_(struct file *f, int level, int opt, void *val, uint32_t *len)
 {
     struct isock *s = isk(f);
     int v;
@@ -411,11 +411,11 @@ int inet_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *len
         case SO_PROTOCOL:  v = s->proto; break;
         case SO_DOMAIN:    v = AF_INET; break;
         case SO_ERROR: {
-            uint64_t fl = irq_save();
+            uint64_t fl = net_lock();
             v = s->err;
             s->err = 0;
             if (!v && s->tcb) v = tcp_sock_error(s, true);
-            irq_restore(fl);
+            net_unlock(fl);
             break;
         }
         case SO_REUSEADDR: v = s->reuseaddr; break;
@@ -536,7 +536,7 @@ static void set_sin(struct sockaddr_in *a, uint32_t ip)
 
 /* SIOCGIFCONF fills a user array; the system call layer passes a kernel
  * buffer of `len` bytes in ifc->buf's place (see kernel/syscall.c). */
-int net_ifconf(void *kbuf, int len)
+static int net_ifconf_(void *kbuf, int len)
 {
     int n = 0;
     for (struct netif *i = netif_list(); i; i = i->next) {
@@ -553,14 +553,14 @@ int net_ifconf(void *kbuf, int len)
     return n * (int)sizeof(struct ifreq_k);
 }
 
-int net_ioctl(unsigned long req, void *arg)
+static int net_ioctl_(unsigned long req, void *arg)
 {
     if (req == SIOCADDRT || req == SIOCDELRT) {
         struct rtentry_k *rt = arg;
         if (current_task()->uid != 0) return -EPERM;
         uint32_t dst = rt->dst.sin_addr, mask = (rt->flags & RTF_HOST) ? 0xffffffffu : rt->mask.sin_addr;
         uint32_t gw = (rt->flags & RTF_GATEWAY) ? rt->gw.sin_addr : 0;
-        uint64_t fl = irq_save();
+        uint64_t fl = net_lock();
         int rc;
         if (req == SIOCDELRT) rc = route_del(dst, mask) ? -ESRCH : 0;
         else {
@@ -568,7 +568,7 @@ int net_ioctl(unsigned long req, void *arg)
             if (!n) for (n = netif_list(); n && (n == netif_loopback() || !n->ip); n = n->next) {}
             rc = !n ? -ENETUNREACH : route_add(dst, mask, gw, n) ? -ENOSPC : 0;
         }
-        irq_restore(fl);
+        net_unlock(fl);
         return rc;
     }
     struct ifreq_k *r = arg;
@@ -584,7 +584,7 @@ int net_ioctl(unsigned long req, void *arg)
     bool set = req == SIOCSIFFLAGS || req == SIOCSIFADDR || req == SIOCSIFNETMASK || req == SIOCSIFMTU ||
                req == SIOCSIFBRDADDR;
     if (set && current_task()->uid != 0) return -EPERM;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     int rc = 0;
     switch (req) {
     case SIOCGIFFLAGS:   r->u.flags = (int16_t)n->flags; break;
@@ -626,7 +626,7 @@ int net_ioctl(unsigned long req, void *arg)
     case SIOCGIFTXQLEN:  r->u.ival = n == netif_loopback() ? 1000 : 1000; break;
     default: rc = -ENOTTY;
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return rc;
 }
 
@@ -640,7 +640,7 @@ static int inet_poll(struct file *f, int events)
 {
     struct isock *s = isk(f);
     int r;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     poll_wait(s);
     if (s->type == SOCK_STREAM && s->tcb) poll_wait(s->tcb);    /* tcp.c wakes the connection */
     if (s->type == SOCK_STREAM) r = tcp_poll(s);
@@ -650,7 +650,7 @@ static int inet_poll(struct file *f, int events)
         if (s->err) r |= POLLERR;
         if (s->shut_rd && s->shut_wr) r |= POLLHUP;
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return r & (events | POLLERR | POLLHUP | POLLNVAL);
 }
 
@@ -659,9 +659,9 @@ static int inet_ioctl(struct vnode *vn, unsigned long req, void *arg)
 {
     struct isock *s = vn->data;
     if (req == FIONREAD) {
-        uint64_t fl = irq_save();
+        uint64_t fl = net_lock();
         *(int *)arg = s->type == SOCK_STREAM ? tcp_readable(s) : s->rq ? (int)s->rq->len : 0;
-        irq_restore(fl);
+        net_unlock(fl);
         return 0;
     }
     if (net_ioctl_is(req)) return net_ioctl(req, arg);
@@ -671,29 +671,40 @@ static int inet_ioctl(struct vnode *vn, unsigned long req, void *arg)
 static void inet_release(struct file *f)
 {
     struct isock *s = isk(f);
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     if (s->type == SOCK_STREAM) tcp_close(s);
     else { dgram_unregister(s); dgram_flush(s); }
     wakeup(s);
-    irq_restore(fl);
+    net_unlock(fl);
     kfree(s);
     net_lo_flush();                         /* the FIN or RST of a loopback connection */
 }
 
 static const struct vnode_ops inet_ops = {
     .fread = inet_fread, .fwrite = inet_fwrite, .poll = inet_poll, .release = inet_release, .ioctl = inet_ioctl,
+    .nolock = true,                         /* net_lock(), net/core.c */
 };
 
-/* ---- entry points: deliver loopback traffic before returning ---------------------- */
+/* ---- entry points: under the stack's lock, and deliver loopback traffic
+ * before returning ------------------------------------------------------------- */
+#define ENTRY(type, call) do { uint64_t fl_ = net_lock(); type r_ = call; net_lo_flush(); net_unlock(fl_); return r_; } while (0)
 int inet_connect(struct file *f, const void *addr, uint32_t len)
-{ int r = inet_connect_(f, addr, len); net_lo_flush(); return r; }
+{ ENTRY(int, inet_connect_(f, addr, len)); }
 int inet_accept(struct file *f, int flags, struct file **out, struct sockaddr_in *peer)
-{ int r = inet_accept_(f, flags, out, peer); net_lo_flush(); return r; }
+{ ENTRY(int, inet_accept_(f, flags, out, peer)); }
 long inet_sendto(struct file *f, const void *buf, size_t len, int flags, const void *to, uint32_t tolen)
-{ long r = inet_sendto_(f, buf, len, flags, to, tolen); net_lo_flush(); return r; }
+{ ENTRY(long, inet_sendto_(f, buf, len, flags, to, tolen)); }
 long inet_recvfrom(struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from, int *msg_flags)
-{ long r = inet_recvfrom_(f, buf, len, flags, from, msg_flags); net_lo_flush(); return r; }
+{ ENTRY(long, inet_recvfrom_(f, buf, len, flags, from, msg_flags)); }
 int inet_shutdown(struct file *f, int how)
-{ int r = inet_shutdown_(f, how); net_lo_flush(); return r; }
+{ ENTRY(int, inet_shutdown_(f, how)); }
 int inet_setsockopt(struct file *f, int level, int opt, const void *val, uint32_t len)
-{ int r = inet_setsockopt_(f, level, opt, val, len); net_lo_flush(); return r; }
+{ ENTRY(int, inet_setsockopt_(f, level, opt, val, len)); }
+int inet_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *len)
+{ ENTRY(int, inet_getsockopt_(f, level, opt, val, len)); }
+int inet_name(struct file *f, bool peer, struct sockaddr_in *out)
+{ ENTRY(int, inet_name_(f, peer, out)); }
+int net_ifconf(void *kbuf, int len)
+{ ENTRY(int, net_ifconf_(kbuf, len)); }
+int net_ioctl(unsigned long req, void *arg)
+{ ENTRY(int, net_ioctl_(req, arg)); }

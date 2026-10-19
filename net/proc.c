@@ -12,7 +12,7 @@
 static size_t gen_dev(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     size_t n = (size_t)snprintf(buf, cap,
         "Inter-|   Receive                                                |  Transmit\n"
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
@@ -20,14 +20,14 @@ static size_t gen_dev(char *buf, size_t cap, void *ctx)
         n += (size_t)snprintf(buf + n, cap - n, "%6s: %7lu %7lu %4lu %4lu    0     0          0         0 %8lu %7lu %4lu %4lu    0     0       0          0\n",
                               i->name, i->rx_bytes, i->rx_packets, i->rx_errors, i->rx_dropped,
                               i->tx_bytes, i->tx_packets, i->tx_errors, i->tx_dropped);
-    irq_restore(f);
+    net_unlock(f);
     return n < cap ? n : cap;
 }
 
 static size_t gen_route(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     size_t n = (size_t)snprintf(buf, cap, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
     for (int i = 0; i < MAX_ROUTES && n < cap; i++) {
         struct route *r = &routes[i];
@@ -36,34 +36,34 @@ static size_t gen_route(char *buf, size_t cap, void *ctx)
         n += (size_t)snprintf(buf + n, cap - n, "%s\t%08X\t%08X\t%04X\t0\t0\t0\t%08X\t0\t0\t0\n",
                               r->nif->name, r->dst, r->gw, flags, r->mask);
     }
-    irq_restore(f);
+    net_unlock(f);
     return n < cap ? n : cap;
 }
 
 static size_t gen_arp(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     size_t n = arp_proc(buf, cap);
-    irq_restore(f);
+    net_unlock(f);
     return n;
 }
 
 static size_t gen_tcp(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     size_t n = tcp_proc(buf, cap);
-    irq_restore(f);
+    net_unlock(f);
     return n;
 }
 
 static size_t gen_udp(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     size_t n = udp_proc(buf, cap);
-    irq_restore(f);
+    net_unlock(f);
     return n;
 }
 

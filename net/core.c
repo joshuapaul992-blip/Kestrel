@@ -17,6 +17,8 @@
 #include <kernel/time.h>
 #include <kernel/bootinfo.h>
 #include <kernel/posix.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 
 static struct netif *ifaces;
 static int next_index = 1;
@@ -32,6 +34,64 @@ struct route routes[MAX_ROUTES];
 uint32_t net_dns[3];
 char net_domain[64];
 
+/* ---- the stack's lock ------------------------------------------------------------
+ * A spinlock with interrupts off, as the stack ran before under the big
+ * kernel lock: its holder may take it again (the entry points nest), and
+ * net_sleep() lets all of it go while the holder sleeps, and takes it back.
+ * A waiter answers TLB shootdowns, since the holder runs a while. */
+static struct spinlock net_spin;
+static struct tcb *net_owner;
+static int net_depth;
+
+static void net_acquire(void)
+{
+#ifdef LOCKCHECK
+    lockcheck_acquire(&net_spin, &net_spin.lc, LC_SPIN, false, (uint64_t)__builtin_return_address(0));
+#endif
+    while (__atomic_exchange_n(&net_spin.locked, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&net_spin.locked, __ATOMIC_RELAXED)) { tlb_service(); cpu_relax(); }
+}
+
+uint64_t net_lock(void)
+{
+    uint64_t f = irq_save();
+    struct tcb *me = current_task();
+    if (__atomic_load_n(&net_owner, __ATOMIC_RELAXED) == me) { net_depth++; return f; }   /* only we set it to us */
+    net_acquire();
+    net_owner = me;
+    net_depth = 1;
+    return f;
+}
+
+void net_unlock(uint64_t f)
+{
+    if (--net_depth == 0) {
+        __atomic_store_n(&net_owner, NULL, __ATOMIC_RELAXED);
+        spin_unlock_keep_irqs(&net_spin);
+    }
+    irq_restore(f);
+}
+
+/* Asleep on chan until a wakeup (or the deadline), without the lock: the
+ * sleeper is on chan before the lock goes, so a waker, which holds it,
+ * cannot slip in between. */
+void net_sleep(void *chan, uint64_t deadline)
+{
+    uint64_t f = irq_save();
+    int depth = net_depth;
+    struct tcb *me = current_task();
+    task_block_self(chan, deadline);
+    __atomic_store_n(&net_owner, NULL, __ATOMIC_RELAXED);
+    net_depth = 0;
+    spin_unlock_keep_irqs(&net_spin);
+    schedule();
+    me->wait_chan = NULL;
+    net_acquire();
+    net_owner = me;
+    net_depth = depth;
+    irq_restore(f);
+}
+
 /* ---- packet buffers: a small cache in front of the heap --------------------- */
 #define PKT_CACHE 128
 static struct pkt *pkt_cache;
@@ -39,10 +99,10 @@ static int pkt_cached;
 
 struct pkt *pkt_alloc(void)
 {
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     struct pkt *p = pkt_cache;
     if (p) { pkt_cache = p->next; pkt_cached--; }
-    irq_restore(f);
+    net_unlock(f);
     if (!p && !(p = kmalloc(sizeof *p))) return NULL;
     p->off = PKT_HEADROOM + ETH_HLEN + 20 + 60;
     p->len = 0;
@@ -71,9 +131,9 @@ void pkt_free(struct pkt *p)
 {
     if (!p) return;
     if (p->big) { kfree(p); return; }
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     if (pkt_cached < PKT_CACHE) { p->next = pkt_cache; pkt_cache = p; pkt_cached++; p = NULL; }
-    irq_restore(f);
+    net_unlock(f);
     kfree(p);
 }
 
@@ -127,7 +187,7 @@ struct netif *netif_by_index(int index)
 
 void netif_register(struct netif *nif)
 {
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     static int neth;
     if (!nif->name[0]) snprintf(nif->name, sizeof nif->name, "eth%d", neth++);   /* drivers leave it empty */
     nif->index = next_index++;
@@ -135,7 +195,7 @@ void netif_register(struct netif *nif)
     struct netif **pp = &ifaces;
     while (*pp) pp = &(*pp)->next;
     *pp = nif;
-    irq_restore(f);
+    net_unlock(f);
     if (nif != &lo)
         kprintf("net: %s: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x, MTU %u\n", nif->name, nif->driver,
                 nif->mac[0], nif->mac[1], nif->mac[2], nif->mac[3], nif->mac[4], nif->mac[5], nif->mtu);
@@ -159,19 +219,19 @@ struct netif *route_lookup(uint32_t dst, uint32_t *nexthop)
 
 int route_add(uint32_t dst, uint32_t mask, uint32_t gw, struct netif *nif)
 {
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     int free = -1;
     for (int i = 0; i < MAX_ROUTES; i++) {
         if (routes[i].used && routes[i].dst == (dst & mask) && routes[i].mask == mask) {
             routes[i].gw = gw; routes[i].nif = nif;     /* replace */
-            irq_restore(f);
+            net_unlock(f);
             return 0;
         }
         if (!routes[i].used && free < 0) free = i;
     }
-    if (free < 0) { irq_restore(f); return -1; }
+    if (free < 0) { net_unlock(f); return -1; }
     routes[free] = (struct route){ dst & mask, mask, gw, nif, true };
-    irq_restore(f);
+    net_unlock(f);
     return 0;
 }
 
@@ -197,12 +257,12 @@ void route_flush_if(struct netif *nif)
 
 void netif_set_addr(struct netif *nif, uint32_t ip, uint32_t mask)
 {
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     if (nif->ip && nif->mask) route_del(nif->ip & nif->mask, nif->mask);
     nif->ip = ip;
     nif->mask = mask;
     if (ip && mask) route_add(ip & mask, mask, 0, nif);
-    irq_restore(f);
+    net_unlock(f);
 }
 
 bool ip_is_local(uint32_t ip)
@@ -272,9 +332,9 @@ static void lo_drain(void)
 bool net_lo_flush(void)
 {
     if (!lo_queue || lo_draining) return false;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     lo_drain();
-    irq_restore(f);
+    net_unlock(f);
     return true;
 }
 
@@ -325,8 +385,9 @@ void net_tick(void)
 static int netd_main(void *arg)
 {
     (void)arg;
+    bkl_exit();                             /* the stack has its own lock */
     for (;;) {
-        uint64_t f = irq_save();
+        uint64_t f = net_lock();
         netd_wake = false;
         for (struct netif *n = ifaces; n; n = n->next) if (n->poll) n->poll(n);
         lo_drain();
@@ -340,9 +401,9 @@ static int netd_main(void *arg)
         if (!netd_wake && !lo_queue) {
             bool more = false;
             for (struct netif *n = ifaces; n; n = n->next) if (n->pending && n->pending(n)) more = true;
-            if (!more) sleep_on_until(&netd_chan, next_timer ? next_timer : 0);
+            if (!more) net_sleep(&netd_chan, next_timer ? next_timer : 0);
         }
-        irq_restore(f);
+        net_unlock(f);
     }
     return 0;
 }
@@ -428,6 +489,7 @@ void net_init(void)
         dhcp_start(n);
     }
     net_proc_init();
+    lockcheck_name(&net_spin, "network stack");
     netd = task_create("netd", netd_main, NULL);
     if (!netd) kprintf("net: cannot start netd\n");
 }
