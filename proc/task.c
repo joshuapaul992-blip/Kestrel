@@ -322,13 +322,25 @@ struct tcb *task_find(int pid)
 
 struct tcb *task_slot(int i) { return (i >= 0 && i < MAX_TASKS) ? &tasks[i] : NULL; }
 
+/* Another task's address space, with a reference: exit and execve swap a
+ * task's under proc_lock. NULL if it has none. */
+struct mm *task_mm_get(struct tcb *t)
+{
+    if (!t) return NULL;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct mm *mm = t->mm;
+    if (mm) mm_get(mm);
+    spin_unlock_irqrestore(&proc_lock, f);
+    return mm;
+}
+
 /* A signal for t. A sleeper wakes; a thread still on its way to sleep
  * (it looked for signals before the sender set one, without the sender's
  * lock) does not go to sleep, and looks again. */
 void task_interrupt(struct tcb *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) make_ready_locked(t);
+    if ((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && !t->paused) make_ready_locked(t);
     else t->sig_kick = true;
     spin_unlock_irqrestore(&sched_lock, f);
 }
@@ -369,17 +381,31 @@ void task_wake(struct tcb *t) { make_ready(t); }
  * stops another CPU from switching to it, and a switch reads those fields. */
 struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg)
 {
-    uint64_t f = irq_save();
-    reap_zombies();
+    /* A slot, claimed under proc_lock (fork runs without the big kernel
+     * lock). Zombies are reaped first under the big lock: right away if it
+     * is ours or free, and waited for only when no slot is free. */
     struct tcb *t = NULL;
-    for (int i = 1; i < MAX_TASKS; i++)
-        if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
-    if (!t) { irq_restore(f); return NULL; }
-    spin_lock_irqsave(&proc_lock);      /* wait4() reads slots without the big lock */
-    memset(t, 0, sizeof *t);
-    t->state = TASK_BLOCKED;            /* not runnable until fully built */
-    spin_unlock_keep_irqs(&proc_lock);
-    irq_restore(f);
+    bool own = bkl_depth() > 0;
+    for (int pass = 0; pass < 2 && !t; pass++) {
+        if (own || (pass == 0 ? bkl_try_enter() : (bkl_enter(), true))) {
+            uint64_t f = irq_save();
+            reap_zombies();
+            irq_restore(f);
+            if (!own) bkl_exit();
+        }
+        uint64_t f = spin_lock_irqsave(&proc_lock);
+        for (int i = 1; i < MAX_TASKS && !t; i++)
+            if (tasks[i].state == TASK_UNUSED) t = &tasks[i];
+        if (t) {
+            memset(t, 0, sizeof *t);
+            t->state = TASK_BLOCKED;    /* not runnable until fully built */
+            t->paused = true;           /* not even by a signal: task_start() */
+            t->pid = t->tgid = next_pid++;
+        }
+        spin_unlock_irqrestore(&proc_lock, f);
+        if (own) break;
+    }
+    if (!t) return NULL;
 
     t->kstack = kstack_alloc();
     if (!t->kstack) { t->state = TASK_UNUSED; return NULL; }
@@ -396,7 +422,6 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
     *--sp = 0; *--sp = 0; *--sp = 0;        /* r13 r14 r15             */
     t->rsp = (uint64_t)sp;
 
-    t->pid = t->tgid = next_pid++;
     t->ppid = cur ? cur->tgid : 0;
     t->pgid = t->sid = t->pid;
     strlcpy(t->name, name, sizeof t->name);
@@ -412,6 +437,7 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
 void task_start(struct tcb *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
+    t->paused = false;
     t->state = TASK_READY;              /* no preemption of the creator: an idle CPU may take it */
     smp_kick_idle();
     spin_unlock_irqrestore(&sched_lock, f);
@@ -914,8 +940,10 @@ void task_exit(int code)
      * comes back at once (the OOM killer relies on that). Run on the kernel
      * page tables from here on. */
     if (cur->mm) {
+        uint64_t pf = spin_lock_irqsave(&proc_lock);   /* task_mm_get() */
         struct mm *mm = cur->mm;
         cur->mm = NULL;
+        spin_unlock_irqrestore(&proc_lock, pf);
         cur->pml4 = 0;
         cur->cr3 = uvm_kernel_pml4();
         cpu_load_cr3(cur->cr3);

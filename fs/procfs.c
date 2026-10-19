@@ -291,6 +291,16 @@ static char state_char(const struct tcb *t)
     }
 }
 
+/* Resident pages of another task's address space, which its exit or
+ * execve may swap away meanwhile: read through a reference. */
+static uint64_t task_rss(struct tcb *t)
+{
+    struct mm *mm = task_mm_get(t);
+    uint64_t pages = mm ? mm->rss : 0;
+    mm_put(mm);
+    return pages;
+}
+
 static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
@@ -298,7 +308,7 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
     if (!t) return 0;
     uint64_t ticks = t->cpu_ticks * 100 / PIT_HZ;              /* USER_HZ */
     uint64_t start = t->start_tick * 100 / PIT_HZ;
-    uint64_t pages = t->mm ? t->mm->rss : 0;
+    uint64_t pages = task_rss(t);
     int tty = t->ctty ? (136 << 8) | (t->ctty - 1) : 0;
     /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
      * majflt cmajflt utime stime cutime cstime priority nice threads
@@ -317,7 +327,7 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
     if (!t) return 0;
     static const char *const names[] = { "?", "R (running)", "R (running)", "S (sleeping)", "S (sleeping)",
                                          "Z (zombie)" };
-    uint64_t pages = t->mm ? t->mm->rss : 0;
+    uint64_t pages = task_rss(t);
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
       t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
     P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
@@ -348,8 +358,10 @@ static size_t gen_pid_comm(char *buf, size_t cap, void *ctx)
 /* /proc/PID/maps: the regions of the address space, Linux format */
 static size_t gen_pid_maps(char *buf, size_t cap, void *ctx)
 {
-    struct tcb *t = pid_task(ctx);
-    return t && t->mm ? vm_maps(t->mm, buf, cap) : 0;
+    struct mm *mm = task_mm_get(pid_task(ctx));
+    size_t n = mm ? vm_maps(mm, buf, cap) : 0;
+    mm_put(mm);
+    return n;
 }
 
 /* /proc/PID/statm: size resident shared text lib data dt, in pages */
@@ -357,7 +369,7 @@ static size_t gen_pid_statm(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
     struct tcb *t = pid_task(ctx);
-    uint64_t pages = t && t->mm ? t->mm->rss : 0;
+    uint64_t pages = t ? task_rss(t) : 0;
     P("%lu %lu 0 0 0 %lu 0\n", pages, pages, pages);
     return n;
 }

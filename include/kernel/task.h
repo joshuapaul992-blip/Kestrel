@@ -106,6 +106,7 @@ struct tcb {
     uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;
     bool      sig_kick;         /* a signal came while it ran: its next sleep is skipped */
+    bool      paused;           /* task_create_paused() until task_start(): not woken */
     struct poll_table *poll_tab;    /* poll/select/epoll: collecting, then sleeping on it */
     uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
@@ -257,6 +258,7 @@ int         task_wait(int pid);         /* exit status, or -ECHILD        */
 int         task_snapshot(struct tcb *out, int max);
 struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
+struct mm  *task_mm_get(struct tcb *t); /* its address space, referenced    */
 void        task_reap(struct tcb *t);   /* free a collected zombie (wait4)   */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
 /* Futex-style sleep: mark the current task asleep on `chan` (until
