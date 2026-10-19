@@ -232,7 +232,9 @@ static ssize_t node_write(struct vnode *vn, const void *buf, size_t len, uint64_
     return -EROFS;
 }
 static uint64_t node_size(struct vnode *vn) { return blk_size_bytes(vn->ctx); }
-static const struct vnode_ops node_ops = { .read = node_read, .write = node_write, .size = node_size };
+/* blk_read takes the big lock itself for a driver that needs it */
+static const struct vnode_ops node_ops = { .read = node_read, .write = node_write, .size = node_size,
+                                           .nolock = true };
 
 void blk_publish(void)
 {
