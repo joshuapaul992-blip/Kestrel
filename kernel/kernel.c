@@ -241,6 +241,7 @@ static int shell_main(void *arg)
 static int exec_waiter(void *arg)
 {
     int pid = (int)(intptr_t)arg;
+    bkl_release_all();          /* waiting is the process tree's (proc_lock) */
     int st = exec_wait(pid);
     kprintf("kestrel.exec: process %d finished with status %d%s\n", pid, st, st >= 128 ? " (killed)" : "");
     return 0;
@@ -392,6 +393,7 @@ static int kworker_compute(void *arg)
 static int kworker_heartbeat(void *arg)
 {
     (void)arg;
+    bkl_release_all();          /* it only sleeps and logs */
     for (;;) {
         task_sleep_ms(30000);
         if (primes_found)
