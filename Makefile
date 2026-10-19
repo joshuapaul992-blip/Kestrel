@@ -127,7 +127,7 @@ LKPI_CFLAGS := $(filter-out -I% -W% -MMD -MP,$(CFLAGS)) -nostdinc -D__KERNEL__ \
 # them and prints its first error, if any.
 # Linux reaches kernel.h, export.h and slab.h through its deep header graph;
 # the KPI's headers are shallower, so DRM files get them up front.
-LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c \
+LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c linuxkpi/src/dma-buf.c linuxkpi/src/sync_file.c linuxkpi/src/drm_prime.c third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c \
                 third_party/linux/drivers/dma-buf/dma-resv.c \
                 third_party/linux/drivers/video/aperture.c third_party/linux/drivers/video/hdmi.c \
                 $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c)) \

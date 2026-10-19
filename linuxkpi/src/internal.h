@@ -44,7 +44,14 @@ void lkpi_pci_irq_release(struct pci_dev *pdev);    /* at unbind: vectors back  
 void *lkpi_devnode_add(struct device *dev);
 void *lkpi_pci_handle_of(struct device *dev);                     /* pci.c: Kestrel's PCI function under dev, or NULL */
 struct lkpi_mmap;
+struct file_operations;
+struct inode;
 int lkpi_file_mmap(struct file *file, struct lkpi_mmap *m);        /* mmap.c */
+/* chardev.c: a struct file (f_count 1) with its own inode (freed with it by
+ * iput), or the shared anonymous inode (inode NULL) */
+struct file *lkpi_file_new(const struct file_operations *fops, struct inode *inode, unsigned int flags,
+                           void *priv);
+void lkpi_file_set_name(struct file *file, const char *name);    /* static: /proc/self/fd shows anon_inode:<name> */
 void lkpi_devnode_remove(struct device *dev);
 void lkpi_notifier_panic(const char *msg);
 void lkpi_notifier_power(int what);

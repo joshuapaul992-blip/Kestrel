@@ -331,4 +331,16 @@ int      timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], in
 int      timerfd_gettime_file(struct file *f, int64_t cur[4]);
 int      signalfd_file(struct file *f, uint64_t mask, int flags, struct file **out);
 
+/* kernel/syscall.c: the calling process's descriptors, for drivers that
+ * hand out files from inside an ioctl (the Linux KPI's dma-bufs, sync
+ * files and DRM sync objects). fd_reserve() holds the lowest free
+ * descriptor with a placeholder (-EMFILE if none), fd_fill() puts f there
+ * (the table takes the caller's reference; if the placeholder is gone, f
+ * is closed) and fd_unreserve() gives the descriptor back unused.
+ * fd_file() is the file behind fd with a reference (vfs_close), or NULL. */
+int           fd_reserve(bool cloexec);
+void          fd_fill(int fd, struct file *f);
+void          fd_unreserve(int fd);
+struct file  *fd_file(int fd);
+
 #endif

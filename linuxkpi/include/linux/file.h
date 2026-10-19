@@ -1,4 +1,4 @@
-/* linux/file.h -- Kestrel's Linux KPI: file descriptors of the calling process (DRM's user-space files; not available yet) */
+/* linux/file.h -- Kestrel's Linux KPI: file descriptors of the calling process (dma-bufs, sync files, DRM sync objects) */
 #ifndef _LKPI_LINUX_FILE_H
 #define _LKPI_LINUX_FILE_H
 
@@ -9,7 +9,7 @@ struct file;
 struct fd { struct file *file; unsigned int flags; };
 void fput(struct file *file);
 struct file *fget(unsigned int fd);
-static inline struct file *get_file(struct file *f) { return f; }
+struct file *get_file(struct file *f);              /* one more reference */
 int  get_unused_fd_flags(unsigned flags);
 void put_unused_fd(unsigned int fd);
 void fd_install(unsigned int fd, struct file *file);

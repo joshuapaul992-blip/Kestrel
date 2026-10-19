@@ -129,6 +129,61 @@ static struct file *fd_take(struct tcb *t, int fd)
     return f;
 }
 
+/* ---- descriptors handed out by drivers (vfs.h: fd_reserve) ---- */
+/* the placeholder between fd_reserve and fd_fill: a node that does nothing */
+static const struct vnode_ops reserved_ops = { .nolock = true };
+static struct vnode reserved_vn = { .name = "reserved", .type = VCHR, .ops = &reserved_ops };
+
+static bool is_reserved(struct file *f) { return f && f->vn == &reserved_vn; }
+
+int fd_reserve(bool cloexec)
+{
+    struct file *f = vfs_file_new(&reserved_vn, O_RDONLY);
+    if (!f) return -ENOMEM;
+    int fd = fd_alloc(current_task(), 0, f, cloexec);
+    if (fd < 0) vfs_close(f);
+    return fd;
+}
+
+void fd_fill(int fd, struct file *f)
+{
+    struct files_struct *fs = current_task()->files;
+    struct file *old = NULL;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    if (fd >= 0 && fd < MAX_FDS && is_reserved(fs->fd[fd])) {
+        old = fs->fd[fd];
+        fs->fd[fd] = f;
+        f = NULL;
+    }
+    spin_unlock_irqrestore(&fs->lock, fl);
+    vfs_close(old);                     /* the placeholder */
+    vfs_close(f);                       /* closed meanwhile (close, dup2): f is not wanted */
+}
+
+void fd_unreserve(int fd)
+{
+    struct files_struct *fs = current_task()->files;
+    struct file *old = NULL;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    if (fd >= 0 && fd < MAX_FDS && is_reserved(fs->fd[fd])) {
+        old = fs->fd[fd];
+        fs->fd[fd] = NULL;
+        fs->cloexec[fd] = 0;
+    }
+    spin_unlock_irqrestore(&fs->lock, fl);
+    vfs_close(old);
+}
+
+struct file *fd_file(int fd)
+{
+    if (fd < 0 || fd >= MAX_FDS) return NULL;
+    struct files_struct *fs = current_task()->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    struct file *f = is_reserved(fs->fd[fd]) ? NULL : vfs_file_get(fs->fd[fd]);
+    spin_unlock_irqrestore(&fs->lock, fl);
+    return f;
+}
+
 /* Install a new file; on failure the file is closed. */
 static int64_t install(struct file *f, bool cloexec)
 {

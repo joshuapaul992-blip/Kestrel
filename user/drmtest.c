@@ -5,7 +5,10 @@
  *                    buffer mapped and drawn, set on the first connected
  *                    monitor, a page flip with its event, the mapping
  *                    after fork and a partial munmap, the render node,
- *                    and the /sys entries libdrm finds the device by
+ *                    the /sys entries libdrm finds the device by, and
+ *                    PRIME: a buffer as a dma-buf descriptor (its size,
+ *                    mapping, CPU-access ioctl and fences as a sync file),
+ *                    imported again here and through a second open
  *   drmtest -h N     ... and keep the picture on screen for N seconds
  *                    (colour bars), so the host can take a screenshot
  * Exit status 0 = every check passed; 77 = no DRM device (skipped). */
@@ -69,7 +72,22 @@ struct drm_mode_crtc_page_flip { uint32_t crtc_id, fb_id, flags, reserved; uint6
 struct drm_event { uint32_t type, length; };
 struct drm_event_vblank { struct drm_event base; uint64_t user_data; uint32_t tv_sec, tv_usec, sequence, crtc_id; };
 
+struct drm_prime_handle { uint32_t handle, flags; int32_t fd; };
+struct drm_gem_close { uint32_t handle, pad; };
+struct dma_buf_sync { uint64_t flags; };
+struct dma_buf_export_sync_file { uint32_t flags; int32_t fd; };
+struct sync_file_info { char name[32]; int32_t status; uint32_t flags, num_fences, pad; uint64_t sync_fence_info; };
+
 #define DRM_IOCTL_VERSION            _IOWR('d', 0x00, struct drm_version)
+#define DRM_IOCTL_GEM_CLOSE          _IOW('d', 0x09, struct drm_gem_close)
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD _IOWR('d', 0x2d, struct drm_prime_handle)
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE _IOWR('d', 0x2e, struct drm_prime_handle)
+#define DMA_BUF_IOCTL_SYNC           _IOW('b', 0, struct dma_buf_sync)
+#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR('b', 2, struct dma_buf_export_sync_file)
+#define SYNC_IOC_FILE_INFO           _IOWR('>', 4, struct sync_file_info)
+#define DRM_CAP_PRIME                0x5
+#define DMA_BUF_SYNC_RW              3
+#define DMA_BUF_SYNC_END             4
 #define DRM_IOCTL_GET_CAP            _IOWR('d', 0x0c, struct drm_get_cap)
 #define DRM_IOCTL_SET_CLIENT_CAP     _IOW('d', 0x0d, struct drm_set_client_cap)
 #define DRM_IOCTL_MODE_GETRESOURCES  _IOWR('d', 0xA0, struct drm_mode_card_res)
@@ -190,6 +208,93 @@ static void check_sysfs(int fd)
     snprintf(path, sizeof path, "/sys/class/drm/card%u/dev", min);
     snprintf(link, sizeof link, "%u:%u", maj, min);
     CHECK(sys_read(path, line, sizeof line) == 0 && !strcmp(line, link), "/sys/class/drm/cardN/dev names the node");
+}
+
+/* PRIME: a dumb buffer exported as a dma-buf and imported back, here and
+ * through a second open of the device (as Mesa hands buffers to X) */
+static void check_prime(int fd)
+{
+    struct drm_get_cap cap = { .capability = DRM_CAP_PRIME };
+    CHECK(xioctl(fd, DRM_IOCTL_GET_CAP, &cap) == 0 && cap.value == 3, "PRIME import and export are offered");
+    struct drm_mode_create_dumb c = { .height = 64, .width = 64, .bpp = 32 };
+    struct drm_mode_map_dumb m = { 0 };
+    uint32_t *map = MAP_FAILED, *pmap = MAP_FAILED;
+    if (xioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c) == 0) {
+        m.handle = c.handle;
+        if (xioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m) == 0)
+            map = mmap(NULL, c.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)m.offset);
+    }
+    CHECK(map != MAP_FAILED, "a dumb buffer to share");
+    if (map == MAP_FAILED) return;
+
+    struct drm_prime_handle ph = { .handle = c.handle, .flags = O_CLOEXEC | O_RDWR, .fd = -1 };
+    CHECK(xioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) == 0 && ph.fd >= 0, "PRIME_HANDLE_TO_FD gives a dma-buf");
+    int pfd = ph.fd;
+    struct stat st;
+    CHECK(pfd >= 0 && lseek(pfd, 0, SEEK_END) == (off_t)c.size && fstat(pfd, &st) == 0 &&
+          st.st_size == (off_t)c.size, "its size, by lseek(SEEK_END) and fstat");
+    char link[64] = "";
+    char path[40];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", pfd);
+    ssize_t ln = readlink(path, link, sizeof link - 1);
+    if (ln > 0) link[ln] = 0;
+    printf("drmtest:        %s -> %s\n", path, link);
+    struct drm_prime_handle back = { .fd = pfd };
+    CHECK(xioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &back) == 0 && back.handle == c.handle,
+          "PRIME_FD_TO_HANDLE gives the same handle back");
+    struct drm_prime_handle again = { .handle = c.handle, .flags = O_CLOEXEC };
+    struct drm_prime_handle back2 = { 0 };
+    CHECK(xioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &again) == 0 &&
+          (back2.fd = again.fd, xioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &back2)) == 0 && back2.handle == c.handle,
+          "exporting it again gives the same buffer");
+    if (again.fd >= 0) close(again.fd);
+    struct drm_prime_handle bad = { .fd = fd };
+    CHECK(ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &bad) < 0 && errno == EINVAL, "a descriptor that is no dma-buf: EINVAL");
+
+    pmap = mmap(NULL, c.size, PROT_READ | PROT_WRITE, MAP_SHARED, pfd, 0);
+    CHECK(pmap != MAP_FAILED, "the dma-buf maps");
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_RW };
+    CHECK(xioctl(pfd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA_BUF_IOCTL_SYNC: start of CPU access");
+    if (pmap != MAP_FAILED) for (unsigned i = 0; i < c.size / 4; i++) pmap[i] = 0x5a000000u | i;
+    sync.flags = DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END;
+    CHECK(xioctl(pfd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA_BUF_IOCTL_SYNC: end");
+    CHECK(pmap != MAP_FAILED && map[100] == (0x5a000000u | 100) && map[c.size / 4 - 1] == (0x5a000000u | (c.size / 4 - 1)),
+          "what was written through the dma-buf reads back through the buffer's own mapping");
+
+    struct dma_buf_export_sync_file es = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
+    CHECK(xioctl(pfd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &es) == 0 && es.fd >= 0, "its fences as a sync file");
+    struct pollfd p = { es.fd, POLLIN, 0 };
+    struct sync_file_info si = { 0 };
+    CHECK(es.fd >= 0 && poll(&p, 1, 1000) == 1 && (p.revents & POLLIN) &&
+          xioctl(es.fd, SYNC_IOC_FILE_INFO, &si) == 0 && si.status == 1,
+          "the sync file polls ready, and SYNC_IOC_FILE_INFO says signaled (no work is pending)");
+    if (es.fd >= 0) close(es.fd);
+
+    /* a second open of the device imports it: its own handle, the same memory */
+    int fd2 = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    struct drm_prime_handle imp = { .fd = pfd };
+    struct drm_mode_map_dumb m2 = { 0 };
+    uint32_t *map2 = MAP_FAILED;
+    if (fd2 >= 0 && xioctl(fd2, DRM_IOCTL_PRIME_FD_TO_HANDLE, &imp) == 0) {
+        m2.handle = imp.handle;
+        if (xioctl(fd2, DRM_IOCTL_MODE_MAP_DUMB, &m2) == 0)
+            map2 = mmap(NULL, c.size, PROT_READ, MAP_SHARED, fd2, (off_t)m2.offset);
+    }
+    CHECK(map2 != MAP_FAILED && map2[100] == (0x5a000000u | 100), "another open of the device imports it and sees the same pixels");
+    if (map2 != MAP_FAILED) munmap(map2, c.size);
+    if (fd2 >= 0) close(fd2);
+
+    /* the buffer outlives its handle while the dma-buf is open */
+    struct drm_gem_close gc = { .handle = c.handle };
+    CHECK(xioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc) == 0, "the handle is closed");
+    struct drm_prime_handle re = { .fd = pfd };
+    CHECK(xioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &re) == 0 && pmap != MAP_FAILED && pmap[7] == (0x5a000000u | 7),
+          "the dma-buf keeps the buffer: it imports again and still maps");
+    gc.handle = re.handle;
+    xioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+    if (pmap != MAP_FAILED) munmap(pmap, c.size);
+    munmap(map, c.size);
+    CHECK(close(pfd) == 0, "the dma-buf closes");
 }
 
 int main(int argc, char **argv)
@@ -333,6 +438,8 @@ int main(int argc, char **argv)
         printf("drmtest: holding the colour bars for %d s\n", hold);
         sleep((unsigned)hold);
     }
+
+    check_prime(fd);
 
     /* tidy up: the terminal comes back when the file closes */
     munmap(rest, b.size - half);

@@ -1,4 +1,4 @@
-/* linux/anon_inodes.h -- Kestrel's Linux KPI: anonymous files (DRM syncobj and dma-buf file descriptors; not available yet) */
+/* linux/anon_inodes.h -- Kestrel's Linux KPI: anonymous files (DRM sync objects, sync files, dma-bufs) */
 #ifndef _LKPI_LINUX_ANON_INODES_H
 #define _LKPI_LINUX_ANON_INODES_H
 
