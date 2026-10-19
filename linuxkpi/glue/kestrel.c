@@ -35,6 +35,11 @@ unsigned long lkpi_frames_alloc(unsigned long n, int dma32)
     return n == 1 ? pmm_alloc() : pmm_alloc_contig(n);
 }
 
+unsigned long lkpi_frames_alloc_order(unsigned int order, int dma32)
+{
+    return pmm_alloc_order(order, dma32);
+}
+
 void lkpi_frames_free(unsigned long phys, unsigned long n)
 {
     if (n == 1) pmm_free(phys);

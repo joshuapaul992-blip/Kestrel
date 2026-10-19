@@ -376,9 +376,15 @@ static int node_poll(void *f, int events)
     return (int)(mask & ((__poll_t)events | POLLERR | POLLHUP));
 }
 
+static int node_mmap(void *f, struct lkpi_mmap *m)
+{
+    struct lkpi_file *lf = f;
+    return lkpi_file_mmap(&lf->file, m);
+}
+
 static const struct lkpi_cdev_ops node_ops = {
     .open = node_open, .release = node_release, .read = node_read, .write = node_write,
-    .ioctl = node_ioctl, .poll = node_poll,
+    .ioctl = node_ioctl, .poll = node_poll, .mmap = node_mmap,
 };
 
 void *lkpi_devnode_add(struct device *dev)

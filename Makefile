@@ -109,7 +109,7 @@ LKPI_SRC := linuxkpi/src/printk.c linuxkpi/src/vsprintf.c linuxkpi/src/lib.c lin
             linuxkpi/src/dma.c linuxkpi/src/io.c linuxkpi/src/firmware.c linuxkpi/src/notifier.c \
             linuxkpi/src/chardev.c linuxkpi/src/watchdog.c linuxkpi/src/idr.c linuxkpi/src/module.c \
             linuxkpi/src/selftest.c linuxkpi/src/ww_mutex.c linuxkpi/src/dma-fence.c \
-            linuxkpi/src/sort.c linuxkpi/src/i2c.c
+            linuxkpi/src/sort.c linuxkpi/src/i2c.c linuxkpi/src/mmap.c
 LKPI_DRV_SRC := third_party/linux/drivers/misc/pvpanic/pvpanic.c \
                 third_party/linux/drivers/misc/pvpanic/pvpanic-pci.c \
                 third_party/linux/drivers/watchdog/i6300esb.c
@@ -380,7 +380,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

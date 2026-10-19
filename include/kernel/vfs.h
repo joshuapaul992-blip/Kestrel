@@ -28,6 +28,7 @@ enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK, VLNK };
 struct vnode;
 struct mount;
 struct file;
+struct vm_devmap;
 
 struct vnode_ops {
     ssize_t (*read)(struct vnode *vn, void *buf, size_t len, uint64_t off);
@@ -66,6 +67,10 @@ struct vnode_ops {
      * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
      * memfd). NULL: no shared mappings of this file. */
     struct vm_object *(*vmobject)(struct vnode *vn);
+    /* Optional, devices: MAP_SHARED of the open file. Fill in m->ops and
+     * m->ctx for the region m describes (vm.h: device mappings), or return
+     * -errno. Called with the address space locked. */
+    int     (*mmap)(struct file *f, struct vm_devmap *m);
     /* Optional, regular files of a disk file system: the page cache's
      * frame holding the file's bytes [idx * 4096, +4096), zero past the
      * end, with a reference for the caller (page_unref when done). With

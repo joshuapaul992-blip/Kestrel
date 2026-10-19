@@ -44,6 +44,8 @@
 #define PTE_HUGE     0x080ull
 #define PTE_COW      0x200ull           /* software: copy-on-write          */
 #define PTE_PROTNONE 0x400ull           /* software: frame kept, no access   */
+#define PTE_PFN      0x800ull           /* software: a device frame, not counted */
+#define PTE_CACHE    0x098ull           /* PWT, PCD, PAT: a device frame's caching */
 #define PTE_NX       (1ull << 63)
 #define ADDR_MASK    0x000FFFFFFFFFF000ull
 #define PAGE         4096ull
@@ -174,8 +176,20 @@ static void vma_insert(struct mm *mm, struct vma *nv)
     *pp = nv;
 }
 
+/* A device mapping's callbacks run under the big lock unless the driver
+ * locks itself (vm_devmap_ops.nolock); a fault comes here without it. */
+static bool dev_enter(const struct vm_devmap_ops *ops)
+{
+    if (ops->nolock || bkl_depth()) return false;
+    bkl_enter();
+    return true;
+}
+
+static void dev_exit(bool entered) { if (entered) bkl_exit(); }
+
 static void vma_free(struct vma *v)
 {
+    if (v->dops) { bool e = dev_enter(v->dops); v->dops->close(v->dctx); dev_exit(e); }
     if (v->obj) vmobj_put(v->obj);
     if (v->file) vfs_close(v->file);
     kfree(v);
@@ -189,6 +203,13 @@ static struct vma *vma_split(struct vma *v, uint64_t at)
     *n = *v;
     n->start = at;
     n->off = v->off + (at - v->start);
+    if (v->dops) {
+        bool e = dev_enter(v->dops);
+        n->dctx = v->dops->dup(v->dctx, NULL, at, v->end, n->off);
+        if (n->dctx) v->dops->resize(v->dctx, v->start, at, v->off);
+        dev_exit(e);
+        if (!n->dctx) { kfree(n); return NULL; }
+    }
     if (n->obj) vmobj_get(n->obj);
     if (n->file) vfs_file_get(n->file);
     v->end = at;
@@ -224,14 +245,15 @@ static int split_at(struct mm *mm, uint64_t a)
  * shootdown: another CPU running this address space may still reach a
  * frame through a stale translation until then. */
 #define ZAP_BATCH 128
-struct zap { struct mm *mm; uint64_t n, lo, hi; uint64_t frames[ZAP_BATCH]; };
+struct zap { struct mm *mm; uint64_t n, lo, hi; bool dev; uint64_t frames[ZAP_BATCH]; };
 
 static void zap_flush(struct zap *z)
 {
-    if (!z->n) return;
+    if (!z->n && !z->dev) return;
     tlb_range(z->mm, z->lo, z->hi);
     for (uint64_t i = 0; i < z->n; i++) page_unref(z->frames[i]);
     z->n = 0;
+    z->dev = false;
 }
 
 static void zap_fn(uint64_t *pte, uint64_t va, void *ctx)
@@ -240,8 +262,9 @@ static void zap_fn(uint64_t *pte, uint64_t va, void *ctx)
     uint64_t e = *pte;
     *pte = 0;
     if (!has_frame(e)) return;
-    if (!z->n) z->lo = va;
+    if (!z->n && !z->dev) z->lo = va;
     z->hi = va + PAGE;
+    if (e & PTE_PFN) { z->dev = true; return; }        /* the driver's frame */
     z->frames[z->n++] = e & ADDR_MASK;
     z->mm->rss--;
     if (z->n == ZAP_BATCH) zap_flush(z);
@@ -253,6 +276,7 @@ static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
     struct zap z;                                       /* ~1 KiB of the 16 KiB kernel stack */
     z.mm = mm;
     z.n = 0;
+    z.dev = false;
     walk_range(mm->pml4, start, end, zap_fn, &z);
     zap_flush(&z);
 }
@@ -310,7 +334,7 @@ static void free_tables(uint64_t *t, int level)
     for (int i = (level == 4 ? KERNEL_SLOTS : 0); i < (level == 4 ? 256 : 512); i++) {
         uint64_t e = t[i];
         if (!e) continue;
-        if (level == 1) { if (has_frame(e)) page_unref(e & ADDR_MASK); }
+        if (level == 1) { if (has_frame(e) && !(e & PTE_PFN)) page_unref(e & ADDR_MASK); }
         else if (e & PTE_P) { free_tables((uint64_t *)(e & ADDR_MASK), level - 1); pmm_free(e & ADDR_MASK); }
         t[i] = 0;
     }
@@ -336,7 +360,7 @@ static void fork_fn(uint64_t *pte, uint64_t va, void *ctx)
     struct forkctx *c = ctx;
     if (c->err) return;
     uint64_t e = *pte;
-    if (!has_frame(e)) return;
+    if (!has_frame(e) || (e & PTE_PFN)) return;         /* device frames: the child faults them in */
     /* private writable pages become copy-on-write in both processes */
     if (!(c->v->flags & VMA_SHARED) && (e & PTE_W)) {
         e = (e & ~PTE_W) | PTE_COW;
@@ -362,6 +386,12 @@ struct mm *mm_fork(struct mm *src)
         if (!n) { err = -ENOMEM; break; }
         *n = *v;
         n->next = NULL;
+        if (v->dops) {
+            bool e = dev_enter(v->dops);
+            n->dctx = v->dops->dup(v->dctx, dst, v->start, v->end, v->off);
+            dev_exit(e);
+            if (!n->dctx) { kfree(n); err = -ENOMEM; break; }
+        }
         if (n->obj) vmobj_get(n->obj);
         if (n->file) vfs_file_get(n->file);
         vma_insert(dst, n);
@@ -507,6 +537,16 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
     bool write = err & PF_WRITE, fetch = err & PF_INSN;
     if (v->prot == PROT_NONE || (write && !(v->prot & PROT_WRITE)) || (fetch && !(v->prot & PROT_EXEC)))
         return -EACCES;
+    if (v->dops) {                                      /* the driver maps it */
+        if (fast) return -EAGAIN;
+        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        if (pte && (*pte & PTE_P)) { tlb_page(mm, va); return 0; }  /* stale translation: retry */
+        current_task()->fault_kind = KF_SHARED;
+        bool e = dev_enter(v->dops);
+        int r = v->dops->fault(v->dctx, va, write);
+        dev_exit(e);
+        return r;
+    }
     uint64_t *pte = pte_walk(mm->pml4, va, true);
     if (!pte) return -ENOMEM;
     uint64_t e = *pte;
@@ -591,6 +631,22 @@ int vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write)
 }
 
 /* ---- mmap and friends ------------------------------------------------------- */
+/* Where a new region of len bytes goes (mm locked): the fixed address, with
+ * whatever was there unmapped, or the hint if it is free, or the lowest gap. */
+static int64_t place(struct mm *mm, uint64_t addr, uint64_t len, int flags)
+{
+    if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
+        if ((addr & (PAGE - 1)) || !user_range_ok(addr, len)) return -EINVAL;
+        if (flags & MAP_FIXED_NOREPLACE) return range_free(mm, addr, addr + len) ? (int64_t)addr : -EEXIST;
+        int r = unmap_range(mm, addr, addr + len);
+        return r ? r : (int64_t)addr;
+    }
+    uint64_t hint = pgdown(addr);
+    if (hint && user_range_ok(hint, len) && range_free(mm, hint, hint + len)) return (int64_t)hint;
+    addr = find_gap(mm, UVM_MMAP_BASE, UVM_MMAP_END, len);
+    return addr ? (int64_t)addr : -ENOMEM;
+}
+
 int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
                 struct file *file, struct vm_object *obj, uint64_t off, uint64_t file_end)
 {
@@ -599,19 +655,9 @@ int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
     if (!len || len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
     if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
     mm_lock(mm);
-    int64_t r;
-    if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
-        if ((addr & (PAGE - 1)) || !user_range_ok(addr, len)) { r = -EINVAL; goto out; }
-        if (flags & MAP_FIXED_NOREPLACE) {
-            if (!range_free(mm, addr, addr + len)) { r = -EEXIST; goto out; }
-        } else if ((r = unmap_range(mm, addr, addr + len))) {
-            goto out;
-        }
-    } else {
-        uint64_t hint = pgdown(addr);
-        if (hint && user_range_ok(hint, len) && range_free(mm, hint, hint + len)) addr = hint;
-        else if (!(addr = find_gap(mm, UVM_MMAP_BASE, UVM_MMAP_END, len))) { r = -ENOMEM; goto out; }
-    }
+    int64_t r = place(mm, addr, len, flags);
+    if (r < 0) goto out;
+    addr = (uint64_t)r;
     struct vma *v = kzalloc(sizeof *v);
     if (!v) { r = -ENOMEM; goto out; }
     v->start = addr;
@@ -628,6 +674,58 @@ out:
     mm_unlock(mm);
     if (r > 0 && (flags & MAP_POPULATE)) vm_populate(mm, (uint64_t)r, len, false);
     return r;
+}
+
+int64_t vm_mmap_dev(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off)
+{
+    if (!len) return -EINVAL;
+    len = pgup(len);
+    if (!len || len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
+    if ((flags & MAP_TYPE) == MAP_PRIVATE) return -EINVAL;     /* no copy-on-write of device memory */
+    struct vma *v = kzalloc(sizeof *v);
+    if (!v) return -ENOMEM;
+    mm_lock(mm);
+    int64_t r = place(mm, addr, len, flags);
+    if (r >= 0) {
+        struct vm_devmap m = { .start = (uint64_t)r, .end = (uint64_t)r + len, .off = off,
+                               .prot = prot, .flags = flags, .mm = mm };
+        int e = f->vn->ops->mmap(f, &m);                /* under the caller's big lock unless nolock */
+        if (e) {
+            r = e;
+        } else {
+            v->start = m.start;
+            v->end = m.end;
+            v->prot = (uint32_t)prot;
+            v->flags = VMA_SHARED | VMA_DEVICE;
+            v->off = off;
+            v->file = vfs_file_get(f);
+            v->dops = m.ops;
+            v->dctx = m.ctx;
+            vma_insert(mm, v);
+            v = NULL;
+        }
+    }
+    mm_unlock(mm);
+    kfree(v);
+    return r;
+}
+
+int vm_dev_insert(struct mm *mm, uint64_t va, uint64_t phys, uint64_t cache)
+{
+    va = pgdown(va);
+    struct vma *v = vma_find(mm, va);
+    if (!v || !v->dops) return -EFAULT;
+    uint64_t *pte = pte_walk(mm->pml4, va, true);
+    if (!pte) return -ENOMEM;
+    if (*pte) return 0;                                 /* mapped already, as Linux's insert_pfn */
+    *pte = (phys & ADDR_MASK) | leaf_flags(v, v->prot & PROT_WRITE) | (cache & PTE_CACHE) | PTE_PFN;
+    return 0;
+}
+
+void vm_dev_zap(struct mm *mm, uint64_t start, uint64_t end)
+{
+    zap_range(mm, pgdown(start), pgup(end));            /* device frames only: nothing to free */
 }
 
 int vm_munmap(struct mm *mm, uint64_t addr, uint64_t len)
@@ -648,6 +746,7 @@ static void prot_fn(uint64_t *pte, uint64_t va, void *ctx)
     struct protctx *c = ctx;
     uint64_t e = *pte;
     if (!has_frame(e)) return;
+    if (e & PTE_PFN) { *pte = 0; return; }              /* device: faulted in again with the new rights */
     uint64_t frame = e & ADDR_MASK, cow = e & PTE_COW;
     if (c->v->prot == PROT_NONE) { *pte = frame | cow | PTE_PROTNONE; return; }
     /* a private page still shared with another process stays read-only
@@ -717,6 +816,7 @@ int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int
     int64_t r;
     struct vma *v = vma_find(mm, old);
     if (!v || old + olen > v->end) { r = -EFAULT; goto out; }     /* must lie in one region */
+    if (v->dops && (nlen > olen || (flags & MREMAP_FIXED))) { r = -EINVAL; goto out; }   /* device: shrink only */
     if (!(flags & MREMAP_FIXED)) {
         if (nlen <= olen) {                                       /* shrink in place */
             r = unmap_range(mm, old + nlen, old + olen);

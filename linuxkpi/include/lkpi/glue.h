@@ -13,6 +13,9 @@
 void         *lkpi_heap_alloc(unsigned long n);            /* 16-byte aligned, NULL on OOM   */
 void          lkpi_heap_free(void *p);
 unsigned long lkpi_frames_alloc(unsigned long n, int dma32);    /* zeroed, contiguous; 0 on OOM */
+/* 2^order frames aligned to their size (alloc_pages: struct pages of one
+ * allocation then lie in one chunk of the KPI's table, so page + i works) */
+unsigned long lkpi_frames_alloc_order(unsigned int order, int dma32);
 void          lkpi_frames_free(unsigned long phys, unsigned long n);
 unsigned long lkpi_ram_total(void);
 unsigned long lkpi_ram_free(void);
@@ -149,6 +152,7 @@ long          lkpi_file_read_all(const char *path, void **data, unsigned long ma
 /* A character device in /dev. The callbacks get the open's private
  * pointer; read/write buffers are kernel memory, ioctl arguments are
  * user addresses (or values). */
+struct lkpi_mmap;
 struct lkpi_cdev_ops {
     int  (*open)(void *dev, int flags, void **file);
     void (*release)(void *file);
@@ -156,9 +160,37 @@ struct lkpi_cdev_ops {
     long (*write)(void *file, const char *buf, unsigned long n, long long *pos);
     long (*ioctl)(void *file, unsigned int cmd, unsigned long arg);
     int  (*poll)(void *file, int events);
+    int  (*mmap)(void *file, struct lkpi_mmap *m);          /* optional: MAP_SHARED */
 };
 void         *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                             const struct lkpi_cdev_ops *ops, void *dev);
 void          lkpi_cdev_remove(void *node);
+
+/* ---- device memory mapped into a process (mmap of a device node) -------- */
+/* The region [start, end) at file offset `off` of the process `mm` (opaque)
+ * is set up by the cdev's mmap(), which fills in ops and ctx. Each region
+ * has its own ctx: dup() copies it for a fork (into `mm`) or for the upper
+ * part of a split region (mm NULL: the same process, and resize() shrinks
+ * the original); close() ends it. fault() maps at least `va` with
+ * lkpi_vm_insert() and returns 0, -EIO (SIGBUS), -ENOMEM or -EFAULT. All
+ * of them may sleep and run under Kestrel's big kernel lock. */
+struct lkpi_mmap_ops {
+    int   (*fault)(void *ctx, unsigned long va, int write);
+    void *(*dup)(void *ctx, void *mm, unsigned long start, unsigned long end, unsigned long off);
+    void  (*resize)(void *ctx, unsigned long start, unsigned long end, unsigned long off);
+    void  (*close)(void *ctx);
+};
+struct lkpi_mmap {
+    unsigned long start, end, off;
+    int           prot, flags;              /* PROT_*, MAP_* (Linux values)  */
+    void         *mm;
+    const struct lkpi_mmap_ops *ops;
+    void         *ctx;
+};
+/* From fault(): map the frame at `phys` at `va` of `mm`; `cache` is 0
+ * (write-back), 0x08 (write-combining) or 0x18 (uncached). 0 or -errno. */
+int           lkpi_vm_insert(void *mm, unsigned long va, unsigned long phys, unsigned long cache);
+/* Unmap [start, end) of a region in `mm`: the memory behind it moved. */
+void          lkpi_vm_zap(void *mm, unsigned long start, unsigned long end);
 
 #endif
