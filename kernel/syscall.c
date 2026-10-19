@@ -3224,6 +3224,9 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* a name's node: the tree's lock; a truncate or statfs of a node that
      * needs the big lock takes it in fs/vfs.c */
     case SYS_truncate: case SYS_statfs:
+    /* every file system's sync (ext2's own lock) and every disk's flush
+     * (blk_flush takes the big lock for a driver that needs it) */
+    case SYS_sync: case SYS_syncfs:
     case SYS_getxattr: case SYS_lgetxattr: case SYS_setxattr: case SYS_lsetxattr:
     case SYS_listxattr: case SYS_llistxattr: case SYS_removexattr: case SYS_lremovexattr:
         return true;

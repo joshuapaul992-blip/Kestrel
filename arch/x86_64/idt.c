@@ -130,14 +130,13 @@ static void user_fault(struct int_frame *f)
 
 /* A page fault in ring 3 that vm_fault_fast() left: resolved without the big
  * lock (demand paging from the disk, copy-on-write under memory pressure),
- * which is taken only for a signal to raise or deliver on the way back. */
+ * as is a signal to raise or deliver on the way back (proc_lock). */
 static void user_page_fault(struct int_frame *f, uint64_t addr)
 {
     sti();                                              /* resolving may sleep (file read, OOM) */
     int r = vm_fault(addr, f->error, true);
     cli();
     if (r == 0 && !signal_pending()) return;
-    bkl_enter();
     if (r == -EIO) {
         signal_force_fault(SIGBUS, 2, addr, 14, f->error);     /* BUS_ADRERR: past the end of a file */
     } else if (r && r != -ENOMEM) {                     /* -ENOMEM: SIGKILL is pending (OOM) */
@@ -147,7 +146,6 @@ static void user_page_fault(struct int_frame *f, uint64_t addr)
     }
     signal_deliver(f, 0, false);
     cli();
-    bkl_exit();
 }
 
 /* ---- faults in the kernel: diagnostics, never silent corruption ------------ */
@@ -288,6 +286,12 @@ static bool lockless(struct int_frame *f)
         return true;
     case 8: case 18:                                    /* #DF, #MC: state unknown, stop */
         kernel_exception(f);
+    case 0: case 1: case 3 ... 7: case 9 ... 13: case 15 ... 17: case 19 ... 31:
+        if ((f->cs & 3) != 3) return false;             /* the kernel's: a report, then panic */
+        user_fault(f);                                  /* a signal for the process (proc_lock) */
+        signal_deliver(f, 0, false);
+        cli();
+        return true;
     case 14: {                                          /* page faults (vm.c) */
         uint64_t addr = read_cr2();
         if ((f->cs & 3) == 3) {

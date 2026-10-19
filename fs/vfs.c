@@ -813,10 +813,17 @@ int vfs_statfs(struct vnode *vn, struct kstatfs *st)
     return 0;
 }
 
+/* The mounts are listed under the tree's lock and synced after it (a sync
+ * writes and waits); a mount is never freed. */
 void vfs_sync_all(bool final)
 {
-    for (struct mount *m = mounts; m; m = m->next)
-        if (m->sync && strcmp(m->fstype, "bind")) m->sync(m, final);
+    struct mount *list[32];
+    int n = 0;
+    vfs_tree_lock(false);
+    for (struct mount *m = mounts; m && n < 32; m = m->next)
+        if (m->sync && strcmp(m->fstype, "bind")) list[n++] = m;
+    vfs_tree_unlock();
+    for (int i = 0; i < n; i++) list[i]->sync(list[i], final);
 }
 
 /* ======================================================================= */
