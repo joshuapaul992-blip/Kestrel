@@ -116,7 +116,7 @@ static void video_init(struct mb2_tag_framebuffer *t)
               t->fb_type == MB2_FB_TYPE_EGA ? "VGA text" : "palette");
 
     uint64_t size = (uint64_t)t->pitch * t->height;
-    if (t->addr + size > PMM_MAX_PHYS && !vmm_identity_map(t->addr, size, VMM_WRITE))
+    if (t->addr + size > BOOT_MAP_END && !vmm_identity_map(t->addr, size, VMM_WRITE))
         panic("cannot map frame buffer at %lx", t->addr);
     if (!fb_init(t)) panic("unsupported frame buffer: %u bpp", t->bpp);
 

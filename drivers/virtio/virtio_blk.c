@@ -98,7 +98,9 @@ static int ndisks;
 #define C8(v, o)  (*(volatile uint8_t  *)((v)->common + (o)))
 #define C16(v, o) (*(volatile uint16_t *)((v)->common + (o)))
 #define C32(v, o) (*(volatile uint32_t *)((v)->common + (o)))
-#define C64(v, o) (*(volatile uint64_t *)((v)->common + (o)))
+/* 64-bit fields as two 32-bit stores, low half first, as Linux writes them:
+ * not every device takes a single 64-bit access to its common config */
+#define C64_SET(v, o, x) do { uint64_t x_ = (x); C32(v, o) = (uint32_t)x_; C32(v, (o) + 4) = (uint32_t)(x_ >> 32); } while (0)
 enum { DFSEL = 0, DF = 4, GFSEL = 8, GF = 12, MSIX = 16, NUMQ = 18, STATUS = 20, QSEL = 22, QSIZE = 24,
        QMSIX = 26, QENABLE = 28, QNOFF = 30, QDESC = 32, QDRIVER = 40, QDEVICE = 48 };
 #define NO_VECTOR 0xffff
@@ -170,9 +172,9 @@ static bool vq_setup(struct vblk *v)
     v->avail->flags = AVAIL_NO_INTERRUPT;               /* polled until MSI-X is set up */
     C16(v, QSIZE) = v->qsize;
     C16(v, QMSIX) = NO_VECTOR;
-    C64(v, QDESC) = (uint64_t)(uintptr_t)v->desc;
-    C64(v, QDRIVER) = (uint64_t)(uintptr_t)v->avail;
-    C64(v, QDEVICE) = (uint64_t)(uintptr_t)v->used;
+    C64_SET(v, QDESC, (uint64_t)(uintptr_t)v->desc);
+    C64_SET(v, QDRIVER, (uint64_t)(uintptr_t)v->avail);
+    C64_SET(v, QDEVICE, (uint64_t)(uintptr_t)v->used);
     v->notify = (volatile uint16_t *)(v->notify_base + (uint32_t)C16(v, QNOFF) * v->notify_mult);
     C16(v, QENABLE) = 1;
     return true;

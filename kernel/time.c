@@ -92,9 +92,9 @@ static const struct rsdp *find_rsdp(uintptr_t mbi)
 static const struct sdt_header *map_table(uint64_t phys)
 {
     if (!phys) return NULL;
-    if (phys + 4096 > PMM_MAX_PHYS) vmm_identity_map(phys, 4096, VMM_WRITE);
+    if (phys + 4096 > BOOT_MAP_END) vmm_identity_map(phys, 4096, VMM_WRITE);
     const struct sdt_header *h = (const struct sdt_header *)(uintptr_t)phys;
-    if (h->length > 4096 && phys + h->length > PMM_MAX_PHYS) vmm_identity_map(phys, h->length, VMM_WRITE);
+    if (h->length > 4096 && phys + h->length > BOOT_MAP_END) vmm_identity_map(phys, h->length, VMM_WRITE);
     return h;
 }
 

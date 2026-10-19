@@ -268,10 +268,13 @@ static bool r8169_init(struct pci_device *d)
         w8(t, CFG9346, CFG_LOCK);
     }
 
-    t->rx = nic_dma(NDESC * sizeof(struct desc), false);
-    t->tx = nic_dma(NDESC * sizeof(struct desc), false);
-    t->rxbuf = nic_dma((size_t)NDESC * BUF_SIZE, false);
-    t->txbuf = nic_dma((size_t)NDESC * BUF_SIZE, false);
+    /* Linux lets only mac_version 18 and later use 64-bit addresses: the
+     * older 8169/8110 parts get memory below 4 GiB */
+    bool dma32 = t->ver < 18;
+    t->rx = nic_dma(NDESC * sizeof(struct desc), dma32);
+    t->tx = nic_dma(NDESC * sizeof(struct desc), dma32);
+    t->rxbuf = nic_dma((size_t)NDESC * BUF_SIZE, dma32);
+    t->txbuf = nic_dma((size_t)NDESC * BUF_SIZE, dma32);
     if (!t->rx || !t->tx || !t->rxbuf || !t->txbuf) { kprintf("r8169: out of memory\n"); return false; }
     for (uint32_t i = 0; i < NDESC; i++) {
         t->rx[i].addr = nic_bus(t->rxbuf + (size_t)i * BUF_SIZE);

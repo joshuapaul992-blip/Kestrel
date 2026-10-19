@@ -192,7 +192,7 @@ int blk_read_bytes(struct blkdev *b, uint64_t off, void *buf, size_t len)
     uint32_t bs = b->block_size;
     size_t cap = BOUNCE_MAX;
     if (cap > ((len + bs - 1) / bs + 1) * bs) cap = ((len + bs - 1) / bs + 1) * bs;
-    uint8_t *bounce = kmalloc(cap);             /* heap: identity mapped, DMA safe */
+    uint8_t *bounce = kmalloc(cap);             /* heap: identity mapped; drivers bounce what their device cannot reach */
     if (!bounce) return -ENOMEM;
 
     size_t done = 0;

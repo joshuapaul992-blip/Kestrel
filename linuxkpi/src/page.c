@@ -18,7 +18,7 @@
 
 #define CHUNK_SHIFT     12                          /* 4096 pages: 16 MiB of memory */
 #define CHUNK_PAGES     (1UL << CHUNK_SHIFT)
-#define MAX_CHUNKS      4096                        /* up to 64 GiB of physical addresses */
+#define MAX_CHUNKS      65536                       /* up to 1 TiB, Kestrel's PMM_MAX_PHYS */
 
 static struct page *chunks[MAX_CHUNKS];
 static DEFINE_SPINLOCK(chunk_lock);

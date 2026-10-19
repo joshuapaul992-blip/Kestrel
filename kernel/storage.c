@@ -41,11 +41,12 @@
 /* ---- platform hooks for the AHCI driver -------------------------------- */
 
 /* PMM frames are 4 KiB aligned, physically contiguous, zeroed and identity
- * mapped: exactly what the HBA's command lists, FIS areas and tables need. */
+ * mapped: exactly what the HBA's command lists, FIS areas and tables need.
+ * Below 4 GiB, so an AHCI controller without 64-bit addressing reaches them. */
 static void *dma_alloc(size_t size, size_t align, uint64_t *phys)
 {
     if (align > PAGE_SIZE) return NULL;
-    uint64_t pa = pmm_alloc_contig((size + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint64_t pa = pmm_alloc_dma32((size + PAGE_SIZE - 1) / PAGE_SIZE);
     *phys = pa;
     return pa ? (void *)pa : NULL;
 }
