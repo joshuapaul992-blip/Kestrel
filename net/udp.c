@@ -240,14 +240,14 @@ long icmp_sock_send(struct isock *s, const void *buf, size_t len, uint32_t dst)
 long dgram_recv(struct isock *s, struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from,
                 int *msg_flags)
 {
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     uint64_t deadline = sock_deadline(s->rcvtimeo);
     while (!s->rq) {
-        if (s->err) { int e = s->err; s->err = 0; irq_restore(fl); return -e; }
-        if (s->shut_rd) { irq_restore(fl); return 0; }
-        if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { irq_restore(fl); return -EAGAIN; }
+        if (s->err) { int e = s->err; s->err = 0; net_unlock(fl); return -e; }
+        if (s->shut_rd) { net_unlock(fl); return 0; }
+        if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { net_unlock(fl); return -EAGAIN; }
         int rc = sock_wait(s, deadline);
-        if (rc) { irq_restore(fl); return rc; }
+        if (rc) { net_unlock(fl); return rc; }
     }
     struct pkt *p = s->rq;
     size_t n = p->len < len ? p->len : len;
@@ -269,7 +269,7 @@ long dgram_recv(struct isock *s, struct file *f, void *buf, size_t len, int flag
         s->rq_bytes -= p->len;
         pkt_free(p);
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return ret;
 }
 

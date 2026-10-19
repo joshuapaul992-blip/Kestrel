@@ -212,6 +212,7 @@ static void in_release(struct file *f)
 
 static const struct vnode_ops in_ops = {
     .fread = in_read, .poll = in_poll, .fioctl = in_ioctl, .release = in_release,
+    .nolock = true,                     /* in_lock */
 };
 
 int inotify_create(int flags, struct file **out)

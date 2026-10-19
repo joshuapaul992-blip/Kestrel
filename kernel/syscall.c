@@ -85,6 +85,18 @@ static bool fd_nolock(uint64_t fd)
     spin_unlock_irqrestore(&fs->lock, fl);
     return r;
 }
+
+/* Is fd a socket: AF_INET (the network stack's lock, net_lock) or AF_UNIX
+ * (fs/unixsock.c's lock, its name table included)? */
+static bool fd_sock(uint64_t fd)
+{
+    if (fd >= MAX_FDS) return false;
+    struct files_struct *fs = current_task()->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    bool r = inet_is(fs->fd[fd]) || usock_is(fs->fd[fd]);
+    spin_unlock_irqrestore(&fs->lock, fl);
+    return r;
+}
 static void fput(struct file *f) { vfs_close(f); }
 
 /* Install f (whose reference the table takes over) at the lowest free
@@ -491,7 +503,6 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
         goto out;
     }
     if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
-        if (!bkl_depth()) bkl_enter();                  /* a unix socket's fget let it be; kept to the end */
         r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
     } else if (size < 0) {
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
@@ -2762,7 +2773,12 @@ static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags, ui
     struct tcb *t = current_task();
     uint64_t hi = (uint32_t)last < MAX_FDS ? (uint32_t)last : MAX_FDS - 1;
     for (uint64_t fd = (uint32_t)first; fd <= hi; fd++) {
-        if (flags & 4) { if (t->files->fd[fd]) t->files->cloexec[fd] = 1; continue; }
+        if (flags & 4) {                                /* CLOSE_RANGE_CLOEXEC */
+            uint64_t fl = spin_lock_irqsave(&t->files->lock);
+            if (t->files->fd[fd]) t->files->cloexec[fd] = 1;
+            spin_unlock_irqrestore(&t->files->lock, fl);
+            continue;
+        }
         struct file *f = fd_take(t, (int)fd);
         if (f) { vfs_locks_fd_closed(f); vfs_close(f); }
     }
@@ -3107,6 +3123,7 @@ static bool syscall_fast(struct int_frame *f)
 #define FUTEX_PRIVATE_FLAG 128
 static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
 {
+    if (nr < SYS_MAX && (table[nr] == sys_absent || table[nr] == sys_enosys)) return true;   /* ENOSYS */
     switch (nr) {
     case SYS_futex:          return (f->rsi & FUTEX_PRIVATE_FLAG) != 0;
     case SYS_sched_yield:    case SYS_rt_sigprocmask: case SYS_sigaltstack:   case SYS_prctl:
@@ -3137,10 +3154,23 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_pipe: case SYS_pipe2: case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
     case SYS_eventfd: case SYS_eventfd2:
         return true;
-    /* the end of a thread or process, and waiting for a child's: the
-     * process tree's own lock (proc_lock, task.h). The last close of a
-     * process's files and the parent's SIGCHLD take the big lock there. */
+    /* the end of a thread or process, waiting for a child's, and signals:
+     * the process tree's own lock (proc_lock, task.h), which also guards
+     * what is pending and the handlers (proc/process.c). The last close of
+     * a file that needs the big lock takes it there (vfs_close). */
     case SYS_exit: case SYS_exit_group: case SYS_wait4: case SYS_waitid:
+    case SYS_rt_sigaction: case SYS_rt_sigreturn: case SYS_rt_sigpending:
+    case SYS_rt_sigsuspend: case SYS_pause: case SYS_tkill: case SYS_tgkill:
+        return true;
+    case SYS_kill:           return f->rdi != 1;        /* the kernel may play init: poweroff */
+    /* a new thread or process: its slot and the tree under proc_lock, the
+     * copies under the tables' own locks (the address space's, the
+     * descriptor table's); the child starts without the big lock */
+    case SYS_fork: case SYS_vfork: case SYS_clone: case SYS_clone3:
+    /* a new program: the image is read with the big lock only from a file
+     * that needs it (proc/exec.c); the rest is the task's own, the tree's
+     * (proc_lock) or the address space's */
+    case SYS_execve:
         return true;
     /* data through a file that locks itself: a unix socket, a pipe, an
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
@@ -3163,6 +3193,39 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * big lock takes it in fget, MAP_POPULATE in sys_mmap. */
     case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_brk:
     case SYS_madvise: case SYS_mremap:
+        return true;
+    /* sockets: the network stack's lock (net/core.c, net_lock) or the unix
+     * sockets' (fs/unixsock.c). Their data calls, polls and ioctls go by
+     * fd_nolock above. */
+    case SYS_socket:         return f->rdi == AF_INET || f->rdi == AF_UNIX;
+    case SYS_socketpair:     return true;
+    case SYS_bind: case SYS_listen: case SYS_connect: case SYS_accept: case SYS_accept4:
+    case SYS_shutdown: case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt: case SYS_getsockopt:
+        return fd_sock(f->rdi);
+    /* answers that need nothing shared: fixed ones, the caller's own ids
+     * and limits, its own address space's (mm->lock) */
+    case SYS_capget: case SYS_capset: case SYS_getcpu: case SYS_ioprio_get: case SYS_ioprio_set:
+    case SYS_personality: case SYS_times: case SYS_sched_get_priority_max: case SYS_sched_get_priority_min:
+    case SYS_sched_setaffinity: case SYS_get_robust_list: case SYS_mincore: case SYS_msync: case SYS_fallocate:
+    case SYS_mlock: case SYS_munlock: case SYS_mlockall: case SYS_munlockall:
+    case SYS_setuid: case SYS_setgid: case SYS_setreuid: case SYS_setregid: case SYS_setresuid:
+    case SYS_setresgid: case SYS_setgroups:
+    /* the process tree's ids: proc_lock */
+    case SYS_setsid: case SYS_setpgid:
+        return true;
+    /* a descriptor's file: fget takes the big lock for one that needs it.
+     * timerfd, signalfd, inotify and memfd files lock themselves. */
+    case SYS_ftruncate: case SYS_fchmod: case SYS_fchown: case SYS_fstatfs: case SYS_sendfile:
+    case SYS_close_range: case SYS_memfd_create:
+    case SYS_timerfd_create: case SYS_timerfd_settime: case SYS_timerfd_gettime:
+    case SYS_signalfd: case SYS_signalfd4:
+    case SYS_inotify_init: case SYS_inotify_init1: case SYS_inotify_add_watch: case SYS_inotify_rm_watch:
+    case SYS_fgetxattr: case SYS_fsetxattr: case SYS_flistxattr: case SYS_fremovexattr:
+    /* a name's node: the tree's lock; a truncate or statfs of a node that
+     * needs the big lock takes it in fs/vfs.c */
+    case SYS_truncate: case SYS_statfs:
+    case SYS_getxattr: case SYS_lgetxattr: case SYS_setxattr: case SYS_lsetxattr:
+    case SYS_listxattr: case SYS_llistxattr: case SYS_removexattr: case SYS_lremovexattr:
         return true;
     /* names in the file tree: the tree's lock (fs/vfs.c), shared to look
      * and exclusive to change. A device's open, a generated file's size or
@@ -3233,14 +3296,13 @@ int syscall_dispatch(struct int_frame *f)
         cli();
     }
     if (t->user && (f->cs & 3) == 3) {
-        /* signals are delivered under the lock: a lock-free call that has
-         * one to deliver (or a wait's mask to restore) takes it now, and so
-         * does one a signal interrupted: another thread may have taken that
-         * signal meanwhile, and the call is then restarted (signal_deliver) */
+        /* a signal to deliver, a wait's mask to restore, or a call a signal
+         * interrupted (another thread may have taken that signal meanwhile,
+         * and the call is then restarted): signal_deliver(), which takes
+         * proc_lock for what it changes */
         int64_t ret = (int64_t)f->rax;
         bool restart = ret == -ERESTARTSYS || ret == -ERESTARTNOHAND;
-        if (!locked && (signal_pending() || t->saved_mask_valid || restart)) { bkl_enter(); locked = true; }
-        if (locked) signal_deliver(f, nr, true);
+        if (signal_pending() || t->saved_mask_valid || restart) signal_deliver(f, nr, true);
     }
     int iret = t->iret_return;
     t->iret_return = false;

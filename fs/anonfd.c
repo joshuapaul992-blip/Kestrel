@@ -133,8 +133,9 @@ struct timerfd {
     uint64_t     interval;              /* ns; 0 = one-shot */
     uint64_t     expired;               /* expirations not read yet */
 };
+static struct spinlock tfd_lock;        /* every timerfd's fields */
 
-/* Count expirations up to now (interrupts off). */
+/* Count expirations up to now (tfd_lock held). */
 static void tfd_update(struct timerfd *t)
 {
     if (!t->next) return;
@@ -156,17 +157,17 @@ static ssize_t tfd_read(struct file *f, void *buf, size_t len)
 {
     struct timerfd *t = f->vn->data;
     if (len < 8) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&tfd_lock);
     for (;;) {
         tfd_update(t);
         if (t->expired) break;
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on_until(t, t->next ? ns_to_deadline_ms(t->next) : 0);    /* settime wakes us too */
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&tfd_lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&tfd_lock, fl); return -ERESTARTSYS; }
+        sleep_on_until_locked(t, t->next ? ns_to_deadline_ms(t->next) : 0, &tfd_lock);   /* settime wakes us too */
     }
     uint64_t v = t->expired;
     t->expired = 0;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&tfd_lock, fl);
     memcpy(buf, &v, 8);
     return 8;
 }
@@ -175,10 +176,10 @@ static int tfd_poll(struct file *f, int events)
 {
     struct timerfd *t = f->vn->data;
     poll_wait(t);                                       /* settime; expiry: the poll deadline */
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&tfd_lock);
     tfd_update(t);
     int r = t->expired ? POLLIN : 0;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&tfd_lock, fl);
     return r & events;
 }
 
@@ -190,6 +191,7 @@ static uint64_t tfd_deadline(struct file *f)
 
 static const struct vnode_ops tfd_ops = {
     .fread = tfd_read, .poll = tfd_poll, .poll_deadline = tfd_deadline, .release = free_object,
+    .nolock = true,                     /* tfd_lock */
 };
 
 static bool is_timerfd(struct file *f) { return f && f->vn && f->vn->ops == &tfd_ops; }
@@ -229,7 +231,7 @@ int timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], int64_t
     if (!ts_ok(nv[0], nv[1]) || !ts_ok(nv[2], nv[3])) return -EINVAL;
     struct timerfd *t = f->vn->data;
     uint64_t value = ts_ns(nv[2], nv[3]), now = time_ns();
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&tfd_lock);
     if (old) cur_value(t, old);
     t->interval = ts_ns(nv[0], nv[1]);
     t->expired = 0;
@@ -245,16 +247,16 @@ int timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], int64_t
     }
     if (t->next == 0 && value) t->next = 1;
     wakeup(t);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&tfd_lock, fl);
     return 0;
 }
 
 int timerfd_gettime_file(struct file *f, int64_t cur[4])
 {
     if (!is_timerfd(f)) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&tfd_lock);
     cur_value(f->vn->data, cur);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&tfd_lock, fl);
     return 0;
 }
 
@@ -282,15 +284,14 @@ static ssize_t sfd_read(struct file *f, void *buf, size_t len)
     struct sigfd *s = f->vn->data;
     size_t n = len / sizeof(struct signalfd_siginfo), got = 0;
     if (!n) return -EINVAL;
-    uint64_t fl = irq_save();
     while (got < n) {
         struct ksig_info info;
-        int sig = signal_dequeue(s->mask, &info);
+        int sig = signal_dequeue(__atomic_load_n(&s->mask, __ATOMIC_RELAXED), &info);
         if (!sig) {
             if (got) break;
-            if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-            if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-            sleep_on(&signal_wait_chan);
+            if (f->flags & O_NONBLOCK) return -EAGAIN;
+            if (signal_pending()) return -ERESTARTSYS;
+            signal_wait_mask(__atomic_load_n(&s->mask, __ATOMIC_RELAXED));   /* proc_lock: none missed */
             continue;
         }
         struct signalfd_siginfo si;
@@ -305,7 +306,6 @@ static ssize_t sfd_read(struct file *f, void *buf, size_t len)
         memcpy((uint8_t *)buf + got * sizeof si, &si, sizeof si);
         got++;
     }
-    irq_restore(fl);
     return (ssize_t)(got * sizeof(struct signalfd_siginfo));
 }
 
@@ -316,7 +316,7 @@ static int sfd_poll(struct file *f, int events)
     return (signal_pending_mask() & s->mask) ? (POLLIN & events) : 0;
 }
 
-static const struct vnode_ops sfd_ops = { .fread = sfd_read, .poll = sfd_poll, .release = free_object };
+static const struct vnode_ops sfd_ops = { .fread = sfd_read, .poll = sfd_poll, .release = free_object, .nolock = true };
 
 /* signalfd4: a new descriptor (f == NULL), or a new mask for an existing one. */
 int signalfd_file(struct file *f, uint64_t mask, int flags, struct file **out)
@@ -325,7 +325,7 @@ int signalfd_file(struct file *f, uint64_t mask, int flags, struct file **out)
     mask &= ~((1ull << 8) | (1ull << 18));              /* SIGKILL and SIGSTOP cannot be read */
     if (f) {
         if (!f->vn || f->vn->ops != &sfd_ops) return -EINVAL;
-        ((struct sigfd *)f->vn->data)->mask = mask;
+        __atomic_store_n(&((struct sigfd *)f->vn->data)->mask, mask, __ATOMIC_RELAXED);
         *out = NULL;
         return 0;
     }

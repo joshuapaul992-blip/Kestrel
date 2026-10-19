@@ -103,6 +103,7 @@ bool signal_pending(void);                      /* for blocking loops         */
 /* signalfd: take the lowest pending signal of the current thread that is in
  * mask (its own first, then the process'); 0 if none. */
 int  signal_dequeue(uint64_t mask, struct ksig_info *info);
+void signal_wait_mask(uint64_t mask);          /* until one in mask, or one to deliver */
 uint64_t signal_pending_mask(void);             /* pending for the current thread */
 extern int signal_wait_chan;                    /* woken whenever a signal is queued */
 /* Deliver pending signals to the current process before it returns to

@@ -317,10 +317,8 @@ static bool lockless(struct int_frame *f)
             sched_tick_fast();
         }
         if ((f->cs & 3) == 3 && signal_pending()) {     /* back to ring 3 with a signal to take */
-            bkl_enter();
             signal_deliver(f, 0, false);
             cli();
-            bkl_exit();
         }
         return true;
     case VEC_RESCHED:                                   /* the idle loop looks after the hlt */

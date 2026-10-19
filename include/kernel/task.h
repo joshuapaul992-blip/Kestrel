@@ -105,6 +105,8 @@ struct tcb {
     bool      idle_class;       /* runs only when no other task is ready    */
     uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;
+    bool      sig_kick;         /* a signal came while it ran: its next sleep is skipped */
+    bool      paused;           /* task_create_paused() until task_start(): not woken */
     struct poll_table *poll_tab;    /* poll/select/epoll: collecting, then sleeping on it */
     uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
@@ -212,6 +214,7 @@ void        sleep_on(void *chan);       /* call with interrupts disabled */
 void        sleep_on_locked(void *chan, struct spinlock *l);
 /* sleep_on() that also ends at deadline_ms of time_ms() (0: none) */
 void        sleep_on_until(void *chan, uint64_t deadline_ms);
+void        sleep_on_until_locked(void *chan, uint64_t deadline_ms, struct spinlock *l);
 void        wakeup(void *chan);
 /* Wake only the tasks sleeping on chan, not every poll()/epoll sleeper as
  * wakeup() does: for things nobody polls (mutexes, device completions). */
@@ -256,6 +259,8 @@ int         task_wait(int pid);         /* exit status, or -ECHILD        */
 int         task_snapshot(struct tcb *out, int max);
 struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
+struct mm  *task_mm_get(struct tcb *t); /* its address space, referenced    */
+struct fs_struct *task_fs_get_locked(struct tcb *t); /* proc_lock held: its fs, referenced (fs_put) */
 void        task_reap(struct tcb *t);   /* free a collected zombie (wait4)   */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
 /* Futex-style sleep: mark the current task asleep on `chan` (until

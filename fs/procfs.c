@@ -72,8 +72,10 @@ static size_t gen_cpuinfo(char *buf, size_t cap, void *ctx)
 static size_t gen_mounts(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
+    vfs_tree_lock(false);                               /* the mount list */
     for (struct mount *m = vfs_mounts(); m; m = m->next)
         P("%s %s %s %s 0 0\n", m->fstype, m->path, m->fstype, (m->flags & MNT_RDONLY) ? "ro" : "rw");
+    vfs_tree_unlock();
     return n;
 }
 
@@ -82,12 +84,14 @@ static size_t gen_mountinfo(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
     int id = 20;
+    vfs_tree_lock(false);
     for (struct mount *m = vfs_mounts(); m; m = m->next, id++) {
         const char *ro = (m->flags & MNT_RDONLY) ? "ro" : "rw";
         P("%d %d %u:%u / %s %s,relatime - %s %s %s\n", id, m->path[1] ? 20 : 1, (m->dev >> 8) & 0xfff,
           (m->dev & 0xff) | ((m->dev >> 12) & 0xfff00),
           m->path, ro, m->fstype, m->fstype, ro);
     }
+    vfs_tree_unlock();
     return n;
 }
 
@@ -291,73 +295,122 @@ static char state_char(const struct tcb *t)
     }
 }
 
+/* A copy of the task a file is about, taken under proc_lock: fork, exit
+ * and execve change it there, and reap frees what it points to, so the
+ * copy's pointers are not followed. NULL if it is gone; kfree it. */
+struct pid_info {
+    struct tcb t;
+    int        threads;
+    uint64_t   shared_pending;
+    uint64_t   rss;                 /* resident pages */
+};
+
+static struct pid_info *pid_copy(void *ctx)
+{
+    struct pid_info *c = kmalloc(sizeof *c);
+    if (!c) return NULL;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct tcb *t = pid_task(ctx);
+    struct mm *mm = t ? t->mm : NULL;
+    if (t) {
+        c->t = *t;
+        c->threads = t->signal ? t->signal->nr_threads : 0;
+        c->shared_pending = t->signal ? t->signal->shared_pending : 0;
+        if (mm) mm_get(mm);                             /* task_mm_get() */
+    }
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!t) { kfree(c); return NULL; }
+    c->rss = mm ? mm->rss : 0;
+    mm_put(mm);
+    return c;
+}
+
 static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
-    struct tcb *t = pid_task(ctx);
-    if (!t) return 0;
+    struct pid_info *c = pid_copy(ctx);
+    if (!c) return 0;
+    const struct tcb *t = &c->t;
     uint64_t ticks = t->cpu_ticks * 100 / PIT_HZ;              /* USER_HZ */
     uint64_t start = t->start_tick * 100 / PIT_HZ;
-    uint64_t pages = t->mm ? t->mm->rss : 0;
+    uint64_t pages = c->rss;
     int tty = t->ctty ? (136 << 8) | (t->ctty - 1) : 0;
     /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
      * majflt cmajflt utime stime cutime cstime priority nice threads
      * itrealvalue starttime vsize rss ... (52 fields) */
     P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
       t->pid, t->name, state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
-      ticks, t->signal ? t->signal->nr_threads : 0, start, pages * 4096, pages);
+      ticks, c->threads, start, pages * 4096, pages);
     P(" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 %d\n", t->exit_code);
+    kfree(c);
     return n;
 }
 
 static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
-    struct tcb *t = pid_task(ctx);
-    if (!t) return 0;
+    struct pid_info *c = pid_copy(ctx);
+    if (!c) return 0;
+    const struct tcb *t = &c->t;
     static const char *const names[] = { "?", "R (running)", "R (running)", "S (sleeping)", "S (sleeping)",
                                          "Z (zombie)" };
-    uint64_t pages = t->mm ? t->mm->rss : 0;
+    uint64_t pages = c->rss;
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
       t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
     P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
       t->gid, t->gid, t->gid, t->gid);
     if (t->user) P("VmSize:\t%lu kB\nVmRSS:\t%lu kB\n", pages * 4, pages * 4);
-    P("Threads:\t%d\nSigPnd:\t%016lx\nShdPnd:\t%016lx\nSigBlk:\t%016lx\n", t->signal ? t->signal->nr_threads : 0,
-      t->sig_pending, t->signal ? t->signal->shared_pending : 0, t->sig_mask);
+    P("Threads:\t%d\nSigPnd:\t%016lx\nShdPnd:\t%016lx\nSigBlk:\t%016lx\n", c->threads,
+      t->sig_pending, c->shared_pending, t->sig_mask);
+    kfree(c);
     return n;
 }
 
 static size_t gen_pid_cmdline(char *buf, size_t cap, void *ctx)
 {
+    size_t n = 0;
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* execve() writes it */
     struct tcb *t = pid_task(ctx);
-    if (!t || !t->cmdline_len) return 0;                /* kernel threads: empty, as on Linux */
-    size_t n = t->cmdline_len < cap ? t->cmdline_len : cap;
-    memcpy(buf, t->cmdline, n);
+    if (t) {                                            /* kernel threads: empty, as on Linux */
+        n = t->cmdline_len < cap ? t->cmdline_len : cap;
+        if (n > sizeof t->cmdline) n = sizeof t->cmdline;
+        memcpy(buf, t->cmdline, n);
+    }
+    spin_unlock_irqrestore(&proc_lock, f);
     return n;
 }
 
 static size_t gen_pid_comm(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
+    char name[sizeof ((struct tcb *)0)->name];
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* execve() renames it */
     struct tcb *t = pid_task(ctx);
-    if (t) P("%s\n", t->name);
+    if (t) strlcpy(name, t->name, sizeof name);
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (t) P("%s\n", name);
     return n;
 }
 
 /* /proc/PID/maps: the regions of the address space, Linux format */
 static size_t gen_pid_maps(char *buf, size_t cap, void *ctx)
 {
-    struct tcb *t = pid_task(ctx);
-    return t && t->mm ? vm_maps(t->mm, buf, cap) : 0;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct mm *mm = pid_task(ctx) ? pid_task(ctx)->mm : NULL;
+    if (mm) mm_get(mm);                                 /* task_mm_get() */
+    spin_unlock_irqrestore(&proc_lock, f);
+    size_t n = mm ? vm_maps(mm, buf, cap) : 0;
+    mm_put(mm);
+    return n;
 }
 
 /* /proc/PID/statm: size resident shared text lib data dt, in pages */
 static size_t gen_pid_statm(char *buf, size_t cap, void *ctx)
 {
     size_t n = 0;
-    struct tcb *t = pid_task(ctx);
-    uint64_t pages = t && t->mm ? t->mm->rss : 0;
+    struct pid_info *c = pid_copy(ctx);
+    uint64_t pages = c ? c->rss : 0;
+    kfree(c);
     P("%lu %lu 0 0 0 %lu 0\n", pages, pages, pages);
     return n;
 }
@@ -379,19 +432,26 @@ static size_t gen_oom_adj(char *buf, size_t cap, void *ctx) { (void)ctx; size_t 
 /* symbolic links whose target is computed: /proc/PID/exe, cwd, root */
 static int link_exe(struct vnode *vn, char *buf, size_t size)
 {
+    char exe[sizeof ((struct tcb *)0)->exe];
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* execve() changes it */
     struct tcb *t = pid_task(vn->ctx);
-    if (!t || !t->exe[0]) return -ENOENT;
-    size_t n = strlen(t->exe);
+    if (t) strlcpy(exe, t->exe, sizeof exe);
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!t || !exe[0]) return -ENOENT;
+    size_t n = strlen(exe);
     if (n > size) n = size;
-    memcpy(buf, t->exe, n);
+    memcpy(buf, exe, n);
     return (int)n;
 }
 static int link_cwd(struct vnode *vn, char *buf, size_t size)
 {
-    struct tcb *t = pid_task(vn->ctx);
-    if (!t || !t->fs || !t->fs->cwd) return -ENOENT;
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* it may exit meanwhile */
+    struct fs_struct *fs = task_fs_get_locked(pid_task(vn->ctx));
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!fs) return -ENOENT;
     char tmp[VFS_PATH_MAX];
-    struct vnode *cwd = vfs_cwd_get(t->fs);             /* it may chdir meanwhile */
+    struct vnode *cwd = vfs_cwd_get(fs);                /* or chdir */
+    fs_put(fs);
     int r = vfs_path_of(cwd, tmp, sizeof tmp);
     vfs_vnode_put(cwd);
     if (r < 0) return r;
@@ -401,9 +461,9 @@ static int link_cwd(struct vnode *vn, char *buf, size_t size)
     return (int)n;
 }
 static int link_root(struct vnode *vn, char *buf, size_t size) { (void)vn; if (!size) return 0; buf[0] = '/'; return 1; }
-static const struct vnode_ops exe_ops = { .readlink = link_exe };
-static const struct vnode_ops cwd_ops = { .readlink = link_cwd };
-static const struct vnode_ops root_ops = { .readlink = link_root };
+static const struct vnode_ops exe_ops = { .readlink = link_exe, .nolock = true };
+static const struct vnode_ops cwd_ops = { .readlink = link_cwd, .nolock = true };
+static const struct vnode_ops root_ops = { .readlink = link_root, .nolock = true };
 
 static void proc_link(struct vnode *dir, const char *name, const struct vnode_ops *ops, void *ctx)
 {
@@ -524,7 +584,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "meminfo",     gen_meminfo, NULL);
     pseudo_file(r, "stat",        gen_stat, NULL);
     pseudo_file(r, "loadavg",     gen_loadavg, NULL);
-    pseudo_file(r, "gpu",         gen_gpu, NULL);
+    pseudo_file_locked(r, "gpu",  gen_gpu, NULL);     /* driver state: the big lock */
     pseudo_file(r, "cpuinfo",     gen_cpuinfo, NULL);
     pseudo_file(r, "mounts",      gen_mounts, NULL);
     pseudo_file(r, "filesystems", gen_filesystems, NULL);
@@ -536,10 +596,10 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "kstat",       gen_kstat, NULL);
     pseudo_file(r, "kprof",       gen_kprof, NULL);
     pseudo_file(r, "pci",         gen_pci, NULL);
-    pseudo_file(r, "usb",         gen_usb, NULL);
+    pseudo_file_locked(r, "usb",  gen_usb, NULL);
     pseudo_file(r, "partitions",  gen_partitions, NULL);
-    pseudo_file(r, "bootvol",     gen_bootvol, NULL);
-    pseudo_file(r, "sound",       gen_sound, NULL);
+    pseudo_file_locked(r, "bootvol", gen_bootvol, NULL);
+    pseudo_file_locked(r, "sound", gen_sound, NULL);
     struct vnode *sys = pseudo_dir(r, "sys");
     struct vnode *sk = pseudo_dir(sys, "kernel");
     pseudo_file(sk, "ostype",    gen_sys_ostype, NULL);
