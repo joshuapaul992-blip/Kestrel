@@ -1,6 +1,7 @@
 #!/bin/sh
 # tools/mkfirefoxroot.sh OUT.tar FIREFOX_DIR [DEBCACHE]
 # LOCAL_DEBS="build/lxpanel/lxpanel_*+kestrel1_amd64.deb" tools/mkfirefoxroot.sh ...
+# XORG_ROOT=build/xorg-root tools/mkfirefoxroot.sh ...
 #
 # Build a root file system of Ubuntu 24.04 (noble) runtime packages with
 # Firefox in /opt/firefox, as a tarball for
@@ -14,7 +15,9 @@
 # (Mozilla's tarball, or the conda-forge package's bin/FirefoxApp).
 # LOCAL_DEBS lists packages built here, unpacked over the archive's: the
 # patched LXPanel from ports/lxpanel/build.sh, without which the panel only
-# spans its plugins' width.
+# spans its plugins' width. XORG_ROOT is the Xorg server from
+# ports/xorg/build.sh, copied in with the libraries it loads: /bin/startx
+# runs it on /dev/dri/card0 where there is one.
 #
 # What the root holds:
 # - glibc, bash, coreutils and the usual tools;
@@ -52,6 +55,9 @@ PKGS="bash dash coreutils findutils grep sed gawk procps util-linux xz-utils zst
       fonts-dejavu-core fonts-dejavu-extra fontconfig hicolor-icon-theme adwaita-icon-theme librsvg2-common shared-mime-info
       libpci3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxcursor1 libxi6 libxtst6 libxss1
       libdbus-glib-1-2 pulseaudio pulseaudio-utils libpulse0 libasound2-plugins xvfb"
+# what Xorg (ports/xorg) and its modesetting and evdev drivers load
+[ -z "${XORG_ROOT:-}" ] || PKGS="$PKGS libpciaccess0 libdrm2 libgbm1 libepoxy0 libxcvt0 libxfont2
+      libxshmfence1 libbsd0 libmd0 libpixman-1-0 libevdev2 libmtdev1t64 x11-xkb-utils xkb-data"
 # The LXDE desktop (lxde-core without the screen locker), its theme and
 # icons, and the archivers Xarchiver drives
 LXDE_PKGS="openbox-lxde-session lxpanel pcmanfm xarchiver lxrandr lxterminal lxappearance lxtask
@@ -93,6 +99,11 @@ for d in ${LOCAL_DEBS:-}; do
     echo "mkfirefoxroot: $(basename "$d") over the archive's"
     dpkg-deb --fsys-tarfile "$d" | tar -x --keep-directory-symlink -C "$ROOT"
 done
+if [ -n "${XORG_ROOT:-}" ]; then
+    [ -f "$XORG_ROOT/.stamp" ] || { echo "mkfirefoxroot: $XORG_ROOT: no Xorg (run ports/xorg/build.sh)"; exit 1; }
+    echo "mkfirefoxroot: Xorg from $XORG_ROOT"
+    (cd "$XORG_ROOT" && tar -c --exclude=./.stamp .) | tar -x --keep-directory-symlink -C "$ROOT"
+fi
 case " ${LOCAL_DEBS:-} " in
 */lxpanel_*) ;;
 *) echo "mkfirefoxroot: warning: no LXPanel from ports/lxpanel in LOCAL_DEBS; the panel will be narrow" ;;
