@@ -85,6 +85,17 @@ static bool fd_nolock(uint64_t fd)
     spin_unlock_irqrestore(&fs->lock, fl);
     return r;
 }
+
+/* Is fd an AF_INET socket (the network stack's own lock, net_lock)? */
+static bool fd_inet(uint64_t fd)
+{
+    if (fd >= MAX_FDS) return false;
+    struct files_struct *fs = current_task()->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    bool r = inet_is(fs->fd[fd]);
+    spin_unlock_irqrestore(&fs->lock, fl);
+    return r;
+}
 static void fput(struct file *f) { vfs_close(f); }
 
 /* Install f (whose reference the table takes over) at the lowest free
@@ -491,7 +502,6 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
         goto out;
     }
     if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
-        if (!bkl_depth()) bkl_enter();                  /* a unix socket's fget let it be; kept to the end */
         r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
     } else if (size < 0) {
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
@@ -3177,6 +3187,12 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_brk:
     case SYS_madvise: case SYS_mremap:
         return true;
+    /* AF_INET sockets: the network stack's lock (net/core.c, net_lock).
+     * Their data calls, polls and ioctls go by fd_nolock above. */
+    case SYS_socket:         return f->rdi == AF_INET;
+    case SYS_bind: case SYS_listen: case SYS_connect: case SYS_accept: case SYS_accept4:
+    case SYS_shutdown: case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt: case SYS_getsockopt:
+        return fd_inet(f->rdi);
     /* names in the file tree: the tree's lock (fs/vfs.c), shared to look
      * and exclusive to change. A device's open, a generated file's size or
      * a /proc link take the big lock there, as do directory descriptors in

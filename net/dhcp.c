@@ -123,7 +123,7 @@ static void discover(struct client *c)
 
 void dhcp_start(struct netif *nif)
 {
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     for (int i = 0; i < MAX_CLIENTS; i++) {
         struct client *c = &clients[i];
         if (c->nif && c->nif != nif) continue;
@@ -132,7 +132,7 @@ void dhcp_start(struct netif *nif)
         discover(c);
         break;
     }
-    irq_restore(f);
+    net_unlock(f);
 }
 
 static const uint8_t *find_opt(const struct dhcp_msg *m, size_t len, uint8_t code, uint8_t *olen)

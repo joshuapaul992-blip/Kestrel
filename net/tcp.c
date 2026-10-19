@@ -848,27 +848,27 @@ int tcp_listen(struct isock *s, int backlog)
 int tcp_connect(struct isock *s, struct file *f, uint32_t dst, uint16_t dport)
 {
     struct tcpcb *t = s->tcb;
-    uint64_t fl = irq_save();
-    if (t->state == SYN_SENT) { irq_restore(fl); return -EALREADY; }
-    if (t->state == LISTEN) { irq_restore(fl); return -EINVAL; }
-    if (t->state != CLOSED) { irq_restore(fl); return -EISCONN; }
-    if (t->ever_connected) { irq_restore(fl); return -EISCONN; }
+    uint64_t fl = net_lock();
+    if (t->state == SYN_SENT) { net_unlock(fl); return -EALREADY; }
+    if (t->state == LISTEN) { net_unlock(fl); return -EINVAL; }
+    if (t->state != CLOSED) { net_unlock(fl); return -EISCONN; }
+    if (t->ever_connected) { net_unlock(fl); return -EISCONN; }
     if (t->err) {                                       /* a failed non-blocking connect, reported once */
         int e = t->err; t->err = 0;
-        irq_restore(fl);
+        net_unlock(fl);
         return -e;
     }
-    if (!dport) { irq_restore(fl); return -ECONNREFUSED; }
+    if (!dport) { net_unlock(fl); return -ECONNREFUSED; }
     if (dst == 0) dst = IP4(127, 0, 0, 1);
     uint32_t src = s->laddr ? s->laddr : ip_source_for(dst);
-    if (!src) { irq_restore(fl); return -ENETUNREACH; }
+    if (!src) { net_unlock(fl); return -ENETUNREACH; }
     if (!s->lport) {
         s->lport = port_ephemeral(IPPROTO_TCP);
-        if (!s->lport) { irq_restore(fl); return -EADDRNOTAVAIL; }
+        if (!s->lport) { net_unlock(fl); return -EADDRNOTAVAIL; }
     }
     for (struct tcpcb *o = tcbs; o; o = o->next)          /* the same 4-tuple must not exist */
         if (o != t && o->state != CLOSED && o->state != LISTEN && o->lport == s->lport && o->raddr == dst &&
-            o->rport == dport && o->laddr == src) { irq_restore(fl); return -EADDRNOTAVAIL; }
+            o->rport == dport && o->laddr == src) { net_unlock(fl); return -EADDRNOTAVAIL; }
     sync_opts(s);
     t->laddr = src; t->lport = s->lport;
     t->raddr = dst; t->rport = dport;
@@ -884,34 +884,34 @@ int tcp_connect(struct isock *s, struct file *f, uint32_t dst, uint16_t dport)
     st_active++;
     send_segment(t, t->iss, 0, TH_SYN);
     arm_rto(t);
-    if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EINPROGRESS; }
+    if (f->flags & O_NONBLOCK) { net_unlock(fl); return -EINPROGRESS; }
     uint64_t deadline = sock_deadline(s->sndtimeo);
     while (t->state == SYN_SENT || t->state == SYN_RCVD) {
         int rc = sock_wait(t, deadline);
-        if (rc == -EAGAIN) { irq_restore(fl); return -EINPROGRESS; }
-        if (rc) { irq_restore(fl); return rc == -ERESTARTSYS ? -EINTR : rc; }   /* the attempt goes on */
+        if (rc == -EAGAIN) { net_unlock(fl); return -EINPROGRESS; }
+        if (rc) { net_unlock(fl); return rc == -ERESTARTSYS ? -EINTR : rc; }   /* the attempt goes on */
     }
     int rc = 0;
     if (t->state == CLOSED) { rc = t->err ? -t->err : -ECONNREFUSED; t->err = 0; }
-    irq_restore(fl);
+    net_unlock(fl);
     return rc;
 }
 
 int tcp_accept(struct isock *s, struct file *f, struct isock **out)
 {
     struct tcpcb *l = s->tcb;
-    uint64_t fl = irq_save();
-    if (l->state != LISTEN) { irq_restore(fl); return -EINVAL; }
+    uint64_t fl = net_lock();
+    if (l->state != LISTEN) { net_unlock(fl); return -EINVAL; }
     uint64_t deadline = sock_deadline(s->rcvtimeo);
     while (!l->aq) {
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
+        if (f->flags & O_NONBLOCK) { net_unlock(fl); return -EAGAIN; }
         int rc = sock_wait(l, deadline);
-        if (rc) { irq_restore(fl); return rc; }
-        if (l->state != LISTEN) { irq_restore(fl); return -EINVAL; }
+        if (rc) { net_unlock(fl); return rc; }
+        if (l->state != LISTEN) { net_unlock(fl); return -EINVAL; }
     }
     struct tcpcb *t = l->aq;
     struct isock *ns = isock_new(SOCK_STREAM, IPPROTO_TCP);
-    if (!ns) { irq_restore(fl); return -ENOMEM; }
+    if (!ns) { net_unlock(fl); return -ENOMEM; }
     l->aq = t->aq_next;
     if (!l->aq) l->aq_tail = NULL;
     l->aq_len--;
@@ -924,26 +924,26 @@ int tcp_accept(struct isock *s, struct file *f, struct isock **out)
     ns->nodelay = t->nodelay; ns->keepalive = t->keepalive;
     if (t->keepalive) set_timer(&t->keep_at, net_now() + KEEP_IDLE_MS);
     *out = ns;
-    irq_restore(fl);
+    net_unlock(fl);
     return 0;
 }
 
 long tcp_send(struct isock *s, struct file *f, const void *buf, size_t len, int flags)
 {
     struct tcpcb *t = s->tcb;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     uint64_t deadline = sock_deadline(s->sndtimeo);
     size_t done = 0;
     for (;;) {
-        if (t->err && t->state == CLOSED) { int e = t->err; t->err = 0; irq_restore(fl); return done ? (long)done : -e; }
+        if (t->err && t->state == CLOSED) { int e = t->err; t->err = 0; net_unlock(fl); return done ? (long)done : -e; }
         if (t->state == SYN_SENT || t->state == SYN_RCVD) {
-            if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { irq_restore(fl); return -EAGAIN; }
+            if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { net_unlock(fl); return -EAGAIN; }
             int rc = sock_wait(t, deadline);
-            if (rc) { irq_restore(fl); return rc; }
+            if (rc) { net_unlock(fl); return rc; }
             continue;
         }
         if (s->shut_wr || t->fin_queued || (t->state != ESTABLISHED && t->state != CLOSE_WAIT)) {
-            irq_restore(fl);
+            net_unlock(fl);
             if (done) return (long)done;
             return t->ever_connected ? -EPIPE : -ENOTCONN;
         }
@@ -961,9 +961,9 @@ long tcp_send(struct isock *s, struct file *f, const void *buf, size_t len, int 
         if (done == len) break;
         if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) break;
         int rc = sock_wait(t, deadline);
-        if (rc) { irq_restore(fl); return done ? (long)done : rc; }
+        if (rc) { net_unlock(fl); return done ? (long)done : rc; }
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return done ? (long)done : -EAGAIN;
 }
 
@@ -979,7 +979,7 @@ static void window_update(struct tcpcb *t)
 long tcp_recv(struct isock *s, struct file *f, void *buf, size_t len, int flags)
 {
     struct tcpcb *t = s->tcb;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     uint64_t deadline = sock_deadline(s->rcvtimeo);
     size_t done = 0;
     for (;;) {
@@ -1001,15 +1001,15 @@ long tcp_recv(struct isock *s, struct file *f, void *buf, size_t len, int flags)
         if (done && !(flags & MSG_WAITALL)) break;
         if (t->fin_rcvd || s->shut_rd) break;           /* EOF */
         if (t->state == CLOSED) {
-            if (t->err) { int e = t->err; t->err = 0; irq_restore(fl); return done ? (long)done : -e; }
+            if (t->err) { int e = t->err; t->err = 0; net_unlock(fl); return done ? (long)done : -e; }
             break;
         }
-        if (t->state == LISTEN || (t->state == CLOSED && !t->ever_connected)) { irq_restore(fl); return -ENOTCONN; }
-        if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { irq_restore(fl); return done ? (long)done : -EAGAIN; }
+        if (t->state == LISTEN || (t->state == CLOSED && !t->ever_connected)) { net_unlock(fl); return -ENOTCONN; }
+        if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) { net_unlock(fl); return done ? (long)done : -EAGAIN; }
         int rc = sock_wait(t, deadline);
-        if (rc) { irq_restore(fl); return done ? (long)done : rc; }
+        if (rc) { net_unlock(fl); return done ? (long)done : rc; }
     }
-    irq_restore(fl);
+    net_unlock(fl);
     return (long)done;
 }
 
@@ -1027,17 +1027,17 @@ static void queue_fin(struct tcpcb *t)
 int tcp_shutdown(struct isock *s, int how)
 {
     struct tcpcb *t = s->tcb;
-    uint64_t fl = irq_save();
+    uint64_t fl = net_lock();
     if (t->state == LISTEN || t->state == CLOSED || t->state == SYN_SENT) {
         bool listening = t->state == LISTEN;
-        irq_restore(fl);
+        net_unlock(fl);
         if (listening && how != SHUT_WR) { s->shut_rd = true; wakeup(t); return 0; }
         return -ENOTCONN;
     }
     if (how == SHUT_RD || how == SHUT_RDWR) { s->shut_rd = true; t->rbuf_len = 0; }
     if (how == SHUT_WR || how == SHUT_RDWR) { s->shut_wr = true; queue_fin(t); }
     wake(t);
-    irq_restore(fl);
+    net_unlock(fl);
     return 0;
 }
 
@@ -1045,7 +1045,7 @@ void tcp_close(struct isock *s)
 {
     struct tcpcb *t = s->tcb;
     if (!t) return;
-    uint64_t f = irq_save();
+    uint64_t f = net_lock();
     t->sock = NULL;
     s->tcb = NULL;
     switch (t->state) {
@@ -1072,7 +1072,7 @@ void tcp_close(struct isock *s)
         if (t->state == FIN_WAIT2) set_timer(&t->tw_at, net_now() + FIN_WAIT2_MS);
         break;
     }
-    irq_restore(f);
+    net_unlock(f);
 }
 
 int tcp_poll(struct isock *s)
