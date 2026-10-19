@@ -799,6 +799,7 @@ int signal_send_info(struct tcb *t, int sig, const struct ksig_info *info)
 }
 
 int signal_send(struct tcb *t, int sig) { return signal_send_info(t, sig, NULL); }
+int signal_send_locked(struct tcb *t, int sig) { return send_info_locked(t, sig, NULL); }
 
 /* A synchronous fault of the current thread (idt.c). Like Linux's
  * force_sig_fault(): a fault cannot be ignored or blocked -- if it is, the

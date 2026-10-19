@@ -824,8 +824,8 @@ static int tt_open(int *m, int *sl, int raw)
     *sl = -1;
     if ((*m = posix_openpt(O_RDWR | O_NOCTTY)) < 0) return tt_open_fail("open", "/dev/ptmx");
     if (grantpt(*m) || unlockpt(*m)) return tt_open_fail("unlock", NULL);
-    const char *name = ptsname(*m);
-    if (!name) return tt_open_fail("ptsname", NULL);
+    char name[32];                                      /* ptsname()'s buffer is shared by the threads */
+    if (ptsname_r(*m, name, sizeof name)) return tt_open_fail("ptsname", NULL);
     if ((*sl = open(name, O_RDWR | O_NOCTTY)) < 0) return tt_open_fail("open", name);
     struct termios t;
     tcgetattr(*sl, &t);
