@@ -47,13 +47,13 @@ static void *dma_alloc(size_t size, size_t align, uint64_t *phys)
     size_t frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     *phys = 0;
     if (align <= PAGE_SIZE) {
-        uint64_t pa = pmm_alloc_contig(frames);
+        uint64_t pa = pmm_alloc_dma32(frames);
         *phys = pa;
         return pa ? (void *)pa : NULL;
     }
     if (align & (align - 1)) return NULL;
     size_t extra = align / PAGE_SIZE - 1;
-    uint64_t raw = pmm_alloc_contig(frames + extra);
+    uint64_t raw = pmm_alloc_dma32(frames + extra);
     if (!raw) return NULL;
     uint64_t pa = (raw + align - 1) & ~((uint64_t)align - 1);
     size_t lead = (size_t)((pa - raw) / PAGE_SIZE);

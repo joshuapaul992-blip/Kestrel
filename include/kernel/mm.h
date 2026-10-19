@@ -7,13 +7,14 @@
 #include <stdbool.h>
 
 #define PAGE_SIZE      4096ul
-#define PMM_MAX_PHYS   (4ul << 30)     /* frames tracked: first 4 GiB */
+#define PMM_MAX_PHYS   (1ul << 40)     /* frames tracked: the first 1 TiB */
+#define BOOT_MAP_END   (4ul << 30)     /* boot.asm identity-maps below this */
 
 extern char _kernel_start[], _kernel_end[];
 
 /* ---- physical memory manager (bitmap, 4 KiB frames) --------------------- */
 void     pmm_init(uintptr_t mbi);
-uint64_t pmm_alloc(void);                    /* one zeroed frame, 0 on OOM  */
+uint64_t pmm_alloc(void);                    /* one zeroed frame, 0 on OOM; above 4 GiB first */
 uint64_t pmm_low_page(void);         /* a usable page below 640 KiB (0 = none), reserved */
 uint64_t pmm_alloc_contig(size_t frames);    /* physically contiguous run   */
 uint64_t pmm_alloc_dma32(size_t frames);     /* contiguous, below 4 GiB     */

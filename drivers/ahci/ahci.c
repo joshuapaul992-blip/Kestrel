@@ -138,6 +138,7 @@ struct port_state {
     struct ahci_received_fis *fis;    uint64_t fis_phys;
     struct ahci_cmd_table   *tables;  uint64_t tables_phys;
     uint8_t                 *scratch; uint64_t scratch_phys; uint32_t scratch_sector;
+    uint8_t                 *bounce;  uint64_t bounce_phys;    /* below 4 GiB, for an HBA without S64A */
     volatile uint32_t        irq_is;        /* PxIS bits the interrupt handler cleared */
 };
 
@@ -521,6 +522,9 @@ int ahci_init(uint64_t abar, const struct ahci_platform *plat)
     struct ahci_hba_regs *r = h->regs;
 
     h->cap  = REG(r->cap);
+#ifdef AHCI_TEST_32BIT                          /* test builds: act as an HBA without S64A */
+    h->cap &= ~AHCI_CAP_S64A;
+#endif
     h->cap2 = REG(r->cap2);
     h->vs   = REG(r->vs);
     h->nslots = ((h->cap >> AHCI_CAP_NCS_SHIFT) & AHCI_CAP_NCS_MASK) + 1;
@@ -572,6 +576,41 @@ static struct port_state *port_of(struct ahci_disk *d)
 /* ======================================================================== */
 /*  block I/O                                                                  */
 /* ======================================================================== */
+#define AHCI_BOUNCE_BYTES   (64u * 1024)
+
+/* Whether an HBA that takes only 32-bit addresses reaches all of buf. */
+static bool reachable(const struct hba_state *h, const uint8_t *buf, uint64_t bytes)
+{
+    for (uint64_t got = 0; got < bytes; ) {
+        uint64_t chunk = 4096 - ((uintptr_t)(buf + got) & 4095);
+        if (chunk > bytes - got) chunk = bytes - got;
+        if (h->plat.virt_to_phys(buf + got) + chunk > 0x100000000ull) return false;
+        got += chunk;
+    }
+    return true;
+}
+
+static int transfer(struct ahci_disk *d, uint64_t lba, uint32_t count, uint8_t *buf, bool write);
+
+/* A buffer above 4 GiB on an HBA without S64A: through the port's bounce
+ * buffer below 4 GiB, AHCI_BOUNCE_BYTES at a time. */
+static int bounce_transfer(struct port_state *p, struct ahci_disk *d, uint64_t lba, uint32_t count,
+                           uint8_t *buf, bool write)
+{
+    if (!p->bounce) p->bounce = alloc(p->hba, AHCI_BOUNCE_BYTES, 4096, &p->bounce_phys);
+    if (!p->bounce) return AHCI_ERR_ALIGN;
+    const uint32_t ss = d->sector_size, per = AHCI_BOUNCE_BYTES / ss;
+    while (count) {
+        uint32_t n = count < per ? count : per;
+        if (write) mem_copy(p->bounce, buf, (size_t)n * ss);
+        int rc = transfer(d, lba, n, p->bounce, write);
+        if (rc != AHCI_OK) return rc;
+        if (!write) mem_copy(buf, p->bounce, (size_t)n * ss);
+        lba += n; count -= n; buf += (size_t)n * ss;
+    }
+    return AHCI_OK;
+}
+
 static int transfer(struct ahci_disk *d, uint64_t lba, uint32_t count, uint8_t *buf, bool write)
 {
     struct port_state *p = port_of(d);
@@ -584,6 +623,8 @@ static int transfer(struct ahci_disk *d, uint64_t lba, uint32_t count, uint8_t *
     const uint32_t ss = d->sector_size;
     const uint32_t max_secs = d->lba48 ? 0xFFFFu : 0x100u;
     const bool s64 = (h->cap & AHCI_CAP_S64A) != 0;
+    if (!s64 && buf != p->bounce && !reachable(h, buf, (uint64_t)count * ss))
+        return bounce_transfer(p, d, lba, count, buf, write);
 
     while (count) {
         uint32_t want = count < max_secs ? count : max_secs;

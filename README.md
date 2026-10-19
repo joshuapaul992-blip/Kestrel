@@ -566,7 +566,7 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
-mm/           pmm.c          bitmap frame allocator from the MB2 memory map, frame reference counts, own lock
+mm/           pmm.c          bitmap frame allocator from the MB2 memory map (up to 1 TiB, above 4 GiB first), frame reference counts, own lock
               heap.c         kmalloc/kfree (size bins, split, coalesce, own lock, IRQ-safe)
               vmm.c          identity map changes: MMIO uncached, write-combining (PAT), guard pages
               vm.c           user address spaces: regions (VMAs), demand paging, copy-on-write,
@@ -1372,7 +1372,9 @@ nouveau takes the boot display over like bochs does (above). Without firmware in
 |---|---|
 | 0 – 1 MiB | reserved (firmware, BIOS data) |
 | 2 MiB – ~2.3 MiB | kernel image (+ bss: boot page tables, 32 KiB boot stack) |
+| below 4 GiB | the frame allocator's bitmap and reference counts (sized from the memory map) |
 | after the kernel | 8 MiB heap, 3 MiB frame-buffer back buffer (from the PMM) |
+| 4 GiB – end of RAM | RAM above 4 GiB, identity-mapped with 2 MiB pages at boot and handed out first |
 | e.g. `0xFD000000` (VBE), `0x80000000` (OVMF GOP) | linear frame buffer |
 | `0x3F80_0000_0000` – +1 GiB (virtual) | vmap window: scattered pages mapped for Linux drivers (`vmm_vmap()`) |
 

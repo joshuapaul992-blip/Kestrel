@@ -25,7 +25,7 @@ static int ngpus;
 /* ---- platform hooks --------------------------------------------------------- */
 static void *map_mmio(uint64_t phys, size_t size)
 {
-    if (phys + size > PMM_MAX_PHYS && !vmm_identity_map(phys, size, VMM_WRITE)) return NULL;
+    if (phys + size > BOOT_MAP_END && !vmm_identity_map(phys, size, VMM_WRITE)) return NULL;
     if (!vmm_set_uncached(phys, size)) return NULL;
     return (void *)(uintptr_t)phys;
 }
