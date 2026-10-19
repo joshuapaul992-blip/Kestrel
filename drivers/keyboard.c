@@ -81,8 +81,10 @@ static void kbd_irq(struct int_frame *f)
     if (!(inb(KBD_STATUS) & 0x01)) return;
     uint8_t sc = inb(KBD_DATA);
 
-    /* A display server holds /dev/kinput: raw scancodes go there instead. */
-    if (kinput_grabbed()) { mods = 0; e0_prefix = false; kinput_ps2_byte(sc); return; }
+    /* Display servers' queues (/dev/kinput, /dev/input/event0) get every
+     * scancode; the terminals get none while one has the keyboard. */
+    kinput_ps2_byte(sc);
+    if (kinput_grabbed()) { mods = 0; e0_prefix = false; return; }
 
     if (sc == 0xE0) { e0_prefix = true; return; }
     bool release = sc & 0x80;

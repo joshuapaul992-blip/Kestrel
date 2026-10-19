@@ -5,9 +5,16 @@
  *  for PS/2, the timer-driven xHCI poll for USB); the queue is a ring of
  *  fixed-size records guarded by a spinlock (qlock), so the display server
  *  reads and polls the device without the big kernel lock.
+ *
+ *  Every event also goes to the evdev devices (/dev/input/event0 for the
+ *  keyboard, event1 for the mouse; evdev.c), whether /dev/kinput is
+ *  grabbed or not. The terminals give the keyboard and mouse up while
+ *  /dev/kinput or an evdev device is grabbed, or while a program has
+ *  turned the console's keyboard off (KDSKBMODE, kinput_console_keys).
  * ============================================================================= */
 #include <kernel/process.h>
 #include <kernel/kinput.h>
+#include <kernel/evdev.h>
 #include <kernel/vfs.h>
 #include <kernel/posix.h>
 #include <kernel/task.h>
@@ -27,11 +34,16 @@ static struct file *grab_file;          /* the open file holding the grab */
 static uint32_t dropped;
 static uint8_t  mouse_buttons;
 static bool     ps2_e0;
+static volatile bool console_keys_off;
 
-bool kinput_grabbed(void) { return grabbed; }
+bool kinput_grabbed(void) { return grabbed || console_keys_off || evdev_grabbed(); }
 
-static void push(uint16_t type, uint16_t code, int32_t value)
+void kinput_console_keys(bool on) { console_keys_off = !on; }
+
+static void push(uint16_t type, uint16_t code, int32_t value, int dev)
 {
+    evdev_event(dev, type, code, value);
+    if (!grabbed) return;
     uint64_t fl = spin_lock_irqsave(&qlock);
     uint32_t next = (q_head + 1) % QLEN;
     if (next == q_tail) dropped++;
@@ -73,8 +85,8 @@ void kinput_ps2_byte(uint8_t sc)
     ps2_e0 = false;
     if (!code) return;
     /* The 8042 repeats makes while a key is held; X does its own repeat. */
-    push(KINPUT_EV_KEY, code, release ? 0 : 1);
-    push(KINPUT_EV_SYN, 0, 0);
+    push(KINPUT_EV_KEY, code, release ? 0 : 1, EVDEV_KEYBOARD);
+    push(KINPUT_EV_SYN, 0, 0, EVDEV_KEYBOARD);
     commit();
 }
 
@@ -100,22 +112,22 @@ static const uint8_t hid_to_linux[0xE8] = {
 void kinput_usb_key(uint8_t usage, bool pressed, bool repeat)
 {
     if (usage >= sizeof hid_to_linux || !hid_to_linux[usage]) return;
-    push(KINPUT_EV_KEY, hid_to_linux[usage], !pressed ? 0 : repeat ? 2 : 1);
-    push(KINPUT_EV_SYN, 0, 0);
+    push(KINPUT_EV_KEY, hid_to_linux[usage], !pressed ? 0 : repeat ? 2 : 1, EVDEV_KEYBOARD);
+    push(KINPUT_EV_SYN, 0, 0, EVDEV_KEYBOARD);
     commit();
 }
 
 void kinput_usb_mouse(int dx, int dy, int wheel, uint8_t buttons)
 {
     static const uint16_t btn[3] = { KINPUT_BTN_LEFT, KINPUT_BTN_RIGHT, KINPUT_BTN_MIDDLE };
-    if (dx) push(KINPUT_EV_REL, KINPUT_REL_X, dx);
-    if (dy) push(KINPUT_EV_REL, KINPUT_REL_Y, dy);
-    if (wheel) push(KINPUT_EV_REL, KINPUT_REL_WHEEL, wheel);
+    if (dx) push(KINPUT_EV_REL, KINPUT_REL_X, dx, EVDEV_MOUSE);
+    if (dy) push(KINPUT_EV_REL, KINPUT_REL_Y, dy, EVDEV_MOUSE);
+    if (wheel) push(KINPUT_EV_REL, KINPUT_REL_WHEEL, wheel, EVDEV_MOUSE);
     uint8_t changed = (uint8_t)(buttons ^ mouse_buttons);
     for (int i = 0; i < 3; i++)
-        if (changed & (1u << i)) push(KINPUT_EV_KEY, btn[i], (buttons >> i) & 1);
+        if (changed & (1u << i)) push(KINPUT_EV_KEY, btn[i], (buttons >> i) & 1, EVDEV_MOUSE);
     mouse_buttons = buttons;
-    push(KINPUT_EV_SYN, 0, 0);
+    push(KINPUT_EV_SYN, 0, 0, EVDEV_MOUSE);
     commit();
 }
 
@@ -193,5 +205,6 @@ static const struct vnode_ops kinput_ops = {
 
 void kinput_init(void)
 {
-    devfs_register("kinput", 0660, (13u << 8) | 64u, &kinput_ops, NULL);
+    devfs_register("kinput", 0660, (10u << 8) | 242u, &kinput_ops, NULL);  /* 13,64 is event0 */
+    evdev_init();
 }
