@@ -13,7 +13,10 @@
  * only the mm's spinlock mm->fast. Taking mm->lock (mm_lock) waits for such
  * a fault in progress to finish; a fast fault that finds mm->lock taken
  * goes the slow way, so the two never overlap. Everything else falls back
- * to vm_fault() under the big lock. Page frames are reference counted with
+ * to vm_fault(), which also runs without the big lock: it takes it only to
+ * read a file that is not nolock (vnode_ops.nolock) and to pick an OOM
+ * victim. Two faults on the same file page meet in the file system, which
+ * reads the page once while the other waits. Page frames are reference counted with
  * locked instructions (mm.h). When a page-table entry loses rights or
  * changes frames, every CPU that has the address space loaded invalidates
  * the translation (smp.h: tlb_shootdown) before the call goes on, and
@@ -375,9 +378,25 @@ struct mm *mm_fork(struct mm *src)
 /* ---- faults --------------------------------------------------------------- */
 #define FAULT_AROUND 16                 /* pages: a file fault maps the cached pages of its 64 KiB */
 
+/* A file that is not nolock is asked under the big lock (taken as needed:
+ * a fault comes here without it). */
 static uint64_t file_size(struct file *f)
 {
-    return f->vn->ops && f->vn->ops->size ? f->vn->ops->size(f->vn) : f->vn->size;
+    if (!f->vn->ops || !f->vn->ops->size) return f->vn->size;
+    if (file_nolock(f)) return f->vn->ops->size(f->vn);
+    bkl_enter();
+    uint64_t n = f->vn->ops->size(f->vn);
+    bkl_exit();
+    return n;
+}
+
+static ssize_t file_read(struct file *f, void *buf, size_t len, uint64_t off)
+{
+    if (file_nolock(f)) return vfs_pread(f, buf, len, off);
+    bkl_enter();
+    ssize_t n = vfs_pread(f, buf, len, off);
+    bkl_exit();
+    return n;
 }
 
 /* A page-cache frame mapped into a private region: read-only, and
@@ -418,6 +437,7 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
     t->fault_kind = (v->flags & VMA_SHARED) ? KF_SHARED : (v->file && va < v->file_end) ? KF_FILE : KF_ANON;
     if (!(v->flags & VMA_SHARED) && v->file && va < v->file_end && v->file->vn->ops &&
         v->file->vn->ops->getpage && va + PAGE <= v->file_end) {
+        if (fast && !file_nolock(v->file)) return -EAGAIN;     /* its size needs the big lock */
         /* a whole page of a cached file: share the cache's frame */
         uint64_t off = v->off + (va - v->start), fsize = file_size(v->file);
         if (off >= pgup(fsize)) return fast ? -EAGAIN : -EIO;   /* past EOF: SIGBUS */
@@ -452,7 +472,7 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
             uint64_t fsize = file_size(v->file);
             if (off >= pgup(fsize)) { page_unref(phys); return -EIO; }   /* past EOF: SIGBUS */
             uint64_t n = v->file_end - va < PAGE ? v->file_end - va : PAGE;
-            ssize_t r = vfs_pread(v->file, (void *)phys, (size_t)n, off);
+            ssize_t r = file_read(v->file, (void *)phys, (size_t)n, off);
             if (r < 0) { page_unref(phys); return -EIO; }
         }
     }
@@ -513,11 +533,13 @@ static int fault_retry(struct tcb *t, struct mm *mm, uint64_t addr, uint64_t err
         if (r != -ENOMEM) return r;
         if (attempt < 20 && pcache_shrink(1024)) continue;     /* cached file pages go first */
         /* Out of memory: free some by ending the largest process, then try
-         * again. Give up (the caller gets SIGKILL/EFAULT) when nothing helps. */
-        if (attempt >= 20 || signal_pending() || !oom_kill(NULL)) {
-            if (user_mode) signal_send(t, SIGKILL);
-            return -ENOMEM;
-        }
+         * again. Give up (the caller gets SIGKILL/EFAULT) when nothing helps.
+         * Choosing and signalling a victim takes the big lock. */
+        bkl_enter();
+        bool give_up = attempt >= 20 || signal_pending() || !oom_kill(NULL);
+        if (give_up && user_mode) signal_send(t, SIGKILL);
+        bkl_exit();
+        if (give_up) return -ENOMEM;
         task_sleep_ms(50);
     }
 }
