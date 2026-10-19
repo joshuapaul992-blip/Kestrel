@@ -299,6 +299,7 @@ void sysfs_init(const char *mountpoint);
 typedef size_t (*vfs_gen_t)(char *buf, size_t cap, void *ctx);
 struct vnode *pseudo_dir(struct vnode *parent, const char *name);
 struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);
+struct vnode *pseudo_file_locked(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);   /* gen needs the big lock */
 struct vnode *ramfs_write_file(const char *path, const char *text);
 struct file  *ramfs_anon_file(const char *name, int flags);    /* memfd_create */
 

@@ -292,14 +292,18 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, const stru
 static int exec_load_image_elf(struct tcb *t, const char *path, const struct exec_args *a,
                                uint64_t *entry, uint64_t *sp)
 {
-    size_t n = 0;                                       /* /proc/PID/cmdline */
-    for (int i = 0; i < a->argc && n < sizeof t->cmdline; i++) {
+    char cmdline[sizeof t->cmdline];                    /* /proc/PID/cmdline */
+    size_t n = 0;
+    for (int i = 0; i < a->argc && n < sizeof cmdline; i++) {
         size_t l = strlen(a->argv[i]) + 1;
-        if (n + l > sizeof t->cmdline) l = sizeof t->cmdline - n;
-        memcpy(t->cmdline + n, a->argv[i], l);
+        if (n + l > sizeof cmdline) l = sizeof cmdline - n;
+        memcpy(cmdline + n, a->argv[i], l);
         n += l;
     }
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* /proc reads it under the lock */
+    memcpy(t->cmdline, cmdline, n);
     t->cmdline_len = (uint16_t)n;
+    spin_unlock_irqrestore(&proc_lock, fl);
 
     struct mm *mm = t->mm;
     struct elf_image img, interp;

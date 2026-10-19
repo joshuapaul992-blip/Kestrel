@@ -1336,7 +1336,11 @@ static uint64_t pseudo_size(struct vnode *vn)
     return n > PSEUDO_BUF ? PSEUDO_BUF : n;
 }
 
-static const struct vnode_ops pseudo_ops = { .read = pseudo_read, .size = pseudo_size };
+/* A generator locks what it reads, or reads only counters and fixed text;
+ * one that reads a driver's state that only the big lock guards is made
+ * with pseudo_file_locked(), and fget takes the lock for it. */
+static const struct vnode_ops pseudo_ops = { .read = pseudo_read, .size = pseudo_size, .nolock = true };
+static const struct vnode_ops pseudo_locked_ops = { .read = pseudo_read, .size = pseudo_size };
 
 struct vnode *pseudo_dir(struct vnode *parent, const char *name)
 {
@@ -1345,13 +1349,24 @@ struct vnode *pseudo_dir(struct vnode *parent, const char *name)
     return d;
 }
 
-struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx)
+static struct vnode *pseudo_new(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx,
+                                const struct vnode_ops *ops)
 {
-    struct vnode *f = vfs_node_new(parent->fs, name, VREG, 0444, &pseudo_ops);
+    struct vnode *f = vfs_node_new(parent->fs, name, VREG, 0444, ops);
     f->data = (void *)gen;
     f->ctx = ctx;
     vfs_node_add(parent, f);
     return f;
+}
+
+struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx)
+{
+    return pseudo_new(parent, name, gen, ctx, &pseudo_ops);
+}
+
+struct vnode *pseudo_file_locked(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx)
+{
+    return pseudo_new(parent, name, gen, ctx, &pseudo_locked_ops);
 }
 
 /* Make directory `dst` show the contents of directory `src` (a bind mount,
