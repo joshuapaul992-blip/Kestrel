@@ -74,6 +74,11 @@ static void make_ready(struct tcb *t)
 static void block_self(void *chan, uint64_t wake_ms)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
+    if (cur->sig_kick) {                        /* task_interrupt() */
+        cur->sig_kick = false;
+        spin_unlock_irqrestore(&sched_lock, f);
+        return;
+    }
     cur->wait_chan = chan;
     cur->wake_ms = wake_ms;
     cur->state = wake_ms ? TASK_SLEEPING : TASK_BLOCKED;
@@ -317,7 +322,16 @@ struct tcb *task_find(int pid)
 
 struct tcb *task_slot(int i) { return (i >= 0 && i < MAX_TASKS) ? &tasks[i] : NULL; }
 
-void task_interrupt(struct tcb *t) { make_ready(t); }
+/* A signal for t. A sleeper wakes; a thread still on its way to sleep
+ * (it looked for signals before the sender set one, without the sender's
+ * lock) does not go to sleep, and looks again. */
+void task_interrupt(struct tcb *t)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) make_ready_locked(t);
+    else t->sig_kick = true;
+    spin_unlock_irqrestore(&sched_lock, f);
+}
 
 /* The idle thread of an application processor, on its start-up stack. */
 struct tcb *sched_cpu_idle_task(int cpu, uint8_t *stack, size_t size)

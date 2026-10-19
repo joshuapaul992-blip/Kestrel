@@ -105,6 +105,7 @@ struct tcb {
     bool      idle_class;       /* runs only when no other task is ready    */
     uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;
+    bool      sig_kick;         /* a signal came while it ran: its next sleep is skipped */
     struct poll_table *poll_tab;    /* poll/select/epoll: collecting, then sleeping on it */
     uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
