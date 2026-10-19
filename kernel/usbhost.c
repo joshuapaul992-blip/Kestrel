@@ -3,7 +3,8 @@
  *
  *   usb_init()          boot: first xHCI controller -> BAR0, MMIO + bus
  *                       mastering, uncached mapping, xhci_init(); installs
- *                       xhci_poll() on the 1 kHz timer tick
+ *                       usb_tick() (xhci_poll(), then the console's input)
+ *                       on the timer tick
  *   usb_start_thread()  after the scheduler: "usbd" thread for hot-plug
  *   key events          translated to Kestrel key codes and injected into the
  *                       same queue as PS/2, so the boot manager and console
@@ -25,6 +26,7 @@
 #include <kernel/block.h>
 #include <kernel/posix.h>
 #include <kernel/kinput.h>
+#include <kernel/spinlock.h>
 #include "pci.h"
 #include <kernel/msi.h>
 #include "xhci.h"
@@ -91,9 +93,38 @@ static uint16_t usage_to_key(uint8_t u)
     return KEY_CHAR;
 }
 
-static void on_key(const struct usb_key_event *ev)
+/* Key and mouse events come from xhci_poll(), on any CPU and without the
+ * big lock (a thread waiting for its transfer, the interrupt). The display
+ * server's queue locks itself (kinput); the console's key queue and the
+ * pointer kept here are under the big lock, so their events wait in
+ * `pending` for usb_tick(), which has it. */
+#define PENDING 64
+static struct pending_ev {
+    bool key;
+    struct usb_key_event k;
+    struct usb_mouse_event m;
+} pending[PENDING];
+static unsigned pend_head, pend_tail;
+static struct spinlock pend_lock;
+
+static void pend(const struct pending_ev *e)
 {
-    if (kinput_grabbed()) { kinput_usb_key(ev->usage, ev->pressed, ev->repeat); return; }
+    uint64_t f = spin_lock_irqsave(&pend_lock);
+    if (pend_head - pend_tail < PENDING) pending[pend_head++ % PENDING] = *e;     /* full: dropped */
+    spin_unlock_irqrestore(&pend_lock, f);
+}
+
+static bool unpend(struct pending_ev *e)
+{
+    uint64_t f = spin_lock_irqsave(&pend_lock);
+    bool any = pend_tail != pend_head;
+    if (any) *e = pending[pend_tail++ % PENDING];
+    spin_unlock_irqrestore(&pend_lock, f);
+    return any;
+}
+
+static void console_key(const struct usb_key_event *ev)
+{
     if (!ev->pressed) return;                   /* Kestrel's queue carries presses */
     uint8_t mods = 0;
     if (ev->modifiers & HID_MOD_SHIFT) mods |= MOD_SHIFT;
@@ -105,14 +136,25 @@ static void on_key(const struct usb_key_event *ev)
     keyboard_inject(key, ev->ascii, mods);
 }
 
+static void on_key(const struct usb_key_event *ev)
+{
+    if (kinput_grabbed()) { kinput_usb_key(ev->usage, ev->pressed, ev->repeat); return; }
+    pend(&(struct pending_ev){ .key = true, .k = *ev });
+}
+
 /* ---- mouse: the display server's, or a position for /proc/usb ------------ */
 static void on_mouse(const struct usb_mouse_event *ev)
 {
-    mouse_reports++;
+    __atomic_add_fetch(&mouse_reports, 1, __ATOMIC_RELAXED);
     if (kinput_grabbed()) {                     /* the display server draws its own cursor */
         kinput_usb_mouse(ev->dx, ev->dy, ev->wheel, ev->buttons);
         return;
     }
+    pend(&(struct pending_ev){ .key = false, .m = *ev });
+}
+
+static void console_mouse(const struct usb_mouse_event *ev)
+{
     mouse_x += ev->dx;
     mouse_y += ev->dy;
     if (mouse_x < 0) mouse_x = 0;
@@ -141,7 +183,19 @@ static const struct xhci_platform kestrel_usb = {
     .wake      = io_wake,
 };
 
-static void xhci_msi(void *arg) { (void)arg; xhci_poll(); }
+/* Every HOOK_EVERY ticks, big lock held (pit.c): the event ring (the
+ * fallback for a lost interrupt, and key repeat), then the console's input. */
+static void usb_tick(void)
+{
+    xhci_poll();
+    struct pending_ev e = { 0 };
+    while (unpend(&e)) {
+        if (e.key) console_key(&e.k);
+        else console_mouse(&e.m);
+    }
+}
+
+static void xhci_msi(void *arg) { (void)arg; xhci_poll(); }    /* no big lock: xhci.c locks its event ring */
 static struct pci_device *usb_pci;
 
 /* ---- bring-up ------------------------------------------------------------------ */
@@ -184,14 +238,17 @@ void usb_init(void)
     kprintf("usb: controller up and initial ports settled in %lu ms\n", time_ms() - t0);
     usb_up = true;
     usb_pci = dev;
-    pit_add_tick_hook(xhci_poll);               /* drain the event ring every 1 ms */
+    pit_add_tick_hook(usb_tick);
 }
 
 /* With the APIC up: an MSI drains the event ring at once (40 us moderation),
  * so a thread waiting for a transfer wakes as soon as it completes. */
 void usb_enable_irqs(void)
 {
-    if (usb_up && msi_enable(usb_pci, xhci_msi, NULL, "xhci") >= 0) xhci_enable_interrupts(160);
+    int v = usb_up ? msi_enable(usb_pci, xhci_msi, NULL, "xhci") : -1;
+    if (v < 0) return;
+    msi_set_lockless(v);
+    xhci_enable_interrupts(160);
 }
 
 static int usbd_main(void *arg)
@@ -281,8 +338,10 @@ static int ublk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void
 }
 static int ublk_flush(struct blkdev *b) { return msc_errno(usb_msc_sync(&((struct usb_disk *)b->ctx)->msc)); }
 static bool ublk_alive(struct blkdev *b) { return usb_msc_alive(&((struct usb_disk *)b->ctx)->msc); }
+/* The controller serialises its commands and transfers (xhci.c: acquire),
+ * the block layer a stick's requests (disk_lock). */
 static const struct blkdev_ops ublk_ops = { .read = ublk_read, .write = ublk_write, .flush = ublk_flush,
-                                            .alive = ublk_alive };
+                                            .alive = ublk_alive, .nolock = true };
 
 static bool known(uint8_t slot, uint32_t gen)
 {

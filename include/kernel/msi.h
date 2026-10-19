@@ -5,7 +5,8 @@
  * (ACPI _PRT) and no sharing. Kestrel gives each such device its own
  * vector from VEC_MSI_BASE up and delivers it to the boot CPU; the handler
  * runs like an IRQ handler (kernel lock held, interrupts off) after the
- * EOI. MSI-X is preferred when a device has both; only its first table
+ * EOI, or, for a driver that locks its own state (msi_set_lockless),
+ * straight from the interrupt without the kernel lock. MSI-X is preferred when a device has both; only its first table
  * entry is used. Needs the local APIC (apic_enabled()). */
 #ifndef KESTREL_MSI_H
 #define KESTREL_MSI_H
@@ -27,10 +28,14 @@ typedef void (*msi_handler_t)(void *arg);
 int  msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name);
 /* Turn the device's MSI or MSI-X off and give the vector back. */
 void msi_disable(struct pci_device *dev, int vector);
+/* The handler of the vector msi_enable() returned locks what it touches:
+ * it runs from the interrupt (interrupts off) without the big lock. */
+void msi_set_lockless(int vector);
+bool msi_lockless(int vector);
 /* The vector msi_enable() returned is delivered by MSI-X (not MSI). */
 bool msi_is_msix(int vector);
 /* isr_dispatch: a vector in [VEC_MSI_BASE, VEC_MSI_BASE + VEC_MSI_COUNT) */
-void msi_dispatch(int vector);         /* big lock held (smp.h: bkl_defer) */
+void msi_dispatch(int vector);         /* big lock held (smp.h: bkl_defer), unless lockless */
 /* /proc/interrupts lines for the MSI vectors in use */
 size_t msi_proc(char *buf, size_t cap);
 

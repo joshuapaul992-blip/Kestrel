@@ -34,7 +34,7 @@ static int ram_write(struct blkdev *b, uint64_t lba, uint32_t count, const void 
     return 0;
 }
 
-static const struct blkdev_ops ram_ops = { .read = ram_read, .write = ram_write };
+static const struct blkdev_ops ram_ops = { .read = ram_read, .write = ram_write, .nolock = true };
 
 void ramdisk_init(uintptr_t mbi)
 {

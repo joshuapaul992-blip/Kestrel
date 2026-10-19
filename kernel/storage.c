@@ -253,19 +253,25 @@ void storage_init(void)
 }
 
 /* Message-signalled interrupts, once the local APIC is up: a finished
- * command wakes its waiter, which sleeps (dropping the kernel lock)
- * instead of spinning. Without MSI the drivers keep polling. */
+ * command wakes its waiter, which sleeps instead of spinning. Without MSI
+ * the drivers keep polling. The handlers only note the port's status and
+ * wake: they run without the big lock, as the requests do (nolock). */
 static void ahci_msi(void *arg) { ahci_irq((int)(uintptr_t)arg); }
 static void nvme_msi(void *arg) { nvme_irq((int)(uintptr_t)arg); }
 
 void storage_enable_irqs(void)
 {
-    for (int i = 0; i < AHCI_MAX_HBAS; i++)
-        if (ahci_pci[i] && msi_enable(ahci_pci[i], ahci_msi, (void *)(uintptr_t)i, "ahci") >= 0)
-            ahci_enable_interrupts(i);
+    for (int i = 0; i < AHCI_MAX_HBAS; i++) {
+        int v = ahci_pci[i] ? msi_enable(ahci_pci[i], ahci_msi, (void *)(uintptr_t)i, "ahci") : -1;
+        if (v < 0) continue;
+        msi_set_lockless(v);
+        ahci_enable_interrupts(i);
+    }
     for (int i = 0; i < NVME_MAX_CTRLS; i++) {
         int v = nvme_pci[i] ? msi_enable(nvme_pci[i], nvme_msi, (void *)(uintptr_t)i, "nvme") : -1;
-        if (v >= 0) nvme_enable_interrupts(i, msi_is_msix(v));
+        if (v < 0) continue;
+        msi_set_lockless(v);
+        nvme_enable_interrupts(i, msi_is_msix(v));
     }
     virtio_blk_enable_irqs();
 }
@@ -332,7 +338,10 @@ static int sata_write(struct blkdev *b, uint64_t lba, uint32_t count, const void
     return rc == AHCI_OK ? 0 : rc == AHCI_ERR_TIMEOUT ? -ETIMEDOUT : -EIO;
 }
 static int sata_flush(struct blkdev *b) { return ahci_flush(b->ctx) == AHCI_OK ? 0 : -EIO; }
-static const struct blkdev_ops sata_ops = { .read = sata_read, .write = sata_write, .flush = sata_flush };
+/* One request per port at a time (block.c: disk_lock); the interrupt only
+ * notes the port's status (ahci_irq). */
+static const struct blkdev_ops sata_ops = { .read = sata_read, .write = sata_write, .flush = sata_flush,
+                                            .nolock = true };
 
 /* ---- block layer: "nvmeN" disks, one per namespace ------------------------ */
 static int nvme_blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
@@ -352,7 +361,9 @@ static int nvme_blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const 
     return rc == NVME_OK ? 0 : rc == NVME_ERR_TIMEOUT ? -ETIMEDOUT : rc == NVME_ERR_NODEV ? -ENODEV : -EIO;
 }
 static int nvme_blk_flush(struct blkdev *b) { return nvme_flush(b->ctx) == NVME_OK ? 0 : -EIO; }
-static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read, .write = nvme_blk_write, .flush = nvme_blk_flush };
+/* The controller's queues have their own lock (nvme.c: ctrl_lock). */
+static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read, .write = nvme_blk_write, .flush = nvme_blk_flush,
+                                            .nolock = true };
 
 void storage_register_devices(void)
 {
