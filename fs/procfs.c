@@ -391,19 +391,26 @@ static size_t gen_oom_adj(char *buf, size_t cap, void *ctx) { (void)ctx; size_t 
 /* symbolic links whose target is computed: /proc/PID/exe, cwd, root */
 static int link_exe(struct vnode *vn, char *buf, size_t size)
 {
+    char exe[sizeof ((struct tcb *)0)->exe];
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* execve() changes it */
     struct tcb *t = pid_task(vn->ctx);
-    if (!t || !t->exe[0]) return -ENOENT;
-    size_t n = strlen(t->exe);
+    if (t) strlcpy(exe, t->exe, sizeof exe);
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!t || !exe[0]) return -ENOENT;
+    size_t n = strlen(exe);
     if (n > size) n = size;
-    memcpy(buf, t->exe, n);
+    memcpy(buf, exe, n);
     return (int)n;
 }
 static int link_cwd(struct vnode *vn, char *buf, size_t size)
 {
-    struct tcb *t = pid_task(vn->ctx);
-    if (!t || !t->fs || !t->fs->cwd) return -ENOENT;
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* it may exit meanwhile */
+    struct fs_struct *fs = task_fs_get_locked(pid_task(vn->ctx));
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!fs) return -ENOENT;
     char tmp[VFS_PATH_MAX];
-    struct vnode *cwd = vfs_cwd_get(t->fs);             /* it may chdir meanwhile */
+    struct vnode *cwd = vfs_cwd_get(fs);                /* or chdir */
+    fs_put(fs);
     int r = vfs_path_of(cwd, tmp, sizeof tmp);
     vfs_vnode_put(cwd);
     if (r < 0) return r;
@@ -413,9 +420,9 @@ static int link_cwd(struct vnode *vn, char *buf, size_t size)
     return (int)n;
 }
 static int link_root(struct vnode *vn, char *buf, size_t size) { (void)vn; if (!size) return 0; buf[0] = '/'; return 1; }
-static const struct vnode_ops exe_ops = { .readlink = link_exe };
-static const struct vnode_ops cwd_ops = { .readlink = link_cwd };
-static const struct vnode_ops root_ops = { .readlink = link_root };
+static const struct vnode_ops exe_ops = { .readlink = link_exe, .nolock = true };
+static const struct vnode_ops cwd_ops = { .readlink = link_cwd, .nolock = true };
+static const struct vnode_ops root_ops = { .readlink = link_root, .nolock = true };
 
 static void proc_link(struct vnode *dir, const char *name, const struct vnode_ops *ops, void *ctx)
 {

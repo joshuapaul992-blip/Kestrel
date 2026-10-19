@@ -271,11 +271,12 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     struct tcb *c = task_create_paused(p->name, fork_child_entry, cf);   /* must not run half-built */
     if (!c) { kfree(cf); cf = NULL; mm_put(mm); mm = NULL; goto again; }
     c->bkl_depth = 0;                                   /* the child starts without the big lock */
-    files_put(c->files); c->files = files;
-    fs_put(c->fs); c->fs = fs;
-    sighand_put(c->sighand); c->sighand = sh;
     struct signal_struct *unused = NULL;
     uint64_t fl = spin_lock_irqsave(&proc_lock);        /* the tree: wait4() and exit() */
+    struct files_struct *ofiles = c->files;             /* /proc reads these under proc_lock */
+    struct fs_struct *ofs = c->fs;
+    struct sighand_struct *osh = c->sighand;
+    c->files = files; c->fs = fs; c->sighand = sh;
     if (thread) {                                       /* same process: share the group */
         unused = c->signal;
         c->signal = p->signal;
@@ -297,6 +298,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (thread && (p->signal->group_exit || p->signal->exec_kill)) c->sig_pending = sigbit(SIGKILL);
     c->user = true;
     spin_unlock_irqrestore(&proc_lock, fl);
+    files_put(ofiles); fs_put(ofs); sighand_put(osh);
     signal_put(unused);
     c->mm = mm;
     c->pml4 = c->cr3 = mm->pml4;
@@ -506,7 +508,9 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     t->saved_mask_valid = false;
     t->robust_list = 0;
     t->alt_sp = t->alt_size = 0;
+    fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe */
     strlcpy(t->exe, path, sizeof t->exe);
+    spin_unlock_irqrestore(&proc_lock, fl);
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     strlcpy(t->name, base, sizeof t->name);
     fl = irq_save();

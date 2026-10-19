@@ -260,6 +260,7 @@ int         task_snapshot(struct tcb *out, int max);
 struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
 struct mm  *task_mm_get(struct tcb *t); /* its address space, referenced    */
+struct fs_struct *task_fs_get_locked(struct tcb *t); /* proc_lock held: its fs, referenced (fs_put) */
 void        task_reap(struct tcb *t);   /* free a collected zombie (wait4)   */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
 /* Futex-style sleep: mark the current task asleep on `chan` (until

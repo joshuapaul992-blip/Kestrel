@@ -334,6 +334,15 @@ struct mm *task_mm_get(struct tcb *t)
     return mm;
 }
 
+/* Another task's working directory state, with a reference (fs_put):
+ * clone and exit swap it under proc_lock, which the caller holds. */
+struct fs_struct *task_fs_get_locked(struct tcb *t)
+{
+    struct fs_struct *fs = t ? t->fs : NULL;
+    if (fs) __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL);
+    return fs;
+}
+
 /* A signal for t. A sleeper wakes; a thread still on its way to sleep
  * (it looked for signals before the sender set one, without the sender's
  * lock) does not go to sleep, and looks again. */
