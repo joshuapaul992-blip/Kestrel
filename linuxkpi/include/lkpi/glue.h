@@ -195,7 +195,7 @@ void         *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops);
  * part of a split region (mm NULL: the same process, and resize() shrinks
  * the original); close() ends it. fault() maps at least `va` with
  * lkpi_vm_insert() and returns 0, -EIO (SIGBUS), -ENOMEM or -EFAULT. All
- * of them may sleep and run under Kestrel's big kernel lock. */
+ * of them may sleep; they run without Kestrel's big kernel lock. */
 struct lkpi_mmap_ops {
     int   (*fault)(void *ctx, unsigned long va, int write);
     void *(*dup)(void *ctx, void *mm, unsigned long start, unsigned long end, unsigned long off);
