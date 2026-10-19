@@ -128,7 +128,6 @@ struct tcb {
     uint64_t  fs_base;          /* TLS pointer (arch_prctl ARCH_SET_FS)    */
     uint64_t  gs_base;          /* user GS base (arch_prctl ARCH_SET_GS)   */
     uint64_t  tid_address;      /* set_tid_address()                       */
-    uint8_t   fpu[512] __attribute__((aligned(16)));    /* fxsave area     */
 
     /* processes (proc/process.c) */
     int       pgid, sid;        /* process group, session                  */
@@ -259,6 +258,7 @@ int         task_wait(int pid);         /* exit status, or -ECHILD        */
 int         task_snapshot(struct tcb *out, int max);
 struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
+uint8_t *task_fpu(struct tcb *t);       /* its user FPU state (fpu.h)       */
 struct mm  *task_mm_get(struct tcb *t); /* its address space, referenced    */
 struct fs_struct *task_fs_get_locked(struct tcb *t); /* proc_lock held: its fs, referenced (fs_put) */
 void        task_reap(struct tcb *t);   /* free a collected zombie (wait4)   */

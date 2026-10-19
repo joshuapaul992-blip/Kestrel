@@ -28,6 +28,7 @@
 #include <kernel/vm.h>
 #include <kernel/smp.h>
 #include <kernel/spinlock.h>
+#include <kernel/fpu.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp, int *saved);
 extern void thread_trampoline(void);
@@ -37,6 +38,8 @@ extern uint8_t boot_stack[], boot_stack_top[];
 
 static struct tcb tasks[MAX_TASKS];
 static struct tcb idle_tasks[MAX_CPUS];            /* the APs' idle threads */
+/* each slot's user FPU state, out of the tcb so copies of it stay small */
+static uint8_t fpu_areas[MAX_TASKS][FPU_AREA_MAX] __attribute__((aligned(64)));
 #define cur          (this_task())           /* writes: this_cpu()->current, irqs off */
 #define need_resched (this_cpu()->need_resched)
 static int next_pid = 1;
@@ -322,6 +325,12 @@ struct tcb *task_find(int pid)
 
 struct tcb *task_slot(int i) { return (i >= 0 && i < MAX_TASKS) ? &tasks[i] : NULL; }
 
+uint8_t *task_fpu(struct tcb *t)
+{
+    if (t < tasks || t >= tasks + MAX_TASKS) panic("task_fpu: %p is not a task slot", t);
+    return fpu_areas[t - tasks];
+}
+
 /* Another task's address space, with a reference: exit and execve swap a
  * task's under proc_lock. NULL if it has none. */
 struct mm *task_mm_get(struct tcb *t)
@@ -539,16 +548,16 @@ void schedule(void)
     uint64_t ktop = ((uintptr_t)next->kstack + next->kstack_size) & ~0xFull;
     tss_set_kernel_stack(ktop);
     c->kernel_rsp = ktop;
-    /* user processes own SSE state (the kernel is built without SSE), a TLS
+    /* user processes own FPU state (the kernel is built without SSE), a TLS
      * base (FS) and a GS base (in KERNEL_GS_BASE while in the kernel);
      * kernel threads never touch them */
     if (prev->user) {
-        __asm__ volatile("fxsave %0" : "=m"(prev->fpu));
+        fpu_save(task_fpu(prev));
         prev->fs_base = rdmsr(MSR_FS_BASE);
         prev->gs_base = rdmsr(MSR_KERNEL_GS_BASE);
     }
     if (next->user) {
-        __asm__ volatile("fxrstor %0" :: "m"(next->fpu));
+        fpu_restore(task_fpu(next));
         wrmsr(MSR_FS_BASE, next->fs_base);
         wrmsr(MSR_KERNEL_GS_BASE, next->gs_base);
     }
