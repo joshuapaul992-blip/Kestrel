@@ -3146,6 +3146,15 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_rt_sigsuspend: case SYS_pause: case SYS_tkill: case SYS_tgkill:
         return true;
     case SYS_kill:           return f->rdi != 1;        /* the kernel may play init: poweroff */
+    /* a new thread or process: its slot and the tree under proc_lock, the
+     * copies under the tables' own locks (the address space's, the
+     * descriptor table's); the child starts without the big lock */
+    case SYS_fork: case SYS_vfork: case SYS_clone: case SYS_clone3:
+    /* a new program: the image is read with the big lock only from a file
+     * that needs it (proc/exec.c); the rest is the task's own, the tree's
+     * (proc_lock) or the address space's */
+    case SYS_execve:
+        return true;
     /* data through a file that locks itself: a unix socket, a pipe, an
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
      * file's position lock) */

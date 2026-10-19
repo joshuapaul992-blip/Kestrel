@@ -216,7 +216,6 @@ static int fork_child_entry(void *arg)
     if (f.vector) put_user_u32((void *)f.vector, (uint32_t)current_task()->pid);
     f.vector = 0x80;
     cli();
-    bkl_exit();                         /* ring 3 runs without the kernel lock */
     user_return(&f);                    /* FPU, FS base and CR3 set by the scheduler */
 }
 
@@ -249,7 +248,11 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (flags & CLONE_FS) { fs = p->fs; __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL); }
     else fs = fs_new(vfs_cwd_get(p->fs), p->fs->umask);
     if (flags & CLONE_SIGHAND) { sh = p->sighand; __atomic_add_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL); }
-    else sh = sighand_new(p->sighand);
+    else if ((sh = sighand_new(NULL))) {
+        uint64_t fl = spin_lock_irqsave(&proc_lock);    /* another thread's sigaction() */
+        memcpy(sh->action, p->sighand->action, sizeof sh->action);
+        spin_unlock_irqrestore(&proc_lock, fl);
+    }
     if (sh && (flags & CLONE_CLEAR_SIGHAND))            /* posix_spawn: handlers reset, ignored stay ignored */
         for (int s = 0; s < NSIG; s++)
             if (sh->action[s].handler != SIG_IGN) {
@@ -265,14 +268,14 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (newsp) cf->rsp = newsp;
     cf->vector = (flags & CLONE_CHILD_SETTID) ? ctid : 0;   /* fork_child_entry writes the tid there */
 
-    uint64_t fl = irq_save();
     struct tcb *c = task_create_paused(p->name, fork_child_entry, cf);   /* must not run half-built */
-    if (!c) { irq_restore(fl); kfree(cf); cf = NULL; mm_put(mm); mm = NULL; goto again; }
+    if (!c) { kfree(cf); cf = NULL; mm_put(mm); mm = NULL; goto again; }
+    c->bkl_depth = 0;                                   /* the child starts without the big lock */
     files_put(c->files); c->files = files;
     fs_put(c->fs); c->fs = fs;
     sighand_put(c->sighand); c->sighand = sh;
     struct signal_struct *unused = NULL;
-    spin_lock_irqsave(&proc_lock);                      /* the tree: wait4() and exit() */
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* the tree: wait4() and exit() */
     if (thread) {                                       /* same process: share the group */
         unused = c->signal;
         c->signal = p->signal;
@@ -293,7 +296,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
      * this one gets its own (taken on its first way back to the kernel) */
     if (thread && (p->signal->group_exit || p->signal->exec_kill)) c->sig_pending = sigbit(SIGKILL);
     c->user = true;
-    spin_unlock_keep_irqs(&proc_lock);
+    spin_unlock_irqrestore(&proc_lock, fl);
     signal_put(unused);
     c->mm = mm;
     c->pml4 = c->cr3 = mm->pml4;
@@ -318,12 +321,11 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
 
     /* vfork: the parent waits until the child has its own address space */
     if (flags & CLONE_VFORK) {
-        spin_lock_irqsave(&proc_lock);                  /* vfork_release() wakes under it */
+        fl = spin_lock_irqsave(&proc_lock);             /* vfork_release() wakes under it */
         while (c->pid == pid && c->vfork_parent == p->pid && c->state != TASK_UNUSED)
             sleep_on_locked(&c->vfork_parent, &proc_lock);
-        spin_unlock_keep_irqs(&proc_lock);
+        spin_unlock_irqrestore(&proc_lock, fl);
     }
-    irq_restore(fl);
     return pid;
 
 nomem:
@@ -451,20 +453,20 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
      * intact (and current again) if loading fails. */
     struct mm *old = t->mm, *nw = mm_create();
     if (!nw) { rc = -ENOMEM; goto out; }
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* task_mm_get() */
     t->mm = nw;
     t->pml4 = t->cr3 = nw->pml4;
     cpu_load_cr3(nw->pml4);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&proc_lock, fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
     if (rc >= 0) rc = de_thread(t);                     /* other threads go before the old image */
     if (rc < 0) {
-        fl = irq_save();
+        fl = spin_lock_irqsave(&proc_lock);
         t->mm = old;
         t->pml4 = t->cr3 = old->pml4;
         cpu_load_cr3(old->pml4);
-        irq_restore(fl);
+        spin_unlock_irqrestore(&proc_lock, fl);
         mm_put(nw);
         goto out;
     }

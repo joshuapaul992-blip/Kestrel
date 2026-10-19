@@ -133,6 +133,8 @@ static int load_elf(struct mm *mm, const char *path, uint64_t bias_dyn, bool int
     struct file *f;
     int rc = vfs_open(path, O_RDONLY, 0, &f);
     if (rc < 0) return rc;
+    bool lock = !file_nolock(f) && !bkl_depth();       /* execve runs without the big lock */
+    if (lock) bkl_enter();
     struct elf64_phdr *ph = NULL;
     memset(img, 0, sizeof *img);
 
@@ -224,6 +226,7 @@ static int load_elf(struct mm *mm, const char *path, uint64_t bias_dyn, bool int
 out:
     kfree(ph);
     vfs_close(f);                                       /* the mappings hold their own references */
+    if (lock) bkl_exit();
     return rc;
 }
 
@@ -335,8 +338,11 @@ static int read_shebang(const char *path, char *interp, size_t icap, char *arg, 
     int rc = vfs_open(path, O_RDONLY, 0, &f);
     if (rc < 0) return rc;
     char line[128];
+    bool lock = !file_nolock(f) && !bkl_depth();
+    if (lock) bkl_enter();
     ssize_t n = vfs_read(f, line, sizeof line - 1);
     vfs_close(f);
+    if (lock) bkl_exit();
     if (n < 2 || line[0] != '#' || line[1] != '!') return 0;
     line[n] = 0;
     char *p = line + 2, *end = strchr(p, '\n');

@@ -79,7 +79,12 @@ static bool pat_wc_ready(void)
     return true;
 }
 
-static uint64_t *identity_pte(uint64_t phys);
+static uint64_t *identity_pte(uint64_t phys, bool *split);
+
+/* Changes to the identity map's page tables (a 2 MiB page split, a PTE's
+ * bits): kernel stacks come and go without the big kernel lock. TLB
+ * shootdowns wait for every CPU, so they come after it is let go. */
+static struct spinlock ident_lock;
 
 bool vmm_set_write_combining(uint64_t phys, uint64_t size)
 {
@@ -105,15 +110,17 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
          * one already split: just the 4 KiB pages in the range. */
         uint64_t lo = a > (phys & ~0xFFFull) ? a : (phys & ~0xFFFull);
         uint64_t hi = a + 0x200000 < phys + size ? a + 0x200000 : phys + size;
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&ident_lock);
+        bool split = false;
         for (uint64_t p = lo; p < hi; p += PAGE_SIZE) {
-            uint64_t *pte = identity_pte(p);
+            uint64_t *pte = identity_pte(p, &split);
             if (!pte) break;
             *pte = (*pte & ~(uint64_t)(VMM_PCD | 0x80)) | VMM_PWT;      /* PAT entry 1 */
             pages++;
         }
-        irq_restore(f);
-        tlb_shootdown_kernel(lo, hi);
+        spin_unlock_irqrestore(&ident_lock, f);
+        if (split) tlb_shootdown_kernel(a, a + 0x200000);
+        else tlb_shootdown_kernel(lo, hi);
     }
     __asm__ volatile("wbinvd" ::: "memory");
     return pages > 0;
@@ -122,10 +129,12 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
 /* The 4 KiB PTE of identity-mapped `phys`, splitting its 2 MiB page into a
  * page table first if needed (same physical pages, same attributes). The
  * boot identity map lives in the shared kernel PDPTs, so the change is seen
- * by every address space. NULL if unmapped or out of memory. */
+ * by every address space. NULL if unmapped or out of memory. ident_lock
+ * held; *split set if the large page was split (its TLB entries: the
+ * caller's shootdown). */
 #define PTE_NX      (1ull << 63)
 #define PDE_PAT     (1ull << 12)                        /* PAT bit of a 2 MiB PDE */
-static uint64_t *identity_pte(uint64_t phys)
+static uint64_t *identity_pte(uint64_t phys, bool *split)
 {
     uint64_t *pml4 = kpml4();
     if (!(pml4[(phys >> 39) & 511] & PTE_PRESENT)) return NULL;
@@ -143,8 +152,7 @@ static uint64_t *identity_pte(uint64_t phys)
         if (*pde & PDE_PAT) attr |= 0x80;               /* PAT bit moves to bit 7 in a PTE */
         for (int i = 0; i < 512; i++) pt[i] = (base + (uint64_t)i * 4096) | attr;
         *pde = pt_phys | PTE_PRESENT | PTE_WRITE;
-        /* the large page's TLB entries, on every CPU */
-        tlb_shootdown_kernel(base, base + 0x200000);
+        *split = true;                                  /* same frames, same attributes meanwhile */
     }
     uint64_t *pt = (uint64_t *)(*pde & ADDR_MASK);
     return &pt[(phys >> 12) & 511];
@@ -152,13 +160,16 @@ static uint64_t *identity_pte(uint64_t phys)
 
 bool vmm_set_guard(uint64_t phys, bool guard)
 {
-    uint64_t f = irq_save();
-    uint64_t *pte = identity_pte(phys & ~0xFFFull);
+    uint64_t p = phys & ~0xFFFull;
+    bool split = false;
+    uint64_t f = spin_lock_irqsave(&ident_lock);
+    uint64_t *pte = identity_pte(p, &split);
     if (pte) {
         if (guard) *pte &= ~(uint64_t)PTE_PRESENT; else *pte |= PTE_PRESENT;
-        tlb_shootdown_kernel(phys & ~0xFFFull, (phys & ~0xFFFull) + PAGE_SIZE);
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&ident_lock, f);
+    if (split) tlb_shootdown_kernel(p & ~0x1FFFFFull, (p & ~0x1FFFFFull) + 0x200000);
+    else if (pte) tlb_shootdown_kernel(p, p + PAGE_SIZE);
     return pte != NULL;
 }
 
