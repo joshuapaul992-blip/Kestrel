@@ -508,11 +508,11 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     t->saved_mask_valid = false;
     t->robust_list = 0;
     t->alt_sp = t->alt_size = 0;
-    fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe */
-    strlcpy(t->exe, path, sizeof t->exe);
-    spin_unlock_irqrestore(&proc_lock, fl);
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe and comm */
+    strlcpy(t->exe, path, sizeof t->exe);
     strlcpy(t->name, base, sizeof t->name);
+    spin_unlock_irqrestore(&proc_lock, fl);
     fl = irq_save();
     memcpy(t->fpu, clean_fpu(), sizeof t->fpu);
     __asm__ volatile("fxrstor %0" :: "m"(t->fpu));

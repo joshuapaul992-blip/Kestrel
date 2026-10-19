@@ -1006,7 +1006,7 @@ static int mixer_ioctl(struct file *f, unsigned long req, void *arg)
     }
 }
 
-static const struct vnode_ops mixer_ops = { .fioctl = mixer_ioctl };
+static const struct vnode_ops mixer_ops = { .fioctl = mixer_ioctl, .nolock = true };   /* volume: slock */
 
 /* ---- probe ------------------------------------------------------------------------------- */
 static const char *codec_vendor(uint32_t v)

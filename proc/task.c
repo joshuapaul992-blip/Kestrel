@@ -1063,9 +1063,9 @@ void sched_idle_loop(void)
 int task_snapshot(struct tcb *out, int max)
 {
     int n = 0;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&proc_lock);
     for (int i = 0; i < MAX_TASKS && n < max; i++)
         if (tasks[i].state != TASK_UNUSED) out[n++] = tasks[i];
-    irq_restore(f);
+    spin_unlock_irqrestore(&proc_lock, f);
     return n;
 }

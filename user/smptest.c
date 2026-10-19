@@ -707,7 +707,21 @@ static void *pr_proc(void *arg)
         if (fd >= 0) close(fd);
         pid_t c = fork();
         if (c == 0) _exit(0);
-        if (c > 0) waitpid(c, NULL, 0);
+        if (c > 0) {                                    /* a process on its way out: read or ENOENT */
+            static const char *const files[] = { "stat", "status", "statm", "maps", "cmdline", "comm" };
+            for (unsigned i = 0; i < sizeof files / sizeof *files; i++) {
+                snprintf(p, sizeof p, "/proc/%d/%s", c, files[i]);
+                int f = open(p, O_RDONLY);
+                if (f >= 0) { while (read(f, buf, sizeof buf) > 0) {} close(f); }
+            }
+            waitpid(c, NULL, 0);
+        }
+        static const char *const sys[] = { "/proc/tasks", "/proc/mounts", "/proc/self/mountinfo", "/proc/meminfo" };
+        for (unsigned i = 0; i < sizeof sys / sizeof *sys; i++) {
+            int f = open(sys[i], O_RDONLY);
+            if (f < 0 || read(f, buf, sizeof buf) <= 0) pr_fail(sys[i], errno);
+            if (f >= 0) close(f);
+        }
     }
     return NULL;
 }
