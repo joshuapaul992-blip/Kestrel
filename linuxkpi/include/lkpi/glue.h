@@ -187,6 +187,12 @@ int           lkpi_fd_reserve(int cloexec);
 int           lkpi_fd_fill(int fd, const char *name, int flags, const struct lkpi_cdev_ops *ops, void *file);
 void          lkpi_fd_unreserve(int fd);
 void         *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops);
+/* Kestrel's eventfds: the one behind fd (a reference, or -EBADF/-EINVAL),
+ * adding 1 to it from any context, and dropping the reference (it may
+ * sleep: not from an interrupt) */
+int           lkpi_eventfd_get(int fd, void **efd);
+void          lkpi_eventfd_signal(void *efd);
+void          lkpi_eventfd_put(void *efd);
 
 /* ---- device memory mapped into a process (mmap of a device node) -------- */
 /* The region [start, end) at file offset `off` of the process `mm` (opaque)

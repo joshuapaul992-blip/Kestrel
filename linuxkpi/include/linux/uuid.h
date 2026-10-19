@@ -14,6 +14,7 @@ typedef struct { __u8 b[UUID_SIZE]; } uuid_t;
 static inline bool guid_equal(const guid_t *a, const guid_t *b) { return !memcmp(a, b, sizeof *a); }
 static inline void guid_copy(guid_t *dst, const guid_t *src) { memcpy(dst, src, sizeof *dst); }
 static inline void import_guid(guid_t *dst, const __u8 *src) { memcpy(dst, src, sizeof *dst); }
+static inline void import_uuid(uuid_t *dst, const __u8 *src) { memcpy(dst, src, sizeof *dst); }
 static inline void export_guid(__u8 *dst, const guid_t *src) { memcpy(dst, src, sizeof *src); }
 static inline bool guid_is_null(const guid_t *g)
 {

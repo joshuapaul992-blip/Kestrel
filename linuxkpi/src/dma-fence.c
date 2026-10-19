@@ -3,6 +3,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-array.h>
 #include <linux/dma-fence-chain.h>
+#include <linux/dma-fence-unwrap.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/atomic.h>
@@ -553,3 +554,75 @@ void dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
     }
     dma_fence_init(&chain->base, &dma_fence_chain_ops, &chain->lock, context, seqno);
 }
+
+/* ---- unwrapping containers (linux/dma-fence-unwrap.h) ------------------------------- */
+static struct dma_fence *unwrap_array(struct dma_fence_unwrap *cursor)
+{
+    cursor->array = dma_fence_chain_contained(cursor->chain);
+    cursor->index = 0;
+    return dma_fence_array_first(cursor->array);
+}
+
+struct dma_fence *dma_fence_unwrap_first(struct dma_fence *head, struct dma_fence_unwrap *cursor)
+{
+    cursor->chain = dma_fence_get(head);
+    return unwrap_array(cursor);
+}
+EXPORT_SYMBOL_GPL(dma_fence_unwrap_first);
+
+/* the walk drops its chain reference as it leaves each node, and at the end */
+struct dma_fence *dma_fence_unwrap_next(struct dma_fence_unwrap *cursor)
+{
+    struct dma_fence *tmp = dma_fence_array_next(cursor->array, ++cursor->index);
+    if (tmp) return tmp;
+    cursor->chain = dma_fence_chain_walk(cursor->chain);
+    return unwrap_array(cursor);
+}
+EXPORT_SYMBOL_GPL(dma_fence_unwrap_next);
+
+struct dma_fence *__dma_fence_unwrap_merge(unsigned int num_fences, struct dma_fence **fences,
+                                           struct dma_fence_unwrap *cursors)
+{
+    struct dma_fence **array, *tmp;
+    unsigned int max = 0, n = 0;
+
+    for (unsigned int i = 0; i < num_fences; i++)
+        dma_fence_unwrap_for_each(tmp, &cursors[i], fences[i])
+            if (!dma_fence_is_signaled(tmp)) max++;
+    if (!max) return dma_fence_get_stub();
+
+    array = kmalloc_array(max, sizeof(*array), GFP_KERNEL);
+    if (!array) return NULL;
+    for (unsigned int i = 0; i < num_fences; i++) {
+        dma_fence_unwrap_for_each(tmp, &cursors[i], fences[i]) {
+            unsigned int j;
+            if (dma_fence_is_signaled(tmp)) continue;
+            for (j = 0; j < n && array[j]->context != tmp->context; j++) {}
+            if (j < n) {                                /* one per context: the later */
+                if (__dma_fence_is_later(tmp->seqno, array[j]->seqno, tmp->ops)) {
+                    dma_fence_put(array[j]);
+                    array[j] = dma_fence_get(tmp);
+                }
+            } else if (n < max) {                       /* more may not have signaled since */
+                array[n++] = dma_fence_get(tmp);
+            }
+        }
+    }
+    if (n == 0) {
+        kfree(array);
+        return dma_fence_get_stub();
+    }
+    if (n == 1) {
+        tmp = array[0];
+        kfree(array);
+        return tmp;
+    }
+    struct dma_fence_array *result = dma_fence_array_create(n, array, dma_fence_context_alloc(1), 1, false);
+    if (!result) {
+        while (n--) dma_fence_put(array[n]);
+        kfree(array);
+        return NULL;
+    }
+    return &result->base;
+}
+EXPORT_SYMBOL_GPL(__dma_fence_unwrap_merge);

@@ -75,6 +75,7 @@ struct int_frame;
 #define SYS_chdir          80
 #define SYS_mkdir          83
 #define SYS_rmdir          84
+#define SYS_creat          85
 #define SYS_rename         82
 #define SYS_unlink         87
 #define SYS_readlink       89

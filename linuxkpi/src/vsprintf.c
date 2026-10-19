@@ -3,7 +3,7 @@
  * The C conversions with Linux's length modifiers, and the %p extensions
  * drivers use in messages: %pe (error names), %pV (nested format),
  * %pM/%pm (MAC), %pI4/%pi4/%pI6, %pa/%pad (physical and DMA addresses),
- * %ph (hex bytes), %pR/%pr (resources), %pU (UUIDs). Symbol lookups
+ * %ph (hex bytes), %pR/%pr (resources), %pU (UUIDs), %p4cc (DRM formats). Symbol lookups
  * (%pS and friends) print the address. Plain %p prints the address
  * itself: Kestrel does not hash pointers. As in Linux, every letter or
  * digit after %p belongs to the extension. */
@@ -224,6 +224,18 @@ static void pointer(struct out *o, const char *ext, void *ptr, struct spec s)
             put(o, digits[b[idx[i]] >> 4]);
             put(o, digits[b[idx[i]] & 15]);
         }
+        return;
+    }
+    case '4': {                         /* %p4cc: a DRM format code, "XR24 little-endian (0x34325258)" */
+        if (!ptr || ext[1] != 'c' || ext[2] != 'c') break;
+        u32 code = *(const u32 *)ptr, v = code & ~(1u << 31);
+        int n = 0;
+        for (int i = 0; i < 4; i++) {
+            char c = (char)(v >> (8 * i));
+            buf[n++] = isascii(c) && isprint(c) ? c : '.';
+        }
+        scnprintf(buf + n, sizeof buf - n, " %s-endian (0x%08x)", code & (1u << 31) ? "big" : "little", code);
+        string(o, buf, s);
         return;
     }
     case 'S': case 's': case 'B': case 'F': case 'f':

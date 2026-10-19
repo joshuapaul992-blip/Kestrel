@@ -533,6 +533,9 @@ static void test_lib(void)
     u8 mac[6] = { 0x52, 0x54, 0, 0x12, 0x34, 0x56 };
     snprintf(buf, sizeof buf, "%pM", mac);
     CHECK(!strcmp(buf, "52:54:00:12:34:56"));
+    u32 fourcc = 0x34325258;                                    /* DRM_FORMAT_XRGB8888 */
+    snprintf(buf, sizeof buf, "%p4cc", &fourcc);
+    CHECK(!strcmp(buf, "XR24 little-endian (0x34325258)"));
     CHECK(strscpy(buf, "too long for it", 8) == -E2BIG && !strcmp(buf, "too lon"));
     char *s = kasprintf(GFP_KERNEL, "%s-%u", "dev", 7u);
     CHECK(s && !strcmp(s, "dev-7"));

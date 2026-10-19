@@ -382,6 +382,13 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_
 static int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode, uint64_t a4, uint64_t a5, uint64_t a6)
 { return sys_openat((uint64_t)(int64_t)AT_FDCWD, path, flags, mode, a4, a5 + 0 * a6); }
 
+/* creat(2): GNU tar opens its archive with it */
+static int64_t sys_creat(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    return sys_openat((uint64_t)(int64_t)AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode, 0, 0);
+}
+
 static int64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -2981,6 +2988,7 @@ void syscall_init(void)
     }
     REG(SYS_read, sys_read);           REG(SYS_write, sys_write);
     REG(SYS_open, sys_open);           REG(SYS_close, sys_close);
+    REG(SYS_creat, sys_creat);
     REG(SYS_stat, sys_stat);           REG(SYS_fstat, sys_fstat);
     REG(SYS_lseek, sys_lseek);         REG(SYS_ioctl, sys_ioctl);
     REG(SYS_sched_yield, sys_sched_yield);
@@ -3294,7 +3302,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * and exclusive to change. A device's open, a generated file's size or
      * a /proc link take the big lock there, as do directory descriptors in
      * fget that need it. */
-    case SYS_open: case SYS_openat: case SYS_stat: case SYS_lstat: case SYS_newfstatat: case SYS_statx:
+    case SYS_open: case SYS_creat: case SYS_openat: case SYS_stat: case SYS_lstat: case SYS_newfstatat: case SYS_statx:
     case SYS_access: case SYS_faccessat: case SYS_faccessat2: case SYS_readlink: case SYS_readlinkat:
     case SYS_getdents64: case SYS_getcwd: case SYS_chdir: case SYS_fchdir: case SYS_umask:
     case SYS_mkdir: case SYS_mkdirat: case SYS_rmdir: case SYS_unlink: case SYS_unlinkat:

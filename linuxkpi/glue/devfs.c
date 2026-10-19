@@ -217,6 +217,17 @@ void *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops)
     return lf;
 }
 
+int lkpi_eventfd_get(int fd, void **efd)
+{
+    struct file *f;
+    int r = eventfd_fget(fd, &f);
+    if (!r) *efd = f;
+    return r;
+}
+
+void lkpi_eventfd_signal(void *efd) { eventfd_file_signal(efd); }
+void lkpi_eventfd_put(void *efd) { vfs_close(efd); }
+
 void *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                     const struct lkpi_cdev_ops *ops, void *dev)
 {

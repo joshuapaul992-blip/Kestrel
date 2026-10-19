@@ -26,6 +26,8 @@
 #include <linux/file.h>
 #include <linux/anon_inodes.h>
 #include <linux/pseudo_fs.h>
+#include <linux/eventfd.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 /* ---- user memory ----------------------------------------------------------- */
@@ -579,3 +581,46 @@ ssize_t simple_write_to_buffer(void *to, size_t available, loff_t *ppos, const v
     *ppos = pos + (loff_t)count;
     return (ssize_t)count;
 }
+
+/* ---- user space's eventfds (linux/eventfd.h) ------------------------------------------ */
+/* A sync object signals one from a fence callback, which may run in an
+ * interrupt, and drops it there too: the last reference of Kestrel's file
+ * goes in a worker. */
+struct eventfd_ctx {
+    void               *efd;
+    struct work_struct  put_work;
+};
+
+static void eventfd_put_work(struct work_struct *w)
+{
+    struct eventfd_ctx *ctx = container_of(w, struct eventfd_ctx, put_work);
+    lkpi_eventfd_put(ctx->efd);
+    kfree(ctx);
+}
+
+struct eventfd_ctx *eventfd_ctx_fdget(int fd)
+{
+    struct eventfd_ctx *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    int r;
+    if (!ctx) return ERR_PTR(-ENOMEM);
+    r = lkpi_eventfd_get(fd, &ctx->efd);
+    if (r) {
+        kfree(ctx);
+        return ERR_PTR(r);
+    }
+    INIT_WORK(&ctx->put_work, eventfd_put_work);
+    return ctx;
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_fdget);
+
+void eventfd_signal(struct eventfd_ctx *ctx)
+{
+    lkpi_eventfd_signal(ctx->efd);
+}
+EXPORT_SYMBOL_GPL(eventfd_signal);
+
+void eventfd_ctx_put(struct eventfd_ctx *ctx)
+{
+    schedule_work(&ctx->put_work);
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_put);

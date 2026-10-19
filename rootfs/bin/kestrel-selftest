@@ -1,0 +1,103 @@
+#!/bin/sh
+# /bin/kestrel-selftest -- the GPU self-test, run by GRUB's "GPU self-test"
+# entry with no one at the keyboard. It checks the display and OpenGL stack
+# step by step and puts what it finds on the stick's "KESTREL RPT" volume:
+#
+#   RESULTS.TAR   selftest/: summary.txt (PASS/FAIL per check), the system
+#                 and GPU reports, the DRM state (/proc/dri) before and after
+#                 X, drmtest, the X server's log, xrandr, glxinfo, eglinfo,
+#                 glxgears' frame rate, screenshots (*.xwd.gz) and the
+#                 kernel log
+#   REPORT.TXT    the kernel log and the summary (/dev/report)
+#
+# Both are rewritten after every step, so a step that hangs the machine
+# still leaves the ones before it. The desktop stays up at the end.
+# Progress shows on the terminal (and the serial port). The X steps need the Firefox root
+# (Xorg, Mesa and the X client tools); without it they are skipped.
+export HOME=/root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export DISPLAY=:0
+D=/tmp/selftest
+GEARS_S=${GEARS_S:-30}
+mkdir -p $D
+
+say() { echo "selftest: $*"; }                  # the terminal, and the serial port with it
+check() {       # check NAME RESULT [DETAIL]
+    echo "$2  $1${3:+: $3}" >> $D/summary.txt
+    say "$2  $1${3:+: $3}"
+}
+save() {        # save STEP: the archive and REPORT.TXT, as they stand
+    cat /proc/kmsg > $D/kmsg.txt 2>/dev/null
+    (cd /tmp && tar -cf /dev/results selftest) 2>/dev/null || say "cannot write RESULTS.TAR"
+    { echo "kestrel-selftest, after: $1"; cat $D/summary.txt; } > /dev/report 2>/dev/null
+}
+shot() {        # shot NAME: the X screen, as xwd's dump, compressed
+    xwd -root -silent 2>/dev/null | gzip -1 > $D/$1.xwd.gz && say "screenshot $1"
+}
+
+say "start"
+: > $D/summary.txt
+
+# 1. the machine and the GPU, as the kernel sees them
+{ uname -a; echo; cat /proc/cmdline; echo; cat /proc/cpuinfo | sed -n '1,30p'; echo; cat /proc/meminfo; } > $D/system.txt 2>&1
+cat /proc/pci > $D/pci.txt 2>&1
+cat /proc/gpu > $D/gpu.txt 2>&1
+{ ls -l /dev/dri; for c in /sys/class/drm/*; do echo "$c:"; cat $c/device/uevent 2>/dev/null; done; } > $D/dri-nodes.txt 2>&1
+if [ -e /dev/dri/card0 ]; then
+    check "a DRM device (/dev/dri/card0)" PASS "$(sed -n 's/^DRIVER=//p' /sys/class/drm/card0/device/uevent 2>/dev/null)"
+else
+    check "a DRM device (/dev/dri/card0)" FAIL "no Linux display driver took the GPU"
+fi
+[ -e /dev/dri/renderD128 ] && check "a render node (/dev/dri/renderD128)" PASS || check "a render node (/dev/dri/renderD128)" FAIL
+save "the GPU report"
+
+# 2. KMS from a program: Kestrel's own test of the DRM interface
+cat /proc/dri > $D/dri-state-boot.txt 2>&1
+if [ -x /bin/drmtest ] && [ -e /dev/dri/card0 ]; then
+    timeout 120 /bin/drmtest > $D/drmtest.txt 2>&1
+    rc=$?
+    [ $rc = 0 ] && check "drmtest" PASS || check "drmtest" FAIL "exit $rc, $(grep -c FAIL $D/drmtest.txt) failed"
+fi
+save "drmtest"
+
+# 3. the X server on the DRM device
+if ! command -v Xorg >/dev/null 2>&1 || ! command -v xwd >/dev/null 2>&1; then
+    check "the X desktop" SKIP "this root has no Xorg (the Firefox root does)"
+    save "done"; say "done"; exit 0
+fi
+/bin/startx > $D/startx.txt 2>&1 &
+i=0; while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 120 ]; do sleep 1; i=$((i + 1)); done
+sleep 20                                         # the desktop draws itself
+cp /var/log/Xorg.0.log $D/Xorg.0.log 2>/dev/null
+if [ -S /tmp/.X11-unix/X0 ] && xrandr --verbose > $D/xrandr.txt 2>&1; then
+    check "the X server" PASS "$(grep -c ' connected' $D/xrandr.txt) monitor(s)"
+else
+    check "the X server" FAIL "no display :0 after ${i}s"
+    save "X"; say "done"; exit 1
+fi
+grep -q "glamor initialized" $D/Xorg.0.log && check "X acceleration (glamor)" PASS || check "X acceleration (glamor)" FAIL "$(grep -m1 'glamor' $D/Xorg.0.log)"
+cat /proc/dri > $D/dri-state-x.txt 2>&1
+shot desktop
+save "the X server"
+
+# 4. OpenGL: the renderer, then glxgears' frame rate
+glxinfo -B > $D/glxinfo.txt 2>&1
+eglinfo -B > $D/eglinfo.txt 2>&1
+r=$(sed -n 's/^OpenGL renderer string: //p' $D/glxinfo.txt)
+case "$r" in
+    "")                 check "OpenGL (GLX)" FAIL "glxinfo: $(head -1 $D/glxinfo.txt)" ;;
+    *llvmpipe*|*softpipe*)
+        case "$r" in virgl*) check "OpenGL on the GPU" PASS "$r" ;; *) check "OpenGL on the GPU" FAIL "software rendering: $r" ;; esac ;;
+    *)                  check "OpenGL on the GPU" PASS "$r" ;;
+esac
+save "glxinfo"
+vblank_mode=0 timeout $((GEARS_S + 10)) glxgears -info > $D/glxgears.txt 2>&1 &
+sleep $((GEARS_S / 2))
+shot glxgears
+sleep $((GEARS_S / 2))
+pkill glxgears 2>/dev/null; sleep 1
+fps=$(sed -n 's/.* = \([0-9.]*\) FPS$/\1/p' $D/glxgears.txt | tail -1)
+[ -n "$fps" ] && check "glxgears" PASS "$fps FPS (vblank off)" || check "glxgears" FAIL "$(tail -1 $D/glxgears.txt)"
+cat /proc/dri > $D/dri-state-end.txt 2>&1
+save "done"
+say "done: the results are in RESULTS.TAR and REPORT.TXT on the stick"
+wait

@@ -8,7 +8,9 @@
  *                    the /sys entries libdrm finds the device by, and
  *                    PRIME: a buffer as a dma-buf descriptor (its size,
  *                    mapping, CPU-access ioctl and fences as a sync file),
- *                    imported again here and through a second open
+ *                    imported again here and through a second open, and
+ *                    sync objects (binary and timeline, as descriptors and
+ *                    sync files, and an eventfd on a timeline point)
  *   drmtest -h N     ... and keep the picture on screen for N seconds
  *                    (colour bars), so the host can take a screenshot
  * Exit status 0 = every check passed; 77 = no DRM device (skipped). */
@@ -22,6 +24,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -297,6 +300,100 @@ static void check_prime(int fd)
     CHECK(close(pfd) == 0, "the dma-buf closes");
 }
 
+/* sync objects (DRM_CAP_SYNCOBJ): binary and timeline ones, their
+ * descriptors and sync files, and an eventfd that a timeline point signals */
+struct drm_syncobj_create { uint32_t handle, flags; };
+struct drm_syncobj_destroy { uint32_t handle, pad; };
+struct drm_syncobj_handle { uint32_t handle, flags; int32_t fd; uint32_t pad; };
+struct drm_syncobj_wait {
+    uint64_t handles; int64_t timeout_nsec;
+    uint32_t count_handles, flags, first_signaled, pad; uint64_t deadline_nsec;
+};
+struct drm_syncobj_timeline_wait {
+    uint64_t handles, points; int64_t timeout_nsec;
+    uint32_t count_handles, flags, first_signaled, pad; uint64_t deadline_nsec;
+};
+struct drm_syncobj_eventfd { uint32_t handle, flags; uint64_t point; int32_t fd; uint32_t pad; };
+struct drm_syncobj_array { uint64_t handles; uint32_t count_handles, pad; };
+struct drm_syncobj_timeline_array { uint64_t handles, points; uint32_t count_handles, flags; };
+#define DRM_CAP_SYNCOBJ                      0x13
+#define DRM_CAP_SYNCOBJ_TIMELINE             0x14
+#define DRM_SYNCOBJ_CREATE_SIGNALED          1
+#define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE 1
+#define DRM_IOCTL_SYNCOBJ_CREATE             _IOWR('d', 0xBF, struct drm_syncobj_create)
+#define DRM_IOCTL_SYNCOBJ_DESTROY            _IOWR('d', 0xC0, struct drm_syncobj_destroy)
+#define DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD       _IOWR('d', 0xC1, struct drm_syncobj_handle)
+#define DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE       _IOWR('d', 0xC2, struct drm_syncobj_handle)
+#define DRM_IOCTL_SYNCOBJ_WAIT               _IOWR('d', 0xC3, struct drm_syncobj_wait)
+#define DRM_IOCTL_SYNCOBJ_RESET              _IOWR('d', 0xC4, struct drm_syncobj_array)
+#define DRM_IOCTL_SYNCOBJ_SIGNAL             _IOWR('d', 0xC5, struct drm_syncobj_array)
+#define DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT      _IOWR('d', 0xCA, struct drm_syncobj_timeline_wait)
+#define DRM_IOCTL_SYNCOBJ_QUERY              _IOWR('d', 0xCB, struct drm_syncobj_timeline_array)
+#define DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL    _IOWR('d', 0xCD, struct drm_syncobj_timeline_array)
+#define DRM_IOCTL_SYNCOBJ_EVENTFD            _IOWR('d', 0xCF, struct drm_syncobj_eventfd)
+
+static void check_syncobj(int fd)
+{
+    struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ }, tcap = { .capability = DRM_CAP_SYNCOBJ_TIMELINE };
+    if (xioctl(fd, DRM_IOCTL_GET_CAP, &cap) != 0 || cap.value != 1) {
+        printf("drmtest:        no sync objects (the driver does not offer them)\n");
+        return;
+    }
+    /* binary: created signalled, reset, signalled again */
+    struct drm_syncobj_create c = { .flags = DRM_SYNCOBJ_CREATE_SIGNALED };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &c) == 0 && c.handle, "SYNCOBJ_CREATE (signalled)");
+    struct drm_syncobj_wait w = { .handles = (uintptr_t)&c.handle, .count_handles = 1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &w) == 0, "SYNCOBJ_WAIT returns at once on a signalled one");
+    struct drm_syncobj_array a = { .handles = (uintptr_t)&c.handle, .count_handles = 1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &a) == 0 && ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &w) < 0 && errno == EINVAL,
+          "after SYNCOBJ_RESET there is nothing to wait for (EINVAL)");
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &a) == 0 && xioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &w) == 0,
+          "SYNCOBJ_SIGNAL signals it again");
+
+    /* as a descriptor, and as a sync file */
+    struct drm_syncobj_handle h = { .handle = c.handle, .fd = -1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &h) == 0 && h.fd >= 0, "SYNCOBJ_HANDLE_TO_FD gives a descriptor");
+    struct drm_syncobj_handle back = { .fd = h.fd };
+    CHECK(h.fd >= 0 && xioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &back) == 0 && back.handle && back.handle != c.handle,
+          "SYNCOBJ_FD_TO_HANDLE makes a new handle for it");
+    if (h.fd >= 0) close(h.fd);
+    struct drm_syncobj_handle sf = { .handle = c.handle, .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE, .fd = -1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &sf) == 0 && sf.fd >= 0, "its fence as a sync file");
+    struct pollfd p = { .fd = sf.fd, .events = POLLIN };
+    CHECK(sf.fd >= 0 && poll(&p, 1, 0) == 1 && (p.revents & POLLIN), "the sync file polls ready");
+    if (sf.fd >= 0) close(sf.fd);
+    struct drm_syncobj_destroy d = { .handle = back.handle };
+    if (back.handle) xioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d);
+    d.handle = c.handle;
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d) == 0 && ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d) < 0 && errno == EINVAL,
+          "SYNCOBJ_DESTROY, then the handle is gone");
+
+    if (xioctl(fd, DRM_IOCTL_GET_CAP, &tcap) != 0 || tcap.value != 1) return;
+    /* timeline: a point signalled, queried, waited for; an eventfd on a later point */
+    struct drm_syncobj_create t = { 0 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &t) == 0, "a timeline sync object");
+    uint64_t point = 5, got = 0;
+    struct drm_syncobj_timeline_array ta = { .handles = (uintptr_t)&t.handle, .points = (uintptr_t)&point, .count_handles = 1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &ta) == 0, "SYNCOBJ_TIMELINE_SIGNAL point 5");
+    struct drm_syncobj_timeline_array q = { .handles = (uintptr_t)&t.handle, .points = (uintptr_t)&got, .count_handles = 1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &q) == 0 && got == 5, "SYNCOBJ_QUERY says 5");
+    uint64_t three = 3;
+    struct drm_syncobj_timeline_wait tw = { .handles = (uintptr_t)&t.handle, .points = (uintptr_t)&three, .count_handles = 1 };
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &tw) == 0, "SYNCOBJ_TIMELINE_WAIT for point 3 returns at once");
+    int efd = eventfd(0, EFD_CLOEXEC);
+    struct drm_syncobj_eventfd ev = { .handle = t.handle, .point = 7, .fd = efd };
+    CHECK(efd >= 0 && xioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev) == 0, "SYNCOBJ_EVENTFD on point 7");
+    struct pollfd ep = { .fd = efd, .events = POLLIN };
+    CHECK(efd >= 0 && poll(&ep, 1, 0) == 0, "the eventfd waits while point 7 is not signalled");
+    point = 7;
+    uint64_t n = 0;
+    CHECK(xioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &ta) == 0 && efd >= 0 && poll(&ep, 1, 2000) == 1 &&
+          read(efd, &n, sizeof n) == (ssize_t)sizeof n && n >= 1, "signalling point 7 wakes the eventfd");
+    if (efd >= 0) close(efd);
+    d.handle = t.handle;
+    xioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d);
+}
+
 int main(int argc, char **argv)
 {
     int hold = argc > 2 && !strcmp(argv[1], "-h") ? atoi(argv[2]) : 0;
@@ -440,6 +537,7 @@ int main(int argc, char **argv)
     }
 
     check_prime(fd);
+    check_syncobj(fd);
 
     /* tidy up: the terminal comes back when the file closes */
     munmap(rest, b.size - half);
