@@ -282,34 +282,16 @@ void storage_shutdown(void)
 }
 
 /* ---- /dev/sdX: read-only byte-addressable view of each disk --------------- */
-#define SD_BOUNCE (64 * 1024)
-
+/* Through the block layer, which sends a port one request at a time
+ * (block.c: disk_lock), as for the disk's sataN node. */
 static ssize_t sd_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
 {
-    struct ahci_disk *d = vn->ctx;
-    uint64_t size = d->sectors * d->sector_size;
+    struct blkdev *b = vn->ctx;
+    uint64_t size = blk_size_bytes(b);
     if (off >= size) return 0;
-    if (len > size - off) len = size - off;
-
-    uint8_t *bounce = kmalloc(SD_BOUNCE);          /* heap = identity-mapped PMM memory */
-    if (!bounce) return -ENOMEM;
-    size_t done = 0;
-    while (done < len) {
-        uint64_t pos = off + done;
-        uint64_t lba = pos / d->sector_size;
-        uint32_t skip = (uint32_t)(pos % d->sector_size);
-        uint32_t secs = (uint32_t)((skip + (len - done) + d->sector_size - 1) / d->sector_size);
-        if (secs > SD_BOUNCE / d->sector_size) secs = SD_BOUNCE / d->sector_size;
-        if (secs > d->sectors - lba) secs = (uint32_t)(d->sectors - lba);
-        int rc = ahci_read(d, lba, secs, bounce);
-        if (rc != AHCI_OK) { kfree(bounce); return done ? (ssize_t)done : -EIO; }
-        size_t chunk = (size_t)secs * d->sector_size - skip;
-        if (chunk > len - done) chunk = len - done;
-        memcpy((uint8_t *)buf + done, bounce + skip, chunk);
-        done += chunk;
-    }
-    kfree(bounce);
-    return (ssize_t)done;
+    if (len > size - off) len = (size_t)(size - off);
+    if (len > (1u << 20)) len = 1u << 20;           /* bounded per call */
+    return blk_read_bytes(b, off, buf, len) < 0 ? -EIO : (ssize_t)len;
 }
 
 static ssize_t sd_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
@@ -318,13 +300,9 @@ static ssize_t sd_write(struct vnode *vn, const void *buf, size_t len, uint64_t 
     return -EROFS;          /* raw writes deliberately disabled; see ahci_write() */
 }
 
-static uint64_t sd_size(struct vnode *vn)
-{
-    struct ahci_disk *d = vn->ctx;
-    return d->sectors * d->sector_size;
-}
+static uint64_t sd_size(struct vnode *vn) { return blk_size_bytes(vn->ctx); }
 
-static const struct vnode_ops sd_ops = { .read = sd_read, .write = sd_write, .size = sd_size };
+static const struct vnode_ops sd_ops = { .read = sd_read, .write = sd_write, .size = sd_size, .nolock = true };
 
 /* ---- block layer: "sataN" disks with MBR/GPT partitions ------------------ */
 static int sata_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
@@ -367,10 +345,12 @@ static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read, .write = nvme
 
 void storage_register_devices(void)
 {
+    struct blkdev *sata[26] = { 0 };                    /* /dev/sdX reads through these */
     for (int i = 0; i < ahci_disk_count(); i++) {
         struct ahci_disk *d = ahci_disk_get(i);
         struct blkdev *b = blk_register_disk("sata", BLK_DISK_SATA, d->model, d->sector_size, d->sectors, &sata_ops, d);
         if (b) blk_scan_partitions(b);
+        if (i < 26) sata[i] = b;
     }
     for (int i = 0; i < nvme_namespace_count(); i++) {
         struct nvme_namespace *ns = nvme_namespace_get(i);
@@ -379,10 +359,11 @@ void storage_register_devices(void)
     }
     virtio_blk_register();
     for (int i = 0; i < ahci_disk_count() && i < 26; i++) {
+        if (!sata[i]) continue;
         char name[8] = "sda";
         name[2] = (char)('a' + i);
         struct vnode *vn = devfs_register(name, 0440, (8u << 8) | (uint32_t)(i * 16),
-                                          &sd_ops, ahci_disk_get(i));
+                                          &sd_ops, sata[i]);
         if (vn) kprintf("storage: /dev/%s -> AHCI port %d (%s)\n", name,
                         ahci_disk_get(i)->port, ahci_disk_get(i)->model);
     }

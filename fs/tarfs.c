@@ -70,7 +70,8 @@ static ssize_t tar_write(struct vnode *vn, const void *buf, size_t len, uint64_t
     (void)vn; (void)buf; (void)len; (void)off;
     return -EROFS;
 }
-static const struct vnode_ops tar_file_ops = { .read = tar_read, .write = tar_write };
+/* blk_read takes the big lock itself for a driver that needs it */
+static const struct vnode_ops tar_file_ops = { .read = tar_read, .write = tar_write, .nolock = true };
 
 /* ---- tree construction ------------------------------------------------------ */
 static struct vnode *child(struct vnode *dir, const char *name)
