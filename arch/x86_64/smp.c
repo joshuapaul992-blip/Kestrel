@@ -13,6 +13,7 @@
 #include <kernel/smp.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
+#include <kernel/fpu.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/klog.h>
@@ -303,8 +304,9 @@ __attribute__((noreturn)) static void ap_entry(struct percpu *c)
     c->self = c;
     wrmsr(MSR_GS_BASE, (uint64_t)c);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
-    __asm__ volatile("mov %0, %%cr4" :: "r"(bsp_cr4));  /* SSE (OSFXSR/OSXMMEXCPT), as the boot CPU */
+    __asm__ volatile("mov %0, %%cr4" :: "r"(bsp_cr4));  /* SSE and XSAVE, as the boot CPU */
     __asm__ volatile("mov %0, %%cr0" :: "r"(bsp_cr0));
+    fpu_init_ap();                                      /* XCR0, as the boot CPU */
     wrmsr(MSR_PAT, bsp_pat);                            /* write-combining entry */
     syscall_cpu_init();
     lapic_init_cpu();

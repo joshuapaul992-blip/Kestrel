@@ -1,6 +1,7 @@
 /* fs/procfs.c -- /proc: process and kernel state, generated on every read */
 #include <kernel/smp.h>
 #include <kernel/vfs.h>
+#include <kernel/fpu.h>
 #include <kernel/vm.h>
 #include <kernel/gpu.h>
 #include <kernel/task.h>
@@ -64,6 +65,9 @@ static size_t gen_cpuinfo(char *buf, size_t cap, void *ctx)
     for (int i = 0; i < ncpus; i++) {                   /* one block per online CPU, as on Linux */
         P("processor\t: %d\nvendor_id\t: %s\nmodel name\t: %s\napicid\t\t: %u\n", i, g_boot.cpu_vendor,
           g_boot.cpu_brand, cpus[i].apic_id);
+        char fl[1024];
+        cpu_flags(fl, sizeof fl);
+        P("flags\t\t: %s\n", fl);
         P("timer\t\t: %s @ %d Hz\n\n", apic_enabled() ? "local APIC" : "PIT 8254", PIT_HZ);
     }
     return n;

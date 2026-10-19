@@ -33,6 +33,8 @@
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
+#include <kernel/fpu.h>
+#include <kernel/process.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/time.h>
@@ -271,7 +273,7 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, const stru
         { AT_PAGESZ, UVM_PAGE }, { AT_BASE, interp_base }, { AT_FLAGS, 0 }, { AT_ENTRY, main_img->entry },
         { AT_UID, t->uid }, { AT_EUID, t->uid }, { AT_GID, t->gid }, { AT_EGID, t->gid },
         { AT_PLATFORM, platform }, { AT_HWCAP, cd }, { AT_HWCAP2, 0 }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
-        { AT_RANDOM, random }, { AT_EXECFN, a->argc ? argv_va[0] : platform }, { AT_MINSIGSTKSZ, 2048 },
+        { AT_RANDOM, random }, { AT_EXECFN, a->argc ? argv_va[0] : platform }, { AT_MINSIGSTKSZ, sig_frame_bytes() },
         { vdso ? AT_SYSINFO_EHDR : AT_NULL, vdso }, { AT_NULL, 0 }, { AT_NULL, 0 },
     };
     _Static_assert(sizeof auxv / sizeof *auxv == 22, "nauxv");
@@ -439,13 +441,12 @@ static int process_main(void *arg)
     strlcpy(t->exe, a->path, sizeof t->exe);
     kfree(a);
 
-    /* clean SSE state for the process: x87 reset, MXCSR default. Interrupts
+    /* clean FPU state for the process: x87 reset, MXCSR default. Interrupts
      * stay off from here: the scheduler starts saving this state as soon
      * as t->user is set. */
     cli();
-    __asm__ volatile("fninit; fxsave %0" : "=m"(t->fpu));
-    *(uint32_t *)(t->fpu + 24) = 0x1f80;
-    __asm__ volatile("fxrstor %0" :: "m"(t->fpu));
+    memcpy(task_fpu(t), fpu_clean(), fpu_size);
+    fpu_restore(task_fpu(t));
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
     t->gs_base = 0;

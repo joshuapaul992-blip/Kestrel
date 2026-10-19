@@ -2,6 +2,7 @@
 #include <kernel/uvm.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
+#include <kernel/fpu.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
 
@@ -38,6 +39,7 @@ void uvm_init(void)
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
     __asm__ volatile("fninit");
+    fpu_init();                             /* XSAVE and AVX where the CPU has them */
     kprintf("uvm: kernel PML4 %lx, %d shared PDPTs pre-allocated; user space %lx-%lx\n",
             kernel_pml4, added, (uint64_t)UVM_USER_START, (uint64_t)(UVM_USER_END - 1));
 }

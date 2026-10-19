@@ -19,6 +19,7 @@
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
+#include <kernel/fpu.h>
 #include <kernel/arch.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
@@ -306,7 +307,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->gs_base = rdmsr(0xC0000102);                     /* the parent's user GS (swapped out) */
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
     c->robust_list = 0;
-    __asm__ volatile("fxsave %0" : "=m"(c->fpu));       /* the parent's live SSE state */
+    fpu_save(task_fpu(c));                              /* the parent's live FPU state */
     c->uid = p->uid;
     c->gid = p->gid;
     c->tty = p->tty;
@@ -379,19 +380,6 @@ static int64_t copy_vector(uint64_t uv, char ***out, int *count, size_t *bytes)
     *out = v;
     *count = n;
     return 0;
-}
-
-static const uint8_t *clean_fpu(void)
-{
-    static uint8_t img[512] __attribute__((aligned(16)));
-    static bool done;
-    if (!done) {
-        memset(img, 0, sizeof img);
-        *(uint16_t *)(img + 0) = 0x037f;                /* FCW: x87 default      */
-        *(uint32_t *)(img + 24) = 0x1f80;               /* MXCSR: SSE default    */
-        done = true;
-    }
-    return img;
 }
 
 /* execve in a multi-threaded process: end the other threads first. The
@@ -514,8 +502,8 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     strlcpy(t->name, base, sizeof t->name);
     spin_unlock_irqrestore(&proc_lock, fl);
     fl = irq_save();
-    memcpy(t->fpu, clean_fpu(), sizeof t->fpu);
-    __asm__ volatile("fxrstor %0" :: "m"(t->fpu));
+    memcpy(task_fpu(t), fpu_clean(), fpu_size);
+    fpu_restore(task_fpu(t));
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
     t->gs_base = 0;
@@ -926,6 +914,35 @@ _Static_assert(sizeof(struct ksiginfo) == 128, "siginfo layout");
 
 static bool user_code(uint64_t a) { return uvm_range_ok(a, 1); }
 
+#define FP_XSTATE_MAGIC1    0x46505853u         /* "FPXS", in the frame's sw_reserved bytes */
+#define FP_XSTATE_MAGIC2    0x46505845u         /* "FPXE", after the XSAVE area */
+#define UC_FP_XSTATE        0x1
+
+/* A signal frame's FPU state, from user memory into `buf` (64-byte aligned,
+ * FPU_AREA_MAX bytes), made safe to restore: XRSTOR and FXRSTOR fault on
+ * reserved MXCSR bits, on features XCR0 does not enable and on a non-zero
+ * compaction or reserved header. A frame without the XSAVE magic (built by
+ * hand, or for FXSAVE) gives x87 and SSE; everything else starts afresh. */
+static bool fpu_from_user(uint8_t *buf, uint64_t ufp)
+{
+    memset(buf, 0, FPU_AREA_MAX);
+    if (copy_from_user(buf, (const void *)ufp, 512)) return false;
+    *(uint32_t *)(buf + 24) &= fpu_mxcsr_mask;
+    if (!fpu_xfeatures) return true;
+    uint32_t magic1 = *(uint32_t *)(buf + 464), ext = *(uint32_t *)(buf + 468);
+    uint64_t feats = *(uint64_t *)(buf + 472);
+    uint32_t size = *(uint32_t *)(buf + 480), magic2 = 0;
+    uint64_t bv = XFEATURE_X87 | XFEATURE_SSE;
+    if (magic1 == FP_XSTATE_MAGIC1 && size == fpu_size && ext == size + 4 &&
+        !copy_from_user(&magic2, (const void *)(ufp + size), 4) && magic2 == FP_XSTATE_MAGIC2) {
+        if (copy_from_user(buf + 512, (const void *)(ufp + 512), size - 512)) return false;
+        bv = *(uint64_t *)(buf + 512) & feats;
+    }
+    memset(buf + 512, 0, 64);                           /* XSAVE header: no compaction */
+    *(uint64_t *)(buf + 512) = bv & fpu_xfeatures;
+    return true;
+}
+
 /* Build the frame in kernel memory, then copy it to the user stack in one
  * checked copy: a bad or unmapped stack (or one another thread unmaps right
  * now) makes delivery fail cleanly, and the process dies of SIGSEGV. */
@@ -937,15 +954,28 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, const struc
     if ((k->flags & SA_ONSTACK) && t->alt_size && !sig_on_altstack(t, f->rsp))
         sp = t->alt_sp + t->alt_size;                   /* sigaltstack(): a fresh stack */
     uint64_t top = sp + 128 > f->rsp ? sp : f->rsp;
-    uint64_t fpu = (sp - 512) & ~63ull;
+    size_t fpu_bytes = fpu_xfeatures ? fpu_size + 4 : 512;  /* XSAVE: and FP_XSTATE_MAGIC2 */
+    uint64_t fpu = (sp - fpu_bytes) & ~63ull;
     uint64_t frame = ((fpu - sizeof(struct rt_sigframe)) & ~15ull) - 8;   /* rsp+8 16-aligned */
     if (frame < UVM_USER_START || top > UVM_USER_END || !user_range_ok(frame, top - frame)) return false;
 
-    uint8_t fxbuf[512] __attribute__((aligned(16)));
     struct rt_sigframe fr;
     memset(&fr, 0, sizeof fr);
-    __asm__ volatile("fxsave %0" : "=m"(fxbuf));
-    if (copy_to_user((void *)fpu, fxbuf, sizeof fxbuf)) return false;
+    uint8_t *raw = kmalloc(FPU_AREA_MAX + 128), *xbuf = (uint8_t *)(((uintptr_t)raw + 63) & ~63ull);
+    if (!raw) return false;
+    fpu_save(xbuf);
+    if (fpu_xfeatures) {                                /* struct _fpx_sw_bytes, as Linux */
+        memset(xbuf + 464, 0, 48);
+        *(uint32_t *)(xbuf + 464) = FP_XSTATE_MAGIC1;
+        *(uint32_t *)(xbuf + 468) = (uint32_t)fpu_size + 4;     /* extended_size */
+        *(uint64_t *)(xbuf + 472) = fpu_xfeatures;
+        *(uint32_t *)(xbuf + 480) = (uint32_t)fpu_size;         /* xstate_size */
+        *(uint32_t *)(xbuf + fpu_size) = FP_XSTATE_MAGIC2;
+        fr.uc.uc_flags = UC_FP_XSTATE;
+    }
+    int err = copy_to_user((void *)fpu, xbuf, fpu_bytes);
+    kfree(raw);
+    if (err) return false;
 
     fr.pretcode = k->restorer;
     struct sigctx *m = &fr.uc.mc;
@@ -986,8 +1016,15 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, const struc
 
     t->saved_mask_valid = false;
     set_mask(t, t->sig_mask | k->mask | ((k->flags & SA_NODEFER) ? 0 : sigbit(sig)));
-    __asm__ volatile("fxrstor %0" :: "m"(*(const uint8_t (*)[512])clean_fpu()));
+    fpu_restore(fpu_clean());
     return true;
+}
+
+/* What setup_frame() puts on the stack at most, with its alignment */
+uint64_t sig_frame_bytes(void)
+{
+    uint64_t n = sizeof(struct rt_sigframe) + (fpu_xfeatures ? fpu_size + 4 : 512) + 64 + 16;
+    return n > 2048 ? n : 2048;
 }
 
 bool sig_on_altstack(const struct tcb *t, uint64_t sp)
@@ -1085,11 +1122,13 @@ int64_t sig_return(void)
     if (!user_code(m->rip) || !uvm_range_ok(m->rsp, 1)) goto bad;
 
     if (m->fpstate) {
-        uint8_t buf[512] __attribute__((aligned(16)));
         if (m->fpstate & 15) goto bad;
-        if (copy_from_user(buf, (const void *)m->fpstate, sizeof buf)) goto bad;
-        *(uint32_t *)(buf + 24) &= 0xffbf;              /* reserved MXCSR bits would #GP */
-        __asm__ volatile("fxrstor %0" :: "m"(buf));
+        uint8_t *raw = kmalloc(FPU_AREA_MAX + 128), *buf = (uint8_t *)(((uintptr_t)raw + 63) & ~63ull);
+        if (!raw) goto bad;
+        bool ok = fpu_from_user(buf, m->fpstate);
+        if (ok) fpu_restore(buf);
+        kfree(raw);
+        if (!ok) goto bad;
     }
     f->r8 = m->r8; f->r9 = m->r9; f->r10 = m->r10; f->r11 = m->r11;
     f->r12 = m->r12; f->r13 = m->r13; f->r14 = m->r14; f->r15 = m->r15;

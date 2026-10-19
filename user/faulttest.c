@@ -8,6 +8,8 @@
  *    si_code / si_addr, delivered to SA_SIGINFO handlers; unhandled (or
  *    blocked) ones end the process with that signal; a signal that cannot
  *    be delivered because the stack is bad ends it with SIGSEGV.
+ * 3. Where the CPU has AVX, YMM registers survive signal handlers (which
+ *    start clean and may change the saved state) and context switches.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -29,6 +31,8 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <sched.h>
+#include <sys/auxv.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -99,6 +103,89 @@ static void child_bad_stack(void)
     /* kill(self, SIGUSR1) with a stack pointer the frame cannot go to */
     __asm__ volatile("mov $0x10, %%rsp\n\tmov $62, %%eax\n\tmov %0, %%rdi\n\tmov $10, %%esi\n\tsyscall\n\tud2"
                      :: "r"(pid) : "rax", "rdi", "rsi", "rcx", "r11", "memory");
+}
+
+
+/* ---- AVX state across signals and context switches ----------------------- */
+#include <cpuid.h>
+#include <sys/ucontext.h>
+
+static int avx_usable(void)
+{
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27)) || !(c & (1u << 28))) return 0;   /* OSXSAVE, AVX */
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;                               /* XCR0: SSE and YMM */
+}
+
+static void ymm_load(const unsigned char v[32]) { __asm__ volatile("vmovdqu %0, %%ymm5" :: "m"(*(const unsigned char (*)[32])v) : "xmm5"); }
+static void ymm_store(unsigned char v[32]) { __asm__ volatile("vmovdqu %%ymm5, %0" : "=m"(*(unsigned char (*)[32])v)); }
+
+static volatile int avx_frame_ok, avx_handler_clean;
+static unsigned ymm_hi_off;                             /* CPUID 0xD.2: YMM_Hi128's offset */
+
+static void on_usr1_avx(int sig, siginfo_t *si, void *ucv)
+{
+    (void)sig; (void)si;
+    ucontext_t *uc = ucv;
+    unsigned char *fp = (unsigned char *)uc->uc_mcontext.fpregs, now[32];
+    ymm_store(now);                                     /* the handler starts from a reset state */
+    int zero = 1;
+    for (int i = 0; i < 32; i++) if (now[i]) zero = 0;
+    avx_handler_clean = zero;
+    unsigned char clobber[32];
+    memset(clobber, 0xEE, sizeof clobber);
+    ymm_load(clobber);
+    /* the interrupted ymm5: low half in the FXSAVE area, high half in YMM_Hi128 */
+    avx_frame_ok = (uc->uc_flags & 1) && *(unsigned *)(fp + 464) == 0x46505853u &&
+                   fp[160 + 5 * 16] == 0x15 && fp[ymm_hi_off + 5 * 16] == 0x35;
+    fp[ymm_hi_off + 5 * 16 + 15] = 0x77;                /* changed in the frame: sigreturn loads it */
+}
+
+static int ymm_switches(void)
+{
+    unsigned char mine[32], back[32];
+    for (int i = 0; i < 32; i++) mine[i] = (unsigned char)(getpid() * 7 + i);
+    ymm_load(mine);
+    for (int n = 0; n < 20000; n++) {
+        if ((n & 63) == 0) sched_yield();
+        ymm_store(back);
+        if (memcmp(mine, back, 32)) return 1;
+    }
+    return 0;
+}
+
+static void test_avx(void)
+{
+    if (!avx_usable()) { printf("  skip  AVX: not offered by this CPU (QEMU needs -cpu max)\n"); return; }
+    unsigned a, b, c, d;
+    __cpuid_count(0xD, 2, a, b, c, d);
+    ymm_hi_off = b;
+    CHECK(a == 256 && b >= 576, "XSAVE reports a 256-byte YMM_Hi128 component");
+    long minsig = (long)getauxval(AT_MINSIGSTKSZ);
+    CHECK(minsig >= 2048, "AT_MINSIGSTKSZ is at least 2048");
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_usr1_avx;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa, NULL);
+    unsigned char v[32], after[32];
+    for (int i = 0; i < 16; i++) { v[i] = (unsigned char)(0x15 + i); v[16 + i] = (unsigned char)(0x35 + i); }
+    ymm_load(v);
+    kill(getpid(), SIGUSR1);
+    ymm_store(after);
+    CHECK(avx_handler_clean, "a signal handler starts with clean YMM registers");
+    CHECK(avx_frame_ok, "the signal frame holds the XSAVE state, with Linux's magic numbers");
+    v[31] = 0x77;
+    CHECK(!memcmp(v, after, 32), "YMM registers come back after the handler, with the frame's changes");
+
+    int bad = 0;
+    pid_t kids[8];
+    for (int i = 0; i < 8; i++) if ((kids[i] = fork()) == 0) _exit(ymm_switches());
+    for (int i = 0; i < 8; i++) { int st; waitpid(kids[i], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) bad++; }
+    CHECK(!bad, "8 processes keep their own YMM registers across context switches");
 }
 
 int main(void)
@@ -208,6 +295,9 @@ int main(void)
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "runaway recursion: SIGSEGV, not a kernel problem");
     st = in_child(child_bad_stack);
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "signal with an unusable stack: SIGSEGV");
+
+    /* ---- 3. AVX state ---------------------------------------------------- */
+    test_avx();
 
     printf(failures ? "faulttest: FAILED (%d)\n" : "faulttest: all checks passed\n", failures);
     return failures ? 1 : 0;
