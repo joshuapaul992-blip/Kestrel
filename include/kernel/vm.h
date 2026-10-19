@@ -98,9 +98,11 @@ struct mm {
     bool         oom_victim;    /* the OOM killer is waiting for it to go   */
 };
 
+/* With interrupts on; may sleep. Needs no lock held (it takes the big
+ * kernel lock where it must, see vm.c). */
 int vm_fault(uint64_t addr, uint64_t err, bool user_mode);   /* 0, -EFAULT, -EACCES, -EIO, -ENOMEM */
-/* A user-mode fault resolved without the big kernel lock, interrupts off:
- * true if done, false to go through vm_fault() under the lock. */
+/* A user-mode fault resolved with interrupts off and no sleeping: true if
+ * done, false to go through vm_fault(). */
 bool vm_fault_fast(uint64_t addr, uint64_t err);
 
 struct mm *mm_create(void);                 /* empty address space; NULL on OOM */
