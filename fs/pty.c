@@ -150,7 +150,7 @@ static void group_signal(struct pty *p, int sig)
     if (!p->fg_pgrp) return;
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
-        if (t->state != TASK_UNUSED && t->user && t->pid == t->tgid && t->signal->nr_threads > 0 &&
+        if (t->state != TASK_UNUSED && t->user && t->pid == t->tgid && t->signal && t->signal->nr_threads > 0 &&
             t->pgid == p->fg_pgrp)
             signal_send_locked(t, sig);                 /* to each process once, via its leader */
     }
