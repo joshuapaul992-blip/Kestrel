@@ -513,8 +513,17 @@ static int pci_bus_probe(struct device *dev)
         put_device(dev);
         if (r > 0) r = -EINVAL;                         /* Linux treats positive as failure too */
         lkpi_display_reclaim(pdev->lkpi_handle);        /* if it had taken the boot display over */
+    } else {
+        lkpi_sysfs_pci_driver(pdev->lkpi_handle, pdrv->name);
     }
     return r;
+}
+
+void *lkpi_pci_handle_of(struct device *dev)
+{
+    for (; dev; dev = dev->parent)
+        if (dev->bus == &pci_bus_type) return to_pci_dev(dev)->lkpi_handle;
+    return NULL;
 }
 
 static void pci_bus_remove(struct device *dev)

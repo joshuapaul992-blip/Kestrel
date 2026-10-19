@@ -296,14 +296,7 @@ void lkpi_pci_write(void *handle, int off, int size, unsigned int v)
 {
     struct pci_device *d = handle;
     if (off < 0 || off + size > 256) return;
-    if (size == 4) { pci_write32(d->bus, d->device, d->function, (uint8_t)off, v); return; }
-    uint32_t addr = 0x80000000u | ((uint32_t)d->bus << 16) | ((uint32_t)(d->device & 0x1F) << 11) |
-                    ((uint32_t)(d->function & 0x07) << 8) | ((uint32_t)off & 0xFC);
-    uint64_t f = irq_save();
-    outl(0xCF8, addr);
-    if (size == 1) outb((uint16_t)(0xCFC + (off & 3)), (uint8_t)v);
-    else outw((uint16_t)(0xCFC + (off & 2)), (uint16_t)v);
-    irq_restore(f);
+    pci_cfg_write(d->bus, d->device, d->function, (uint8_t)off, size, v);
 }
 
 int lkpi_pci_msi_enable(void *handle, void (*fn)(void *), void *arg, const char *name)

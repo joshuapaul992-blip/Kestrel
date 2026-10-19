@@ -33,17 +33,21 @@ extern uint8_t  pci_hook_inb(uint16_t port);
 typedef int irqstate_t;
 static inline irqstate_t irq_off(void) { return 0; }
 static inline void irq_restore_state(irqstate_t s) { (void)s; }
+static inline irqstate_t cfg_lock(void) { return 0; }
+static inline void cfg_unlock(irqstate_t s) { (void)s; }
 #else
 static inline void port_outl(uint16_t port, uint32_t v) { __asm__ volatile("outl %0, %1" :: "a"(v), "Nd"(port)); }
 static inline uint32_t port_inl(uint16_t port) { uint32_t v; __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline void port_outb(uint16_t port, uint8_t v)  { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(port)); }
 static inline uint8_t port_inb(uint16_t port) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 
-/* The 0xCF8/0xCFC pair is a two-step protocol: an interrupt handler that
- * also touches config space between the two steps would corrupt the
- * access, so each access runs with interrupts disabled. (SMP kernels must
- * additionally hold a spinlock around these sections.) */
+/* The 0xCF8/0xCFC pair is a two-step protocol: an interrupt handler or
+ * another CPU that also touches config space between the two steps would
+ * corrupt the access, so each access runs with interrupts disabled and
+ * holds a spinning lock (drivers off the big kernel lock and /sys's config
+ * files read config space on any CPU). */
 typedef uint64_t irqstate_t;
+static volatile char cfg_busy;
 static inline irqstate_t irq_off(void)
 {
     uint64_t f;
@@ -53,6 +57,18 @@ static inline irqstate_t irq_off(void)
 static inline void irq_restore_state(irqstate_t f)
 {
     if (f & (1u << 9)) __asm__ volatile("sti" ::: "memory");
+}
+static inline irqstate_t cfg_lock(void)
+{
+    irqstate_t f = irq_off();
+    while (__atomic_test_and_set(&cfg_busy, __ATOMIC_ACQUIRE))
+        while (cfg_busy) __asm__ volatile("pause");
+    return f;
+}
+static inline void cfg_unlock(irqstate_t f)
+{
+    __atomic_clear(&cfg_busy, __ATOMIC_RELEASE);
+    irq_restore_state(f);
 }
 #endif
 
@@ -101,10 +117,10 @@ static inline uint32_t cfg_address(uint8_t bus, uint8_t dev, uint8_t func, uint8
 
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off)
 {
-    irqstate_t s = irq_off();
+    irqstate_t s = cfg_lock();
     port_outl(PCI_CONFIG_ADDRESS, cfg_address(bus, dev, func, off));
     uint32_t v = port_inl(PCI_CONFIG_DATA);
-    irq_restore_state(s);
+    cfg_unlock(s);
     g_stats.config_reads++;
     return v;
 }
@@ -124,10 +140,10 @@ uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off)
 
 void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v)
 {
-    irqstate_t s = irq_off();
+    irqstate_t s = cfg_lock();
     port_outl(PCI_CONFIG_ADDRESS, cfg_address(bus, dev, func, off));
     port_outl(PCI_CONFIG_DATA, v);
-    irq_restore_state(s);
+    cfg_unlock(s);
 }
 
 /* Read-modify-write of the containing dword. Do not use this on registers
@@ -141,6 +157,36 @@ void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint16_t v
     pci_write32(bus, dev, func, off, d);
 }
 
+#ifndef PCI_PORT_IO_HOOKS
+/* Configuration cycles of the given size (1, 2 or 4) at 0xCFC + (off & 3):
+ * for devices that decode the access size, and for writes that must not
+ * touch the neighbouring bytes (pci_write16 rewrites the whole dword). */
+uint32_t pci_cfg_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, int size)
+{
+    uint16_t port = (uint16_t)(PCI_CONFIG_DATA + (off & (size == 1 ? 3 : 2)));
+    uint32_t v;
+    irqstate_t s = cfg_lock();
+    port_outl(PCI_CONFIG_ADDRESS, cfg_address(bus, dev, func, off));
+    if (size == 1)      v = port_inb(port);
+    else if (size == 2) { uint16_t w; __asm__ volatile("inw %1, %0" : "=a"(w) : "Nd"(port)); v = w; }
+    else                v = port_inl(PCI_CONFIG_DATA);
+    cfg_unlock(s);
+    g_stats.config_reads++;
+    return v;
+}
+
+void pci_cfg_write(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, int size, uint32_t v)
+{
+    uint16_t port = (uint16_t)(PCI_CONFIG_DATA + (off & (size == 1 ? 3 : 2)));
+    irqstate_t s = cfg_lock();
+    port_outl(PCI_CONFIG_ADDRESS, cfg_address(bus, dev, func, off));
+    if (size == 1)      port_outb(port, (uint8_t)v);
+    else if (size == 2) __asm__ volatile("outw %0, %1" :: "a"((uint16_t)v), "Nd"(port));
+    else                port_outl(PCI_CONFIG_DATA, v);
+    cfg_unlock(s);
+}
+#endif
+
 /* Write the Command register without echoing back Status bits: Status is
  * RW1C, so writing the value just read would clear pending error flags. */
 static void write_command(uint8_t bus, uint8_t dev, uint8_t func, uint16_t cmd)
@@ -150,12 +196,12 @@ static void write_command(uint8_t bus, uint8_t dev, uint8_t func, uint16_t cmd)
 
 bool pci_mech1_present(void)
 {
-    irqstate_t s = irq_off();
+    irqstate_t s = cfg_lock();
     uint32_t saved = port_inl(PCI_CONFIG_ADDRESS);
     port_outl(PCI_CONFIG_ADDRESS, PCI_CONFIG_ENABLE);
     bool ok = port_inl(PCI_CONFIG_ADDRESS) == PCI_CONFIG_ENABLE;
     port_outl(PCI_CONFIG_ADDRESS, saved);
-    irq_restore_state(s);
+    cfg_unlock(s);
     return ok;
 }
 
@@ -388,7 +434,7 @@ uint32_t pci_filter_and_log(struct pci_device *d, bool log)
 static void size_bar(const struct pci_device *d, int i, struct pci_bar *b)
 {
     uint8_t off = (uint8_t)(PCI_REG_BAR0 + 4 * i);
-    irqstate_t s = irq_off();
+    irqstate_t s = irq_off();                           /* at boot, on one CPU */
     uint16_t cmd = (uint16_t)pci_read32(d->bus, d->device, d->function, PCI_REG_COMMAND);
     write_command(d->bus, d->device, d->function, (uint16_t)(cmd & ~(unsigned)(PCI_CMD_IO_SPACE | PCI_CMD_MEM_SPACE)));
 

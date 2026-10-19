@@ -148,11 +148,6 @@ static void chain(int n)
     M.x86.R_IP = off;
 }
 
-static uint32_t cf8(int bus, int devfn, int reg)
-{
-    return 0x80000000u | (uint32_t)bus << 16 | (uint32_t)devfn << 8 | (reg & 0xFC);
-}
-
 /* PCI BIOS (INT 1Ah AH=B1h), configuration mechanism #1 */
 static void pci_bios(void)
 {
@@ -188,12 +183,12 @@ static void pci_bios(void)
         }
         break;
     }
-    case 0x08: outl(0xCF8, cf8(bus, devfn, reg)); M.x86.R_CL = inb(0xCFC + (reg & 3)); break;
-    case 0x09: outl(0xCF8, cf8(bus, devfn, reg)); M.x86.R_CX = p_inw(0xCFC + (reg & 2)); break;
-    case 0x0A: outl(0xCF8, cf8(bus, devfn, reg)); M.x86.R_ECX = inl(0xCFC); break;
-    case 0x0B: outl(0xCF8, cf8(bus, devfn, reg)); outb(0xCFC + (reg & 3), M.x86.R_CL); break;
-    case 0x0C: outl(0xCF8, cf8(bus, devfn, reg)); p_outw(0xCFC + (reg & 2), M.x86.R_CX); break;
-    case 0x0D: outl(0xCF8, cf8(bus, devfn, reg)); outl(0xCFC, M.x86.R_ECX); break;
+    case 0x08: M.x86.R_CL = (u8)pci_cfg_read(bus, devfn >> 3, devfn & 7, reg, 1); break;
+    case 0x09: M.x86.R_CX = (u16)pci_cfg_read(bus, devfn >> 3, devfn & 7, reg, 2); break;
+    case 0x0A: M.x86.R_ECX = pci_cfg_read(bus, devfn >> 3, devfn & 7, reg, 4); break;
+    case 0x0B: pci_cfg_write(bus, devfn >> 3, devfn & 7, reg, 1, M.x86.R_CL); break;
+    case 0x0C: pci_cfg_write(bus, devfn >> 3, devfn & 7, reg, 2, M.x86.R_CX); break;
+    case 0x0D: pci_cfg_write(bus, devfn >> 3, devfn & 7, reg, 4, M.x86.R_ECX); break;
     default:   status = 0x81;           /* FUNC_NOT_SUPPORTED */
     }
     M.x86.R_AH = status;

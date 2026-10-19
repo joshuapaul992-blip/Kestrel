@@ -42,6 +42,7 @@ void lkpi_pci_irq_release(struct pci_dev *pdev);    /* at unbind: vectors back  
 
 /* chardev.c, watchdog.c, notifier.c */
 void *lkpi_devnode_add(struct device *dev);
+void *lkpi_pci_handle_of(struct device *dev);                     /* pci.c: Kestrel's PCI function under dev, or NULL */
 struct lkpi_mmap;
 int lkpi_file_mmap(struct file *file, struct lkpi_mmap *m);        /* mmap.c */
 void lkpi_devnode_remove(struct device *dev);

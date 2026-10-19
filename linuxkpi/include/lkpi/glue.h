@@ -165,6 +165,11 @@ struct lkpi_cdev_ops {
 void         *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                             const struct lkpi_cdev_ops *ops, void *dev);
 void          lkpi_cdev_remove(void *node);
+/* /sys: the device node's entries (class/<cls>/<name>, dev/char/<major>:<minor>)
+ * under the PCI function `pci` (a handle, or NULL); a driver bound to `pci`. */
+void          lkpi_sysfs_class_dev(void *pci, const char *cls, const char *name, const char *devname,
+                                   unsigned int major, unsigned int minor);
+void          lkpi_sysfs_pci_driver(void *pci, const char *driver);
 
 /* ---- device memory mapped into a process (mmap of a device node) -------- */
 /* The region [start, end) at file offset `off` of the process `mm` (opaque)

@@ -186,3 +186,11 @@ void lkpi_cdev_remove(void *node)
     struct cdev_node *n = node;
     if (n && n->vn) n->vn->ops = &gone_ops;
 }
+
+void lkpi_sysfs_class_dev(void *pci, const char *cls, const char *name, const char *devname,
+                          unsigned int major, unsigned int minor)
+{
+    sysfs_class_dev(pci, cls, name, devname, major, minor);
+}
+
+void lkpi_sysfs_pci_driver(void *pci, const char *driver) { sysfs_pci_driver(pci, driver); }

@@ -4,7 +4,8 @@
  *                    version and capabilities, the KMS objects, a dumb
  *                    buffer mapped and drawn, set on the first connected
  *                    monitor, a page flip with its event, the mapping
- *                    after fork and a partial munmap, the render node
+ *                    after fork and a partial munmap, the render node,
+ *                    and the /sys entries libdrm finds the device by
  *   drmtest -h N     ... and keep the picture on screen for N seconds
  *                    (colour bars), so the host can take a screenshot
  * Exit status 0 = every check passed; 77 = no DRM device (skipped). */
@@ -19,6 +20,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 /* the DRM interface (<drm/drm.h>, <drm/drm_mode.h>), defined here:
  * musl-gcc has no kernel headers */
@@ -134,6 +137,61 @@ static void paint(struct buf *b, uint32_t w, uint32_t h, int bars, uint32_t soli
     }
 }
 
+/* A file under /sys, its first line in buf (without the newline). */
+static int sys_read(const char *path, char *buf, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char *r = fgets(buf, (int)cap, f);
+    fclose(f);
+    if (!r) return -1;
+    buf[strcspn(buf, "\n")] = 0;
+    return 0;
+}
+
+/* What libdrm's drmGetDevice2() reads (xf86drm.c), for the node open as fd:
+ * /sys/dev/char/M:m/device/drm exists, device/subsystem names "pci", the
+ * device's uevent has PCI_SLOT_NAME, and vendor/device agree with config. */
+static void check_sysfs(int fd)
+{
+    struct stat st;
+    char path[128], link[256], line[128];
+    if (fstat(fd, &st) < 0) return;
+    unsigned maj = major(st.st_rdev), min = minor(st.st_rdev);
+    printf("drmtest:        /dev/dri/card0 is %u:%u\n", maj, min);
+    snprintf(path, sizeof path, "/sys/dev/char/%u:%u/device/drm", maj, min);
+    CHECK(maj == 226 && stat(path, &st) == 0 && S_ISDIR(st.st_mode), "/sys/dev/char/226:N/device/drm is there");
+    snprintf(path, sizeof path, "/sys/dev/char/%u:%u/device/subsystem", maj, min);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    if (n > 0) link[n] = 0;
+    CHECK(n > 0 && strrchr(link, '/') && !strcmp(strrchr(link, '/'), "/pci"), "its device is on the PCI bus");
+
+    snprintf(path, sizeof path, "/sys/dev/char/%u:%u/device/uevent", maj, min);
+    FILE *f = fopen(path, "r");
+    unsigned dom = 99, bus = 0, dev = 0, fn = 0;
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "PCI_SLOT_NAME=", 14)) sscanf(line + 14, "%x:%x:%x.%u", &dom, &bus, &dev, &fn);
+    if (f) fclose(f);
+    CHECK(dom == 0, "uevent has PCI_SLOT_NAME");
+    printf("drmtest:        PCI %04x:%02x:%02x.%u\n", dom, bus, dev, fn);
+
+    unsigned vendor = 0, device = 0;
+    uint16_t cfg[2] = { 0 };
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.%u/vendor", dom, bus, dev, fn);
+    if (sys_read(path, line, sizeof line) == 0) vendor = (unsigned)strtoul(line, NULL, 16);
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.%u/device", dom, bus, dev, fn);
+    if (sys_read(path, line, sizeof line) == 0) device = (unsigned)strtoul(line, NULL, 16);
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.%u/config", dom, bus, dev, fn);
+    int cfd = open(path, O_RDONLY);
+    if (cfd >= 0) { if (read(cfd, cfg, 4) != 4) cfg[0] = 0; close(cfd); }
+    CHECK(vendor && vendor == cfg[0] && device == cfg[1], "vendor and device match the configuration space");
+    printf("drmtest:        %04x:%04x\n", vendor, device);
+
+    snprintf(path, sizeof path, "/sys/class/drm/card%u/dev", min);
+    snprintf(link, sizeof link, "%u:%u", maj, min);
+    CHECK(sys_read(path, line, sizeof line) == 0 && !strcmp(line, link), "/sys/class/drm/cardN/dev names the node");
+}
+
 int main(int argc, char **argv)
 {
     int hold = argc > 2 && !strcmp(argv[1], "-h") ? atoi(argv[2]) : 0;
@@ -149,6 +207,8 @@ int main(int argc, char **argv)
                              .desc_len = sizeof desc - 1, .desc = desc };
     CHECK(xioctl(fd, DRM_IOCTL_VERSION, &v) == 0 && name[0], "DRM_IOCTL_VERSION names the driver");
     printf("drmtest:        driver %s %d.%d.%d (%s)\n", name, v.major, v.minor, v.patch, desc);
+
+    check_sysfs(fd);
 
     struct drm_get_cap cap = { .capability = DRM_CAP_DUMB_BUFFER };
     CHECK(xioctl(fd, DRM_IOCTL_GET_CAP, &cap) == 0 && cap.value == 1, "dumb buffers are offered");
