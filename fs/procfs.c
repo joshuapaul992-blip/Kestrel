@@ -74,27 +74,73 @@ static size_t gen_cpuinfo(char *buf, size_t cap, void *ctx)
     return n;
 }
 
+/* A mount as /proc/mounts names it: a bind mount shows the file system it
+ * comes from, and the source is the device, or the type for a pseudo file
+ * system ("proc /proc proc ..."). */
+static const char *mount_type(struct mount *m) { return m->of ? m->of->fstype : m->fstype; }
+static const char *mount_source(struct mount *m)
+{
+    struct mount *s = m->of ? m->of : m;
+    return s->source[0] ? s->source : s->fstype;
+}
+
+/* Escape the characters /proc/mounts can't show as they are (space, tab,
+ * newline, backslash), as \ooo the way Linux does. */
+static const char *mount_esc(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (; *in && o + 5 < cap; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\\') o += (size_t)snprintf(out + o, cap - o, "\\%03o", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return out;
+}
+
+/* "rw,nosuid,nodev,noexec,relatime" */
+static const char *mount_opts(struct mount *m, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s%s%s%s,relatime", (m->flags & MNT_RDONLY) ? "ro" : "rw", (m->flags & MNT_NOSUID) ? ",nosuid" : "",
+             (m->flags & MNT_NODEV) ? ",nodev" : "", (m->flags & MNT_NOEXEC) ? ",noexec" : "");
+    return out;
+}
+
 static size_t gen_mounts(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
+    char path[256], o[48];
     vfs_tree_lock(false);                               /* the mount list */
     for (struct mount *m = vfs_mounts(); m; m = m->next)
-        P("%s %s %s %s 0 0\n", m->fstype, m->path, m->fstype, (m->flags & MNT_RDONLY) ? "ro" : "rw");
+        P("%s %s %s %s 0 0\n", mount_source(m), mount_esc(m->path, path, sizeof path), mount_type(m), mount_opts(m, o, sizeof o));
     vfs_tree_unlock();
     return n;
 }
 
-/* /proc/PID/mountinfo: id parent major:minor root mountpoint options - type source superoptions */
+/* /proc/PID/mountinfo: id parent major:minor root mountpoint options - type source superoptions.
+ * The parent is the mount holding the mount point; a bind mount's root is
+ * where its source sits in that file system. */
 static size_t gen_mountinfo(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
-    int id = 20;
+    char path[256], rootp[256];
     vfs_tree_lock(false);
-    for (struct mount *m = vfs_mounts(); m; m = m->next, id++) {
+    for (struct mount *m = vfs_mounts(); m; m = m->next) {
         const char *ro = (m->flags & MNT_RDONLY) ? "ro" : "rw";
-        P("%d %d %u:%u / %s %s,relatime - %s %s %s\n", id, m->path[1] ? 20 : 1, (m->dev >> 8) & 0xfff,
-          (m->dev & 0xff) | ((m->dev >> 12) & 0xfff00),
-          m->path, ro, m->fstype, m->fstype, ro);
+        int parent = m->id;                             /* "/" is its own parent */
+        if (m->covered)
+            for (struct mount *p = vfs_mounts(); p; p = p->next)
+                if (p != m && p->root && (p == m->covered->fs || (p->of && p->of == m->covered->fs))) parent = p->id;
+        const char *root = "/";
+        if (m->of && vfs_path_of(m->root, rootp, sizeof rootp) == 0) {
+            size_t pl = strlen(m->of->path);            /* the source, relative to its file system */
+            root = m->of->path[1] && !strncmp(rootp, m->of->path, pl) ? (rootp[pl] ? rootp + pl : "/") : rootp;
+        }
+        uint32_t dev = m->of ? m->of->dev : m->dev;
+        char o[48];
+        P("%d %d %u:%u %s %s %s - %s %s %s\n", m->id, parent, (dev >> 8) & 0xfff,
+          (dev & 0xff) | ((dev >> 12) & 0xfff00), root, mount_esc(m->path, path, sizeof path), mount_opts(m, o, sizeof o),
+          mount_type(m), mount_source(m), ro);
     }
     vfs_tree_unlock();
     return n;
@@ -103,7 +149,7 @@ static size_t gen_mountinfo(char *buf, size_t cap, void *ctx)
 static size_t gen_filesystems(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
-    P("nodev\tramfs\nnodev\ttmpfs\nnodev\tdevfs\nnodev\tprocfs\nnodev\tsysfs\n\text2\n");
+    P("nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tramfs\n\text2\nnodev\tfuse\n");
     return n;
 }
 
@@ -584,7 +630,7 @@ static const struct vnode_ops proc_root_ops = { .refresh = proc_refresh, .stale 
 void procfs_init(const char *mountpoint)
 {
     struct mount *m;
-    struct vnode *r = vfs_mkfs("procfs", MNT_RDONLY | MNT_NOCREATE, &m);
+    struct vnode *r = vfs_mkfs("proc", MNT_RDONLY | MNT_NOCREATE, &m);
     pseudo_file(r, "version",     gen_version, NULL);
     pseudo_file(r, "uptime",      gen_uptime, NULL);
     pseudo_file(r, "meminfo",     gen_meminfo, NULL);

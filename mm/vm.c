@@ -380,6 +380,7 @@ struct mm *mm_fork(struct mm *src)
     mm_lock(src);
     dst->brk_start = src->brk_start;
     dst->brk = src->brk;
+    dst->thp_disable = src->thp_disable;
     int err = 0;
     for (struct vma *v = src->vmas; v && !err; v = v->next) {
         struct vma *n = kmalloc(sizeof *n);

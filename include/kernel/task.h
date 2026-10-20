@@ -154,6 +154,8 @@ struct tcb {
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
     int       vfs_depth;        /* the file tree's lock, held this many times (fs/vfs.c) */
     bool      vfs_excl;         /* ... exclusively                                    */
+    bool      vfs_may_drop;     /* in walk_locked: a directory to load ends the walk  */
+    struct vnode *vfs_load;     /* ... and this is the one (fs/vfs.c: find)           */
     bool      sched_cur;        /* some CPU's current task (under the scheduler lock) */
     int       on_cpu;           /* until its registers are saved at a switch-out    */
     struct kstat_task ks;       /* performance counters (kstat.h)            */

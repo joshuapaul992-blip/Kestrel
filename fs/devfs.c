@@ -16,6 +16,7 @@
 #include <kernel/tty.h>
 #include <kernel/kinput.h>
 #include <kernel/uaccess.h>
+#include <kernel/fuse.h>
 
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 
@@ -482,7 +483,7 @@ struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
 void devfs_init(const char *mountpoint)
 {
     struct mount *m;
-    struct vnode *r = vfs_mkfs("devfs", MNT_NOCREATE, &m);
+    struct vnode *r = vfs_mkfs("devtmpfs", MNT_NOCREATE, &m);
     devfs_root = r;
     add_dev(r, "null",    0666, MKDEV(1, 3),  &null_ops);
     add_dev(r, "zero",    0666, MKDEV(1, 5),  &zero_ops);
@@ -500,6 +501,7 @@ void devfs_init(const char *mountpoint)
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
     add_dev(r, "report",  0600, MKDEV(10, 240), &report_ops);
     add_dev(r, "results", 0600, MKDEV(10, 241), &results_ops);
+    add_dev(r, "fuse",    0666, MKDEV(10, 229), &fuse_ctl_ops);
     for (int i = 0; i < tty_count; i++) {              /* one per monitor */
         char name[8];
         snprintf(name, sizeof name, "fb%d", i);

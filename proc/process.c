@@ -28,6 +28,7 @@
 #include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/futex.h>
+#include <kernel/time.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
 
@@ -422,13 +423,21 @@ static int de_thread(struct tcb *t)
 
 int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
 {
-    struct tcb *t = current_task();
-    struct int_frame *f = t->uframe;
-    if (!t->user || !f) return -EINVAL;
-
     int64_t rc = 0;
     char *path = ustrdup(upath, VFS_PATH_MAX, &rc);
     if (!path) return rc == -E2BIG ? -ENAMETOOLONG : rc;
+    return proc_execve_path(path, uargv, uenvp);
+}
+
+/* execve with the path already in the kernel (kmalloc'd; freed here):
+ * execveat builds it from its directory and name. */
+int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
+{
+    struct tcb *t = current_task();
+    struct int_frame *f = t->uframe;
+    if (!t->user || !f) { kfree(path); return -EINVAL; }
+
+    int64_t rc = 0;
     struct exec_args ea = { 0, 0, NULL, NULL };
     size_t bytes = 0;
     if ((rc = copy_vector(uargv, &ea.argv, &ea.argc, &bytes)) < 0 ||
@@ -438,6 +447,11 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     struct stat st;
     if ((rc = vfs_stat(path, &st)) < 0) goto out;
     if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111)) { rc = -EACCES; goto out; }
+    struct vnode *pv;
+    if ((rc = vfs_lookup(path, &pv)) < 0) goto out;
+    bool noexec = pv->fs && (pv->fs->flags & MNT_NOEXEC);
+    vfs_vnode_put(pv);
+    if (noexec) { rc = -EACCES; goto out; }         /* mounted noexec */
 
     /* Build the new image in a fresh address space; the old one stays
      * intact (and current again) if loading fails. */
@@ -822,15 +836,19 @@ uint64_t signal_pending_mask(void)
 }
 
 /* Sleep until a signal in mask is pending (signalfd), or one to deliver. */
-void signal_wait_mask(uint64_t mask)
+void signal_wait_mask(uint64_t mask) { signal_wait_mask_until(mask, 0); }
+
+/* The same, ending at deadline_ms of time_ms() as well (0: none). */
+void signal_wait_mask_until(uint64_t mask, uint64_t deadline_ms)
 {
     struct tcb *t = current_task();
     if (!t->user) return;
     uint64_t fl = spin_lock_irqsave(&proc_lock);        /* senders set pending, and wake, under it */
-    while (!(pending_of(t) & mask & ~UNBLOCKABLE) && !signal_pending())
-        sleep_on_locked(&signal_wait_chan, &proc_lock);
+    while (!(pending_of(t) & mask & ~UNBLOCKABLE) && !signal_pending() && (!deadline_ms || time_ms() < deadline_ms))
+        sleep_on_until_locked(&signal_wait_chan, deadline_ms, &proc_lock);
     spin_unlock_irqrestore(&proc_lock, fl);
 }
+
 
 int signal_dequeue(uint64_t mask, struct ksig_info *info)
 {
@@ -911,6 +929,19 @@ struct rt_sigframe {
 _Static_assert(sizeof(struct sigctx) == 256, "sigcontext layout");
 _Static_assert(sizeof(struct kucontext) == 304, "ucontext layout");
 _Static_assert(sizeof(struct ksiginfo) == 128, "siginfo layout");
+
+/* siginfo_t as Linux lays it out, for sig with the details in i
+ * (rt_sigtimedwait; signal frames build theirs the same way). */
+void signal_user_info(int sig, const struct ksig_info *i, void *out128)
+{
+    struct ksiginfo u;
+    memset(&u, 0, sizeof u);
+    u.si_signo = sig;
+    u.si_code = i->code;
+    if (fault_signal(sig) && i->trapno) u.u.fault.addr = i->addr;
+    else { u.u.kill.pid = i->pid; u.u.kill.uid = i->uid; u.u.kill.status = i->status; }
+    memcpy(out128, &u, sizeof u);
+}
 
 static bool user_code(uint64_t a) { return uvm_range_ok(a, 1); }
 

@@ -133,6 +133,8 @@ struct mm {
     uint64_t     brk_start, brk;
     uint64_t     rss;           /* user pages mapped (statistics, OOM)      */
     bool         oom_victim;    /* the OOM killer is waiting for it to go   */
+    bool         thp_disable;   /* prctl(PR_SET_THP_DISABLE): only remembered,
+                                   there are no huge pages to turn off      */
 };
 
 /* With interrupts on; may sleep. Needs no lock held (it takes the big

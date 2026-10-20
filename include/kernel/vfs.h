@@ -47,6 +47,9 @@ struct vnode_ops {
      * system's nodes it says that every operation locks itself, so the path
      * calls (stat, readlink, open) call them without the big kernel lock. */
     bool    nolock;
+    /* fwrite gets each write(2) and writev(2) whole, in one call, however
+     * large (up to 1 MiB): a FUSE answer is one message. */
+    bool    whole_writes;
     void    (*release)(struct file *f);            /* last close of f      */
     int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
     /* Optional: create the open file (devices that hand out a new object per
@@ -101,6 +104,13 @@ struct vnode_ops {
     int     (*setattr)(struct vnode *vn);       /* mode, uid, gid, times changed: write back */
     void    (*evict)(struct vnode *vn);         /* the vnode is being freed */
     void    (*getattr)(struct vnode *vn);       /* refresh size, nlink, times (before stat) */
+    /* Optional, directories of a file system that has to ask someone else
+     * for their entries (FUSE asks a program): read them all, make their
+     * nodes and hand them to vfs_load_done(). Called when a lookup or a
+     * listing first reaches a directory whose `loaded` is false, normally
+     * without the tree's lock, so that a slow answer holds up nobody else;
+     * a walk inside someone's hold of the lock calls it under that hold. */
+    int     (*load)(struct vnode *dir);
 };
 
 /* poll(2) bits */
@@ -146,6 +156,9 @@ struct vnode {
 
 #define MNT_RDONLY   0x1
 #define MNT_NOCREATE 0x2            /* pseudo fs: structure fixed by kernel */
+#define MNT_NOSUID   0x4            /* mount(2)'s MS_NOSUID: shown in /proc/mounts */
+#define MNT_NODEV    0x8            /* MS_NODEV: shown */
+#define MNT_NOEXEC   0x10           /* MS_NOEXEC: execve refuses its files */
 
 /* statfs(2), Linux x86_64 layout */
 struct kstatfs {
@@ -157,7 +170,11 @@ struct kstatfs {
 
 struct mount {
     char          path[VFS_PATH_MAX];
-    char          fstype[16];
+    char          fstype[16];       /* Linux's name for it ("proc", "tmpfs", "ext2", "fuse.squashfuse"),
+                                       or "bind": `of` is the file system shown */
+    char          source[64];       /* /proc/mounts' first column (empty: the type) */
+    struct mount *of;               /* bind mount: the source's file system */
+    int           id;               /* /proc/self/mountinfo's mount ID */
     struct vnode *root;
     struct vnode *covered;
     uint32_t      flags;
@@ -167,6 +184,7 @@ struct mount {
     void         *priv;
     int         (*sync)(struct mount *m, bool final);           /* write back everything; final: shutting down */
     int         (*statfs)(struct mount *m, struct kstatfs *st);
+    void        (*umount)(struct mount *m);                     /* leaving the tree (FUSE: hang up) */
 };
 
 struct epitem;
@@ -193,6 +211,20 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
  * (or shared, from a refresh: see vnode_ops.refresh). So do pseudo_dir and
  * pseudo_file below. */
 void          vfs_node_add(struct vnode *dir, struct vnode *child);
+/* A load (vnode_ops.load) is done: add the nodes on `list` (linked through
+ * `sibling`) to dir and mark it loaded, under the tree's lock (taken here
+ * unless the caller holds it). If dir was loaded meanwhile they are freed. */
+void          vfs_load_done(struct vnode *dir, struct vnode *list);
+/* Unmount the file system mounted at path (umount2). MNT_DETACH (2): even
+ * if files in it are open (they keep working). Its nodes are freed as their
+ * last references go, unless it is a bind mount (the nodes are the
+ * source's); `m->umount` is called first. */
+int           vfs_umount(const char *path, int flags);
+/* mount --bind of a directory node (mount(2) of proc, sysfs ...: their one
+ * instance shown again) */
+int           vfs_bind_node(struct vnode *src, const char *dst, const char *source);
+int           vfs_move_mount(const char *from, const char *to);    /* MS_MOVE */
+struct mount *vfs_mount_at(const char *path);                       /* NULL: not a mount point */
 struct vnode *vfs_mkfs(const char *fstype, uint32_t flags, struct mount **out);
 int           vfs_mount(struct mount *m, const char *path);
 int           vfs_bind(const char *src, const char *dst);     /* show src's contents at dst */
@@ -237,6 +269,7 @@ int     vfs_chmod_vn(struct vnode *vn, mode_t mode);
 int     vfs_chown_vn(struct vnode *vn, int uid, int gid);
 int     vfs_utime_vn(struct vnode *vn, int64_t mtime);
 int     vfs_statfs(struct vnode *vn, struct kstatfs *st);
+int64_t vfs_fs_magic(const char *fstype);       /* statfs' f_type for a type name */
 void    vfs_sync_all(bool final);               /* every mounted disk file system */
 /* make the file system `m` the root ("/"), moving the other mounts into it */
 int     vfs_pivot_root(struct mount *m);

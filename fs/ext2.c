@@ -1488,6 +1488,7 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
     struct mount *m = kzalloc(sizeof *m);
     if (!m) { r = -ENOMEM; goto fail; }
     strlcpy(m->fstype, "ext2", sizeof m->fstype);
+    snprintf(m->source, sizeof m->source, "/dev/%s", dev->name);
     m->flags = fs->rdonly ? MNT_RDONLY : 0;
     m->dev = 0x800 + (uint32_t)(dev - blk_get(0));
     m->priv = fs;
