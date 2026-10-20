@@ -525,6 +525,143 @@ static void proc_link(struct vnode *dir, const char *name, const struct vnode_op
     vfs_node_add(dir, l);
 }
 
+/* /proc/PID/fd: a link per open descriptor, named by its number. Reading
+ * one gives the file's path ("/memfd:x (deleted)", "pipe:[r]", ...);
+ * following it gives the open file's own node (vnode_ops.follow), so
+ * open(), stat() and execve() of /proc/self/fd/N reach the file even when
+ * it is in no directory. The directory is rebuilt when the descriptors
+ * change. */
+struct fd_dir {
+    void    *ctx;                   /* the process (pid_dir), NULL: self */
+    uint64_t sig[3];                /* of the descriptors it was built for */
+};
+
+static struct files_struct *pid_fds_get(void *ctx)
+{
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* exit clears it under the lock */
+    struct tcb *t = pid_task(ctx);
+    struct files_struct *fs = t ? t->files : NULL;
+    if (fs) __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL);
+    spin_unlock_irqrestore(&proc_lock, f);
+    return fs;
+}
+
+static void fd_signature(void *ctx, uint64_t s[3])
+{
+    s[0] = s[1] = s[2] = 0;
+    struct files_struct *fs = pid_fds_get(ctx);
+    if (!fs) return;
+    uint64_t f = spin_lock_irqsave(&fs->lock);
+    for (int i = 0; i < MAX_FDS; i++)
+        if (fs->fd[i]) { s[0]++; s[1] += (uint64_t)i * 0x9E3779B97F4A7C15ull; s[2] += (uint64_t)(uintptr_t)fs->fd[i]; }
+    spin_unlock_irqrestore(&fs->lock, f);
+    files_put(fs);
+}
+
+/* The node behind descriptor n, or NULL. No reference is kept: the caller
+ * holds the tree's lock, and the file stays open meanwhile unless another
+ * thread closes it at that very moment. */
+static struct vnode *fd_node(void *ctx, int n)
+{
+    if (n < 0 || n >= MAX_FDS) return NULL;
+    struct files_struct *fs = pid_fds_get(ctx);
+    if (!fs) return NULL;
+    uint64_t f = spin_lock_irqsave(&fs->lock);
+    struct vnode *vn = fs->fd[n] ? fs->fd[n]->vn : NULL;
+    spin_unlock_irqrestore(&fs->lock, f);
+    files_put(fs);
+    return vn;
+}
+
+static int fd_number(const struct vnode *l)
+{
+    int n = 0;
+    for (const char *p = l->name; *p; p++) {
+        if (*p < '0' || *p > '9' || n > MAX_FDS) return -1;
+        n = n * 10 + (*p - '0');
+    }
+    return n;
+}
+
+static struct vnode *link_fd_follow(struct vnode *l)
+{
+    struct fd_dir *d = l->ctx;
+    return fd_node(d->ctx, fd_number(l));
+}
+
+static int link_fd(struct vnode *l, char *buf, size_t size)
+{
+    struct fd_dir *d = l->ctx;
+    char tmp[VFS_PATH_MAX];
+    vfs_tree_lock(false);
+    struct vnode *vn = fd_node(d->ctx, fd_number(l));
+    int r = -ENOENT;
+    if (vn && (vn->type == VSOCK || !strncmp(vn->name, "pipe:", 5))) {
+        snprintf(tmp, sizeof tmp, "%s:[%lu]", vn->type == VSOCK ? "socket" : "pipe", (unsigned long)vn->ino);
+        r = 0;
+    } else if (vn && !vn->parent && vn != vfs_root() &&
+        (!vn->unlinked || !strncmp(vn->name, "pipe:", 5) || !strncmp(vn->name, "socket:", 7) ||
+         !strncmp(vn->name, "anon_inode:", 11))) {
+        strlcpy(tmp, vn->name, sizeof tmp);             /* a pipe or socket: in no tree */
+        r = 0;
+    } else if (vn) {
+        r = vfs_path_of(vn, tmp, sizeof tmp);
+    }
+    vfs_tree_unlock();
+    if (r < 0) return r;
+    size_t n = strlen(tmp);
+    if (n > size) n = size;
+    memcpy(buf, tmp, n);
+    return (int)n;
+}
+
+static const struct vnode_ops fd_link_ops = { .readlink = link_fd, .follow = link_fd_follow, .nolock = true };
+
+static bool fd_dir_stale(struct vnode *dir)
+{
+    struct fd_dir *d = dir->ctx;
+    uint64_t s[3];
+    fd_signature(d->ctx, s);
+    return s[0] != d->sig[0] || s[1] != d->sig[1] || s[2] != d->sig[2];
+}
+
+/* With the tree's lock held exclusively. */
+static void fd_dir_refresh(struct vnode *dir)
+{
+    struct fd_dir *d = dir->ctx;
+    fd_signature(d->ctx, d->sig);
+    while (dir->children) vfs_node_drop(dir, dir->children);
+    struct files_struct *fs = pid_fds_get(d->ctx);
+    if (!fs) return;
+    for (int i = 0; i < MAX_FDS; i++) {
+        uint64_t f = spin_lock_irqsave(&fs->lock);
+        bool open = fs->fd[i] != NULL;
+        spin_unlock_irqrestore(&fs->lock, f);
+        if (!open) continue;
+        char name[12];
+        snprintf(name, sizeof name, "%d", i);
+        struct vnode *l = vfs_node_new(dir->fs, name, VLNK, 0700, &fd_link_ops);
+        if (!l) break;
+        l->ctx = d;
+        vfs_node_add(dir, l);
+    }
+    files_put(fs);
+}
+
+static const struct vnode_ops fd_dir_ops = { .refresh = fd_dir_refresh, .stale = fd_dir_stale, .nolock = true };
+
+static void proc_fd_dir(struct vnode *dir, void *ctx)
+{
+    struct fd_dir *d = kzalloc(sizeof *d);
+    if (!d) return;
+    d->ctx = ctx;
+    d->sig[0] = ~0ull;                                  /* stale until first built */
+    struct vnode *fd = vfs_node_new(dir->fs, "fd", VDIR, 0500, &fd_dir_ops);
+    if (!fd) { kfree(d); return; }
+    fd->ctx = d;
+    vfs_node_add(dir, fd);
+}
+
 static size_t gen_kstat(char *buf, size_t cap, void *ctx) { (void)ctx; return kstat_gen(buf, cap); }
 static size_t gen_kprof(char *buf, size_t cap, void *ctx) { (void)ctx; return kstat_gen_prof(buf, cap); }
 
@@ -546,6 +683,7 @@ static void pid_files(struct vnode *dir, void *ctx)
     proc_link(dir, "exe", &exe_ops, ctx);
     proc_link(dir, "cwd", &cwd_ops, ctx);
     proc_link(dir, "root", &root_ops, ctx);
+    proc_fd_dir(dir, ctx);
     pseudo_file(dir, "stat", gen_pid_stat, ctx);
     pseudo_file(dir, "status", gen_pid_status, ctx);
     pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);

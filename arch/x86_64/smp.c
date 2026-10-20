@@ -11,6 +11,7 @@
  * further APs are started (its slot and stack stay reserved). kestrel.smp=0 (or maxcpus=1) keeps the system on one CPU. */
 #include <kernel/msi.h>
 #include <kernel/smp.h>
+#include <kernel/uvm.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/fpu.h>
@@ -38,14 +39,14 @@ void percpu_init_bsp(void)
     c->id = 0;
     c->online = true;
     c->loaded_cr3 = read_cr3() & ADDR_MASK;
-    wrmsr(MSR_GS_BASE, (uint64_t)c);
+    wrmsr(MSR_GS_BASE, uvm_direct((uint64_t)c));       /* the entry code reads it before CR3 is the kernel's */
     wrmsr(MSR_KERNEL_GS_BASE, 0);
     kstat_cpu_online();
 }
 
 bool percpu_is_kernel_gs(uint64_t base)
 {
-    uint64_t lo = (uint64_t)&cpus[0], hi = (uint64_t)&cpus[MAX_CPUS];
+    uint64_t lo = uvm_direct((uint64_t)&cpus[0]), hi = uvm_direct((uint64_t)&cpus[MAX_CPUS]);
     return base >= lo && base < hi && (base - lo) % sizeof(struct percpu) == 0;
 }
 
@@ -184,7 +185,8 @@ void bkl_reacquire(int depth)
 
 static void flush_local(uint64_t start, uint64_t end)
 {
-    if (end - start > FLUSH_PAGES_MAX * PAGE_SIZE) { write_cr3(read_cr3()); return; }
+    /* a low window is also cached at UVM_LOW_ALIAS (uaccess): drop it all */
+    if (end - start > FLUSH_PAGES_MAX * PAGE_SIZE || this_cpu()->user_cr3) { write_cr3(read_cr3()); return; }
     for (uint64_t va = start & ~(PAGE_SIZE - 1); va < end; va += PAGE_SIZE) invlpg(va);
 }
 
@@ -302,7 +304,7 @@ __attribute__((noreturn)) static void ap_entry(struct percpu *c)
     gdt_load_cpu(c->id);
     idt_load();
     c->self = c;
-    wrmsr(MSR_GS_BASE, (uint64_t)c);
+    wrmsr(MSR_GS_BASE, uvm_direct((uint64_t)c));
     wrmsr(MSR_KERNEL_GS_BASE, 0);
     __asm__ volatile("mov %0, %%cr4" :: "r"(bsp_cr4));  /* SSE and XSAVE, as the boot CPU */
     __asm__ volatile("mov %0, %%cr0" :: "r"(bsp_cr0));

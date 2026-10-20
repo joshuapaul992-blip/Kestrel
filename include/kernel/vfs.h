@@ -91,6 +91,11 @@ struct vnode_ops {
     uint64_t (*poll_deadline)(struct file *f);
     /* Symbolic links: copy the target (no NUL) into buf, return its length. */
     int     (*readlink)(struct vnode *vn, char *buf, size_t size);
+    /* Optional, links: the node the link stands for, whatever its name
+     * (/proc/PID/fd/N: an open file, even one no longer in any directory).
+     * Called with the tree's lock held; path walks go on from it instead of
+     * from the readlink text. NULL: -ENOENT. */
+    struct vnode *(*follow)(struct vnode *link);
     /* A disk file system's directory operations (on the directory's ops).
      * Without them the in-memory tree is the whole truth (ramfs). The VFS
      * has checked names, types, emptiness and write access; on success it
@@ -185,6 +190,7 @@ struct mount {
     int         (*sync)(struct mount *m, bool final);           /* write back everything; final: shutting down */
     int         (*statfs)(struct mount *m, struct kstatfs *st);
     void        (*umount)(struct mount *m);                     /* leaving the tree (FUSE: hang up) */
+    bool          expired;          /* umount2(MNT_EXPIRE) marked it */
 };
 
 struct epitem;
@@ -211,6 +217,9 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
  * (or shared, from a refresh: see vnode_ops.refresh). So do pseudo_dir and
  * pseudo_file below. */
 void          vfs_node_add(struct vnode *dir, struct vnode *child);
+/* Take a child away again, from a refresh run with the lock held exclusively
+ * (vnode_ops.stale); it is freed once nothing refers to it. */
+void          vfs_node_drop(struct vnode *dir, struct vnode *child);
 /* A load (vnode_ops.load) is done: add the nodes on `list` (linked through
  * `sibling`) to dir and mark it loaded, under the tree's lock (taken here
  * unless the caller holds it). If dir was loaded meanwhile they are freed. */

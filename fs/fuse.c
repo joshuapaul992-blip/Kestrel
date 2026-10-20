@@ -30,6 +30,7 @@
  * SIGKILL. Unmounting hangs up: the program's next read gets ENODEV,
  * which is how libfuse knows to exit. */
 #include <kernel/vfs.h>
+#include <kernel/uaccess.h>
 #include <kernel/fuse.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
@@ -100,6 +101,7 @@ struct fuse_req {
 struct fuse_conn {
     struct spinlock lock;
     int      refs;              /* the /dev/fuse file, the mount, each node */
+    int      devs;              /* /dev/fuse files on it (FUSE_DEV_IOC_CLONE) */
     bool     connected;         /* until the program closes /dev/fuse or the mount goes */
     bool     mounted;
     bool     initialized;       /* INIT answered */
@@ -302,18 +304,49 @@ static int dev_poll(struct file *f, int events)
     return r;
 }
 
-/* The program closed its descriptor: hang up (the mount answers ENOTCONN). */
+/* The program closed its last descriptor: hang up (the mount answers
+ * ENOTCONN). */
 static void dev_release(struct file *f)
 {
     struct fuse_conn *c = f->vn->data;
     uint64_t fl = spin_lock_irqsave(&c->lock);
-    abort_locked(c);
+    if (--c->devs == 0) abort_locked(c);
     spin_unlock_irqrestore(&c->lock, fl);
     conn_put(c);
 }
 
+/* FUSE_DEV_IOC_CLONE: this new descriptor serves the connection of another
+ * (libfuse's clone_fd: one per worker thread). */
+#define FUSE_DEV_IOC_CLONE 0x8004e500ul
+static int dev_fioctl(struct file *f, unsigned long req, void *arg)
+{
+    if (req != FUSE_DEV_IOC_CLONE) return -ENOTTY;
+    uint32_t ofd;
+    if (get_user_u32(&ofd, arg)) return -EFAULT;
+    struct file *of = fd_file((int)ofd);
+    if (!of) return -EBADF;
+    struct fuse_conn *n = f->vn->data, *o = of->vn->ops == &fuse_dev_ops ? of->vn->data : NULL;
+    int r = -EINVAL;
+    if (o && o != n) {
+        uint64_t fl = spin_lock_irqsave(&n->lock);
+        bool fresh = !n->mounted && n->devs == 1 && n->refs == 1;
+        spin_unlock_irqrestore(&n->lock, fl);
+        if (fresh) {
+            fl = spin_lock_irqsave(&o->lock);
+            if (o->connected) { o->refs++; o->devs++; r = 0; }
+            spin_unlock_irqrestore(&o->lock, fl);
+        }
+    }
+    vfs_close(of);
+    if (r < 0) return r;
+    vfs_vnode_get(&o->dev_vn);
+    f->vn = &o->dev_vn;
+    kfree(n);                                           /* nothing else knew it */
+    return 0;
+}
+
 static const struct vnode_ops fuse_dev_ops = {
-    .fread = dev_read, .fwrite = dev_write, .poll = dev_poll, .release = dev_release,
+    .fread = dev_read, .fwrite = dev_write, .poll = dev_poll, .release = dev_release, .fioctl = dev_fioctl,
     .nolock = true, .whole_writes = true,
 };
 
@@ -324,6 +357,7 @@ static int fuse_dev_open(struct vnode *vn, int flags, struct file **out)
     if (!c) return -ENOMEM;
     lockcheck_name(&c->lock, "fuse");
     c->refs = 1;
+    c->devs = 1;
     c->connected = true;
     strlcpy(c->name, "fuse", sizeof c->name);
     struct vnode *d = &c->dev_vn;
@@ -334,7 +368,8 @@ static int fuse_dev_open(struct vnode *vn, int flags, struct file **out)
     d->ops = &fuse_dev_ops;
     d->data = c;
     d->fs = vn->fs;
-    d->refs = 1 << 30;                                  /* not in the tree: vfs_vnode_put never frees it */
+    /* refs from 0, never VN_GONE: like eventfd's, freed with the connection,
+     * not by the last vfs_vnode_put */
     struct file *f = vfs_file_new(d, flags);
     if (!f) { kfree(c); return -ENOMEM; }
     *out = f;

@@ -24,9 +24,14 @@ uint64_t extable_fixup(uint64_t rip)
     return 0;
 }
 
-bool user_range_ok(uint64_t addr, size_t len)
+bool user_range_ok(uint64_t addr, size_t len) { return uvm_range_ok(addr, len); }
+
+/* Where the kernel reaches a checked user address: the low window (uvm.h)
+ * is mapped at UVM_LOW_ALIAS in the kernel's root, not at its own place. */
+static void *ua(const void *u)
 {
-    return addr >= UVM_USER_START && addr <= UVM_USER_END && len <= UVM_USER_END - addr;
+    uint64_t a = (uint64_t)u;
+    return (void *)(a < UVM_LOW_END ? a + UVM_LOW_ALIAS : a);
 }
 
 /* Kernel threads pass kernel buffers through int 0x80. */
@@ -41,7 +46,7 @@ int copy_from_user(void *dst, const void *usrc, size_t n)
     if (!n) return 0;
     if (kernel_caller()) { memcpy(dst, usrc, n); return 0; }
     if (!user_range_ok((uint64_t)usrc, n)) return -EFAULT;
-    return uaccess_copy(dst, usrc, n) ? -EFAULT : 0;
+    return uaccess_copy(dst, ua(usrc), n) ? -EFAULT : 0;
 }
 
 int copy_to_user(void *udst, const void *src, size_t n)
@@ -49,7 +54,7 @@ int copy_to_user(void *udst, const void *src, size_t n)
     if (!n) return 0;
     if (kernel_caller()) { memcpy(udst, src, n); return 0; }
     if (!user_range_ok((uint64_t)udst, n)) return -EFAULT;
-    return uaccess_copy(udst, src, n) ? -EFAULT : 0;
+    return uaccess_copy(ua(udst), src, n) ? -EFAULT : 0;
 }
 
 int clear_user(void *udst, size_t n)
@@ -57,7 +62,7 @@ int clear_user(void *udst, size_t n)
     if (!n) return 0;
     if (kernel_caller()) { memset(udst, 0, n); return 0; }
     if (!user_range_ok((uint64_t)udst, n)) return -EFAULT;
-    return uaccess_clear(udst, n) ? -EFAULT : 0;
+    return uaccess_clear(ua(udst), n) ? -EFAULT : 0;
 }
 
 long strncpy_from_user(char *dst, const char *usrc, size_t cap)
@@ -71,9 +76,9 @@ long strncpy_from_user(char *dst, const char *usrc, size_t cap)
     }
     uint64_t a = (uint64_t)usrc;
     if (!user_range_ok(a, 1)) return -EFAULT;
-    size_t avail = UVM_USER_END - a;                    /* never read past the user half */
+    size_t avail = uvm_region_end(a) - a;               /* never read past the user region */
     size_t lim = cap < avail ? cap : avail;
-    int64_t n = uaccess_strncpy(dst, usrc, lim);        /* NUL index, or lim if none */
+    int64_t n = uaccess_strncpy(dst, ua(usrc), lim);        /* NUL index, or lim if none */
     if (n < 0) return -EFAULT;
     if ((size_t)n == lim) {
         dst[lim - 1] = 0;
@@ -86,28 +91,28 @@ int get_user_u32(uint32_t *out, const void *uaddr)
 {
     if (kernel_caller()) { memcpy(out, uaddr, 4); return 0; }
     if (!user_range_ok((uint64_t)uaddr, 4)) return -EFAULT;
-    return uaccess_get32(uaddr, out) ? -EFAULT : 0;
+    return uaccess_get32(ua(uaddr), out) ? -EFAULT : 0;
 }
 
 int get_user_u64(uint64_t *out, const void *uaddr)
 {
     if (kernel_caller()) { memcpy(out, uaddr, 8); return 0; }
     if (!user_range_ok((uint64_t)uaddr, 8)) return -EFAULT;
-    return uaccess_get64(uaddr, out) ? -EFAULT : 0;
+    return uaccess_get64(ua(uaddr), out) ? -EFAULT : 0;
 }
 
 int put_user_u32(void *uaddr, uint32_t v)
 {
     if (kernel_caller()) { memcpy(uaddr, &v, 4); return 0; }
     if (!user_range_ok((uint64_t)uaddr, 4)) return -EFAULT;
-    return uaccess_put32(uaddr, v) ? -EFAULT : 0;
+    return uaccess_put32(ua(uaddr), v) ? -EFAULT : 0;
 }
 
 int put_user_u64(void *uaddr, uint64_t v)
 {
     if (kernel_caller()) { memcpy(uaddr, &v, 8); return 0; }
     if (!user_range_ok((uint64_t)uaddr, 8)) return -EFAULT;
-    return uaccess_put64(uaddr, v) ? -EFAULT : 0;
+    return uaccess_put64(ua(uaddr), v) ? -EFAULT : 0;
 }
 
 int user_cmpxchg_u32(void *uaddr, uint32_t old, uint32_t nw, uint32_t *cur)
@@ -118,7 +123,7 @@ int user_cmpxchg_u32(void *uaddr, uint32_t old, uint32_t nw, uint32_t *cur)
         return 0;
     }
     if (!user_range_ok((uint64_t)uaddr, 4)) return -EFAULT;
-    return uaccess_cmpxchg32(uaddr, old, nw, cur) ? -EFAULT : 0;
+    return uaccess_cmpxchg32(ua(uaddr), old, nw, cur) ? -EFAULT : 0;
 }
 
 void pagefault_disable(void) { struct tcb *t = current_task(); if (t) t->pagefault_off++; }

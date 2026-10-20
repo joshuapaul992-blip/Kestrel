@@ -7,7 +7,8 @@
  * They copy arguments in and results out with the functions below:
  *
  *   - the range [addr, addr+len) must lie inside the user half
- *     (UVM_USER_START .. UVM_USER_END) without wrapping around;
+ *     (UVM_USER_START .. UVM_USER_END, or the low window: uvm.h) without
+ *     wrapping around;
  *   - the copy itself runs in arch/x86_64/uaccess.asm, whose faulting
  *     instructions are listed in the exception table. A page fault there is
  *     first offered to the memory manager (demand paging, copy-on-write);

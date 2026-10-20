@@ -18,6 +18,8 @@
 ;  user-mode code. Kernel threads use `int 0x80` (see usyscall.h).
 ; =============================================================================
 
+%include "arch/x86_64/lowwin.inc"
+
 bits 64
 section .text
 
@@ -28,6 +30,8 @@ syscall_entry:
     swapgs
     mov     [gs:16], rsp                ; percpu.user_rsp
     mov     rsp, [gs:8]                 ; percpu.kernel_rsp
+    ENTRY_KERNEL_CR3
+    ENTRY_KERNEL_RIP
 
     push    0x1B                        ; ss  (user data | RPL3)
     push    qword [gs:16]               ; rsp
@@ -65,6 +69,7 @@ syscall_entry:
     shr     rcx, 47
     jnz     .iret
 
+    EXIT_USER_CR3
     pop     r15
     pop     r14
     pop     r13
@@ -92,6 +97,7 @@ syscall_entry:
     ; SYSRET would overwrite: leave through IRETQ (the frame above is laid
     ; out like an interrupt frame).
 .iret:
+    EXIT_USER_CR3
     pop     r15
     pop     r14
     pop     r13

@@ -386,13 +386,19 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest
-USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest fusermount3
+USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS) nopietest))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
 	@mkdir -p $(dir $@)
 	@echo "  MUSLCC  $<"
 	@$(MUSL_CC) $(MUSL_CFLAGS) $< -o $@
+
+# Linked at a fixed low address (ET_EXEC): the kernel's low window (uvm.h).
+$(BUILD)/user/nopietest: user/nopietest.c
+	@mkdir -p $(dir $@)
+	@echo "  MUSLCC  $< (no PIE)"
+	@$(MUSL_CC) -std=gnu11 -O2 -g -Wall -Wextra -fno-pie -no-pie -static $< -o $@ -lpthread
 
 # Dynamically linked test program + shared library, and musl's dynamic loader
 # (libc.so doubles as /lib/ld-musl-x86_64.so.1) for the boot volume's /lib.
@@ -474,6 +480,8 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
 	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
+	@chmod 4755 $(ROOTFS_STAGE)/bin/fusermount3   # libfuse looks for a setuid one
+	@ln -sf fusermount3 $(ROOTFS_STAGE)/bin/fusermount
 	@if [ -n "$(DYN_FILES)" ]; then mkdir -p $(ROOTFS_STAGE)/lib && cp $(MUSL_LOADER) $(ROOTFS_STAGE)/lib/ld-musl-x86_64.so.1 && \
 	    cp $(BUILD)/user/libdyntest.so $(ROOTFS_STAGE)/lib/ && cp $(BUILD)/user/dyntest $(ROOTFS_STAGE)/bin/; fi
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi

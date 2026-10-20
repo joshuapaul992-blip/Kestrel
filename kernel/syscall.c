@@ -552,6 +552,7 @@ static int64_t net_user_ioctl(unsigned long req, uint64_t arg)
 static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
+    req = (uint32_t)req;                                /* an unsigned int, as on Linux: musl sign-extends it */
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     int size = -1, dir = 0;
@@ -1233,6 +1234,7 @@ static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uin
     if (n < 0) return -EINVAL;                          /* longer than 249 bytes */
     struct file *f = ramfs_anon_file(name, O_RDWR);
     if (!f) return -ENOMEM;
+    f->vn->mode = (f->vn->mode & ~07777u) | ((flags & MFD_NOEXEC_SEAL) ? 0666 : 0777);  /* as Linux */
     struct vm_object *o = vfs_vmobject(f->vn);
     if (!o) { vfs_close(f); return -ENOMEM; }
     if (flags & MFD_NOEXEC_SEAL) o->seals = 0x0020;        /* F_SEAL_EXEC */
@@ -1799,9 +1801,7 @@ static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, u
     return ret == -ERESTARTNOHAND ? -EINTR : ret;
 }
 
-/* readlink: there are no symbolic links, except /proc/self/exe and
- * /proc/self/fd/N */
-/* readlink: symbolic links, plus /proc/self/exe and /proc/self/fd/N */
+/* readlink: symbolic links, plus /proc/self/exe (procfs has /proc/PID/fd/N) */
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t len, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
@@ -1813,19 +1813,6 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint6
     if (!strcmp(p, "/proc/self/exe") && t->exe[0]) {
         strlcpy(out, t->exe, sizeof out);
         n = (int)strlen(out);
-    } else if (!strncmp(p, "/proc/self/fd/", 14)) {     /* ttyname(): the file behind a descriptor */
-        int fd = 0;
-        const char *q = p + 14;
-        n = -ENOENT;
-        if (*q) {
-            for (; *q >= '0' && *q <= '9' && fd < MAX_FDS; q++) fd = fd * 10 + (*q - '0');
-            struct file *f = *q ? NULL : fget(fd);
-            if (f) {
-                n = vfs_path_of(f->vn, out, sizeof out);
-                if (!n) n = (int)strlen(out);
-                fput(f);
-            }
-        }
     } else {
         n = vfs_readlink_at(base, p, out, sizeof out);
     }
@@ -3091,6 +3078,12 @@ static int64_t sys_execveat(uint64_t dirfd, uint64_t upath, uint64_t argv, uint6
         if (!f) { r = -EBADF; goto fail; }
         if (!p[0] && !(flags & AT_EMPTY_PATH)) { fput(f); r = -ENOENT; goto fail; }
         if (p[0] && f->vn->type != VDIR) { fput(f); r = -ENOTDIR; goto fail; }
+        if (!p[0]) {                                    /* the file itself (fexecve): even a memfd */
+            fput(f);
+            snprintf(full, VFS_PATH_MAX, "/proc/self/fd/%d", (int)dirfd);
+            flags &= ~(uint64_t)AT_SYMLINK_NOFOLLOW;    /* that link is ours, not the caller's */
+            goto have;
+        }
         r = vfs_path_of(f->vn, full, VFS_PATH_MAX);
         bool gone = f->vn->unlinked;
         fput(f);
@@ -3102,6 +3095,7 @@ static int64_t sys_execveat(uint64_t dirfd, uint64_t upath, uint64_t argv, uint6
             strlcat(full, p, VFS_PATH_MAX);
         }
     }
+have:
     if (flags & AT_SYMLINK_NOFOLLOW) {
         struct stat st;
         if (vfs_stat_at(NULL, full, false, &st) == 0 && S_ISLNK(st.st_mode)) { r = -ELOOP; goto fail; }
@@ -3401,7 +3395,6 @@ static int64_t sys_umount2(uint64_t utarget, uint64_t flags, uint64_t a3, uint64
     char p[VFS_PATH_MAX];
     int r = get_path(utarget, p);
     if (r) return r;
-    if (flags & 4) return -EAGAIN;                      /* MNT_EXPIRE: marked, as on a first call */
     return vfs_umount(p, (int)flags);
 }
 
@@ -3604,7 +3597,7 @@ void syscall_cpu_init(void)
 {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);                       /* EFER.SCE */
     wrmsr(MSR_STAR, ((uint64_t)(GDT_USER_DATA - 8) << 48) | ((uint64_t)GDT_KERNEL_CODE << 32));
-    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_LSTAR, uvm_direct((uint64_t)syscall_entry));   /* see uvm.h */
     /* SFMASK: RFLAGS bits cleared on entry. IF off until the kernel stack is
      * in place; DF, TF, AC and NT never leak from user space into the kernel. */
     wrmsr(MSR_FMASK, 0x200 | 0x400 | 0x100 | 0x40000 | 0x4000);
@@ -3619,6 +3612,27 @@ void syscall_cpu_init(void)
 static bool strace_on(const struct tcb *t)
 {
     return strace_pat[0] && t->user && strstr(t->exe, strace_pat);
+}
+
+/* ... and the path a call names, on a line of its own. */
+static void strace_path(const struct tcb *t, uint64_t nr, const struct int_frame *f)
+{
+    uint64_t a;
+    switch (nr) {
+    case SYS_open: case SYS_stat: case SYS_lstat: case SYS_access: case SYS_execve: case SYS_readlink:
+    case SYS_chdir: case SYS_mkdir: case SYS_rmdir: case SYS_unlink: case SYS_statfs: case SYS_umount2:
+    case SYS_truncate: case SYS_chmod: case SYS_rename: case SYS_symlink: case SYS_link:
+        a = f->rdi; break;
+    case SYS_openat: case SYS_newfstatat: case SYS_unlinkat: case SYS_mkdirat: case SYS_readlinkat:
+    case SYS_faccessat: case SYS_faccessat2: case SYS_statx: case SYS_execveat: case SYS_renameat2: case SYS_mount:
+        a = f->rsi; break;
+    default:
+        return;
+    }
+    char buf[160];
+    long n = strncpy_from_user(buf, (const char *)a, sizeof buf);
+    if (n == -ENAMETOOLONG) n = (long)sizeof buf - 1;
+    if (n >= 0) kprintf("strace %d   path \"%s\"\n", t->pid, buf);
 }
 
 static bool may_block(uint64_t nr)
@@ -3833,6 +3847,7 @@ int syscall_dispatch(struct int_frame *f)
             kprintf("strace %d %s(%lx, %lx, %lx, %lx) ...\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4);
         uint64_t w0 = rdtsc(), c0 = kstat_run_cycles(t);
         if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
+        if (tr) strace_path(t, nr, f);
         int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
         f->rax = (uint64_t)r;
         if (!locked && bkl_depth()) locked = true;      /* fget took the lock on the way */

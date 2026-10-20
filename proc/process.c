@@ -303,7 +303,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     files_put(ofiles); fs_put(ofs); sighand_put(osh);
     signal_put(unused);
     c->mm = mm;
-    c->pml4 = c->cr3 = mm->pml4;
+    task_use_mm(c, mm);
     c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);   /* each thread: its own TLS block */
     c->gs_base = rdmsr(0xC0000102);                     /* the parent's user GS (swapped out) */
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
@@ -462,8 +462,7 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     if (!nw) { rc = -ENOMEM; goto out; }
     uint64_t fl = spin_lock_irqsave(&proc_lock);        /* task_mm_get() */
     t->mm = nw;
-    t->pml4 = t->cr3 = nw->pml4;
-    cpu_load_cr3(nw->pml4);
+    task_use_mm(t, nw);
     spin_unlock_irqrestore(&proc_lock, fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
@@ -471,8 +470,7 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     if (rc < 0) {
         fl = spin_lock_irqsave(&proc_lock);
         t->mm = old;
-        t->pml4 = t->cr3 = old->pml4;
-        cpu_load_cr3(old->pml4);
+        task_use_mm(t, old);
         spin_unlock_irqrestore(&proc_lock, fl);
         mm_put(nw);
         goto out;
@@ -1004,14 +1002,13 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, const struc
                         const struct ksig_info *si)
 {
     if (!(k->flags & SA_RESTORER) || !user_code(k->handler) || !user_code(k->restorer)) return false;
-    uint64_t sp = f->rsp - 128;                         /* skip the red zone */
+    uint64_t sp = f->rsp - 128, top = f->rsp;           /* skip the red zone */
     if ((k->flags & SA_ONSTACK) && t->alt_size && !sig_on_altstack(t, f->rsp))
-        sp = t->alt_sp + t->alt_size;                   /* sigaltstack(): a fresh stack */
-    uint64_t top = sp + 128 > f->rsp ? sp : f->rsp;
+        sp = top = t->alt_sp + t->alt_size;             /* sigaltstack(): a fresh stack */
     size_t fpu_bytes = fpu_xfeatures ? fpu_size + 4 : 512;  /* XSAVE: and FP_XSTATE_MAGIC2 */
     uint64_t fpu = (sp - fpu_bytes) & ~63ull;
     uint64_t frame = ((fpu - sizeof(struct rt_sigframe)) & ~15ull) - 8;   /* rsp+8 16-aligned */
-    if (frame < UVM_USER_START || top > UVM_USER_END || !user_range_ok(frame, top - frame)) return false;
+    if (top < frame || !user_range_ok(frame, top - frame)) return false;
 
     struct rt_sigframe fr;
     memset(&fr, 0, sizeof fr);

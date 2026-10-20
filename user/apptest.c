@@ -150,6 +150,55 @@ static void check_exec(const char *self)
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 7, "execveat(fd, \"\", AT_EMPTY_PATH): fexecve");
     close(fd);
     close(dir);
+
+    /* a program that is in no directory: a memfd holding a copy of us */
+    printf("/proc/self/fd:\n");
+    int src = open(self, O_RDONLY), mfd = (int)syscall(SYS_memfd_create, "apptest-copy", 0);
+    char buf[65536];
+    ssize_t n;
+    while (src >= 0 && mfd >= 0 && (n = read(src, buf, sizeof buf)) > 0) write(mfd, buf, (size_t)n);
+    if (src >= 0) close(src);
+    char path[64], target[256] = "";
+    snprintf(path, sizeof path, "/proc/self/fd/%d", mfd);
+    ssize_t tl = readlink(path, target, sizeof target - 1);
+    if (tl > 0) target[tl] = 0;
+    CHECK(mfd >= 0 && !strcmp(target, "/memfd:apptest-copy (deleted)"), "readlink of a memfd's link");
+    struct stat sb;
+    CHECK(stat(path, &sb) == 0 && S_ISREG(sb.st_mode) && (sb.st_mode & 0111) && sb.st_size > 0,
+          "stat through it: the memfd, executable");
+    p = fork();
+    if (!p) {
+        char *av[] = { "apptest", "--exit7", NULL }, *ev[] = { NULL };
+        syscall(SYS_execveat, mfd, "", av, ev, AT_EMPTY_PATH);
+        _exit(42);
+    }
+    waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 7, "fexecve of the memfd");
+    p = fork();
+    if (!p) {
+        char *av[] = { "apptest", "--exit7", NULL }, *ev[] = { NULL };
+        execve(path, av, ev);
+        _exit(42);
+    }
+    waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 7, "execve of /proc/self/fd/N");
+    close(mfd);
+    DIR *d = opendir("/dev/fd");
+    int seen = 0;
+    struct dirent *de;
+    while (d && (de = readdir(d))) if (!strcmp(de->d_name, "0") || !strcmp(de->d_name, "1") || !strcmp(de->d_name, "2")) seen++;
+    if (d) closedir(d);
+    CHECK(seen == 3, "/dev/fd lists 0, 1 and 2");
+    int pf[2];
+    pipe(pf);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", pf[0]);
+    tl = readlink(path, target, sizeof target - 1);
+    if (tl > 0) target[tl] = 0;
+    CHECK(tl > 0 && !strncmp(target, "pipe:", 5), "a pipe's link reads pipe:...");
+    if (tl <= 0 || strncmp(target, "pipe:", 5)) printf("        (read %zd: %s)\n", tl, tl > 0 ? target : strerror(errno));
+    close(pf[0]);
+    close(pf[1]);
+    CHECK(access(path, F_OK) < 0 && errno == ENOENT, "a closed descriptor's link is gone");
 }
 
 static void check_signals(void)

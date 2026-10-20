@@ -19,11 +19,14 @@
 ;  All 256 vectors have a stub; unexpected ones are counted and ignored.
 ; =============================================================================
 
+%include "arch/x86_64/lowwin.inc"
+
 bits 64
 section .text
 
 extern isr_dispatch
 extern percpu_is_kernel_gs
+extern uvm_kernel_cr3
 global isr_stub_table
 global isr_syscall_stub
 
@@ -137,22 +140,45 @@ isr_common:
     test    qword [rsp + 24], 3
     jz      .from_kernel
     swapgs                              ; from ring 3: kernel GS
+    ENTRY_KERNEL_CR3
 .from_kernel:
+    ENTRY_KERNEL_RIP
     PUSH_REGS
     mov     rdi, rsp                    ; struct int_frame *
     cld                                 ; SysV ABI: DF clear on call
     call    isr_dispatch
-    POP_REGS
-    test    qword [rsp + 24], 3
+    test    qword [rsp + 15*8 + 24], 3
     jz      .to_kernel
+    cli
+    EXIT_USER_CR3
+    POP_REGS
     swapgs                              ; back to ring 3: user GS
-.to_kernel:
     add     rsp, 16                     ; drop vector + error code
+    iretq
+.to_kernel:
+    POP_REGS
+    add     rsp, 16
     iretq
 
 ; ---- paranoid path (NMI, #DF, #MC): decide by the GS base itself --------------
+; They arrive on their IST stack, given by its direct address, with any CR3:
+; the kernel's own root while they run, and the interrupted one back after.
 isr_paranoid:
     PUSH_REGS
+    mov     rax, cr3
+    push    rax
+    push    rax                         ; (twice: the stack stays 16-aligned)
+    mov     rax, [rel uvm_kernel_cr3]   ; 0 until uvm_init(): boot's, which will do
+    test    rax, rax
+    jz      .cr3_kept
+    mov     cr3, rax
+.cr3_kept:
+    bt      rsp, 63
+    jnc     .stack_kept
+    mov     rax, UVM_DIRECT_BASE
+    sub     rsp, rax
+.stack_kept:
+    ENTRY_KERNEL_RIP
     mov     ecx, 0xC0000101             ; IA32_GS_BASE
     rdmsr
     shl     rdx, 32
@@ -166,12 +192,21 @@ isr_paranoid:
     swapgs
     mov     ebx, 1
 .kernel_gs:
-    mov     rdi, rsp
+    lea     rdi, [rsp + 16]
     call    isr_dispatch
     test    ebx, ebx
     jz      .noswap
     swapgs
 .noswap:
+    mov     rax, UVM_DIRECT_BASE        ; back on the direct view: CR3 may be a user's
+    add     rsp, rax
+    lea     rdx, [rel .direct]
+    add     rdx, rax
+    jmp     rdx
+.direct:
+    pop     rax
+    pop     rax
+    mov     cr3, rax
     POP_REGS
     add     rsp, 16
     iretq

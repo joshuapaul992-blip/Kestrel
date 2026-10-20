@@ -13,11 +13,14 @@
  *   IST1  #DF  double fault (e.g. a kernel stack overflow hit its guard page)
  *   IST2  NMI  can interrupt anything, including the first instructions of
  *              another handler
- *   IST3  #MC  machine check: hardware error, state unknown */
+ *   IST3  #MC  machine check: hardware error, state unknown
+ * The CPU reads all of these on entry from ring 3, before the kernel's CR3
+ * is loaded, so they are given by their UVM_DIRECT_BASE addresses (uvm.h). */
 #include <kernel/arch.h>
 #include <kernel/smp.h>
 #include <kernel/mm.h>
 #include <kernel/string.h>
+#include <kernel/uvm.h>
 
 struct tss {
     uint32_t reserved0;
@@ -40,7 +43,7 @@ struct gdt_ptr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
 static void set_tss_desc(int cpu)
 {
-    uint64_t base = (uint64_t)&tss[cpu], limit = sizeof tss[cpu] - 1;
+    uint64_t base = uvm_direct((uint64_t)&tss[cpu]), limit = sizeof tss[cpu] - 1;
     gdt[5 + 2 * cpu] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (0x89ull << 40) |
                        (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56);
     gdt[6 + 2 * cpu] = base >> 32;
@@ -49,7 +52,7 @@ static void set_tss_desc(int cpu)
 /* Load the GDT, reload the segment registers, and this CPU's TSS. */
 void gdt_load_cpu(int cpu)
 {
-    struct gdt_ptr p = { sizeof gdt - 1, (uint64_t)gdt };
+    struct gdt_ptr p = { sizeof gdt - 1, uvm_direct((uint64_t)gdt) };
     __asm__ volatile(
         "lgdt %0\n"
         "pushq %1\n"
@@ -79,7 +82,7 @@ bool tss_setup_cpu(int cpu)
         uint8_t *stk = cpu == 0 ? bsp_ist[i] : (uint8_t *)(uintptr_t)pmm_alloc_contig(IST_STACK_SIZE / PAGE_SIZE);
         if (!stk) return false;
         cpus[cpu].ist[i] = stk;
-        tss[cpu].ist[i] = (uint64_t)(stk + IST_STACK_SIZE);
+        tss[cpu].ist[i] = uvm_direct((uint64_t)(stk + IST_STACK_SIZE));
     }
     tss[cpu].iopb_offset = sizeof tss[cpu];
     cpus[cpu].tss = &tss[cpu];

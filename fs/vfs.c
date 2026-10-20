@@ -331,6 +331,14 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
         }
         struct vnode *c;
         if ((r = find(vn, comp, true, &c)) < 0) goto out;
+        if (c->type == VLNK && c->ops && c->ops->follow && (!is_last || slash || (flags & WALK_FOLLOW))) {
+            if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
+            struct vnode *to = c->ops->follow(c);       /* a magic link: the node itself */
+            if (!to) { r = -ENOENT; goto out; }
+            vn = to;
+            p = e;
+            continue;
+        }
         if (c->type == VLNK && (!is_last || slash || (flags & WALK_FOLLOW))) {
             if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
             int tl = link_target(c, tmp, VFS_PATH_MAX);
@@ -560,6 +568,17 @@ static void node_free(struct vnode *vn)
     vn->unlinked = true;
     vn->parent = NULL;
     if ((__atomic_fetch_or(&vn->refs, VN_GONE, __ATOMIC_ACQ_REL) & ~VN_GONE) == 0) node_destroy(vn);
+}
+
+void vfs_node_drop(struct vnode *dir, struct vnode *child)
+{
+    for (struct vnode **pp = &dir->children; *pp; pp = &(*pp)->sibling)
+        if (*pp == child) {
+            *pp = child->sibling;
+            child->sibling = NULL;
+            node_free(child);
+            return;
+        }
 }
 
 static int remove_node(struct vnode *dir, struct vnode *vn)
@@ -1542,6 +1561,10 @@ int vfs_umount(const char *path, int flags)
         for (struct mount *o = mounts; o; o = o->next)  /* mounts inside it go first */
             if (o != m && o->covered && in_subtree(o->covered, m->root)) { r = -EBUSY; break; }
     if (r == 0 && !(flags & 2) && !m->of && subtree_busy(m->root)) r = -EBUSY;     /* MNT_DETACH */
+    if (r == 0 && (flags & 4) && !m->expired) {         /* MNT_EXPIRE: the first call only marks it */
+        m->expired = true;
+        r = -EAGAIN;
+    }
     if (r < 0) { vfs_tree_unlock(); return r; }
     for (struct mount **pp = &mounts; *pp; pp = &(*pp)->next)
         if (*pp == m) { *pp = m->next; break; }
