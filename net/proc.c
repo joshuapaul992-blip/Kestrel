@@ -88,8 +88,28 @@ static size_t gen_header(char *buf, size_t cap, void *ctx)
 static size_t gen_snmp(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
-    return (size_t)snprintf(buf, cap, "Ip: InReceives OutRequests InDiscards ReasmReqds\nIp: %lu %lu %lu %lu\n",
-                            ip_stats(0), ip_stats(1), ip_stats(2), ip_stats(3));
+    size_t n = (size_t)snprintf(buf, cap, "Ip: InReceives OutRequests InDiscards ReasmReqds\nIp: %lu %lu %lu %lu\n",
+                                ip_stats(0), ip_stats(1), ip_stats(2), ip_stats(3));
+    if (n < cap) {
+        uint64_t f = net_lock();
+        n += tcp_snmp(buf + n, cap - n);
+        net_unlock(f);
+    }
+    return n < cap ? n : cap;
+}
+
+/* What each card's driver knows (link, PHY, chip counters), for debugging on
+ * real hardware. Not under net_lock: drivers may wait on the PHY. */
+static size_t gen_nic(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx;
+    size_t n = 0;
+    for (struct netif *i = netif_list(); i && n < cap; i = i->next) {
+        if (!i->info) continue;
+        n += (size_t)snprintf(buf + n, cap - n, "%s (%s):\n", i->name, i->driver);
+        if (n < cap) n += i->info(i, buf + n, cap - n);
+    }
+    return n < cap ? n : cap;
 }
 
 void net_proc_init(void)
@@ -104,6 +124,7 @@ void net_proc_init(void)
     pseudo_file(d, "tcp", gen_tcp, NULL);
     pseudo_file(d, "udp", gen_udp, NULL);
     pseudo_file(d, "pnp", gen_pnp, NULL);
+    pseudo_file(d, "nic", gen_nic, NULL);
     pseudo_file(d, "snmp", gen_snmp, NULL);
     static const char tcp6[] = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
     static const char udp6[] = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
