@@ -438,6 +438,7 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     if (!t->user || !f) { kfree(path); return -EINVAL; }
 
     int64_t rc = 0;
+    char *abs = NULL;
     struct exec_args ea = { 0, 0, NULL, NULL };
     size_t bytes = 0;
     if ((rc = copy_vector(uargv, &ea.argv, &ea.argc, &bytes)) < 0 ||
@@ -450,8 +451,10 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     struct vnode *pv;
     if ((rc = vfs_lookup(path, &pv)) < 0) goto out;
     bool noexec = pv->fs && (pv->fs->flags & MNT_NOEXEC);
+    abs = kmalloc(VFS_PATH_MAX);                        /* /proc/PID/exe: the absolute path */
+    if (abs && vfs_path_of(pv, abs, VFS_PATH_MAX) < 0) { kfree(abs); abs = NULL; }
     vfs_vnode_put(pv);
-    if (noexec) { rc = -EACCES; goto out; }         /* mounted noexec */
+    if (noexec) { rc = -EACCES; goto out; }             /* mounted noexec */
 
     /* Build the new image in a fresh address space; the old one stays
      * intact (and current again) if loading fails. */
@@ -512,7 +515,7 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     t->alt_sp = t->alt_size = 0;
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe and comm */
-    strlcpy(t->exe, path, sizeof t->exe);
+    strlcpy(t->exe, abs ? abs : path, sizeof t->exe);
     strlcpy(t->name, base, sizeof t->name);
     spin_unlock_irqrestore(&proc_lock, fl);
     fl = irq_save();
@@ -538,6 +541,7 @@ out:
     free_strings(ea.argv, ea.argc);
     free_strings(ea.envp, ea.envc);
     kfree(path);
+    kfree(abs);
     return rc;
 }
 
@@ -779,6 +783,7 @@ static int send_info_locked(struct tcb *t, int sig, const struct ksig_info *info
         struct tcb *o = task_slot(i);
         if (thread_alive(o) && same_group(o, t) && !(blocked_of(o) & sigbit(sig))) w = o;
     }
+    g->shared_to[sig - 1] = w;
     if (w) task_interrupt(w);
     wakeup(&signal_wait_chan);
     return 0;
@@ -823,10 +828,28 @@ void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint6
 
 static uint64_t pending_of(const struct tcb *t) { return t->sig_pending | t->signal->shared_pending; }
 
+/* What this thread is to deliver: its own signals, and the process's that
+ * were not woken into another thread still able to take them. As on Linux,
+ * a thread that sends its process a signal leaves it to the one woken (the
+ * main thread when it can), so a main thread asleep in read() is the one
+ * that sees EINTR. */
+static uint64_t deliverable_of(const struct tcb *t)
+{
+    uint64_t own = t->sig_pending, shared = t->signal->shared_pending, out = 0;
+    while (shared) {
+        int sig = __builtin_ctzll(shared) + 1;
+        shared &= shared - 1;
+        const struct tcb *w = t->signal->shared_to[sig - 1];
+        if (!w || w == t || !thread_alive(w) || !same_group(w, t) || (blocked_of(w) & sigbit(sig)))
+            out |= sigbit(sig);
+    }
+    return (own | out) & ~blocked_of(t);
+}
+
 bool signal_pending(void)
 {
     struct tcb *t = current_task();
-    return t->user && (pending_of(t) & ~blocked_of(t));
+    return t->user && deliverable_of(t);
 }
 
 uint64_t signal_pending_mask(void)
@@ -1103,7 +1126,7 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
     struct signal_struct *g = t->signal;
     for (;;) {
         uint64_t fl = spin_lock_irqsave(&proc_lock);    /* taken, with its action, in one go */
-        uint64_t ready = pending_of(t) & ~blocked_of(t);
+        uint64_t ready = deliverable_of(t);
         if (!ready) { spin_unlock_irqrestore(&proc_lock, fl); break; }
         int sig = (ready & sigbit(SIGKILL)) ? SIGKILL : __builtin_ctzll(ready) + 1;
         struct ksig_info info;

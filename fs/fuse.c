@@ -109,7 +109,7 @@ struct fuse_conn {
     struct fuse_req *pending, *sent;    /* to be read; read and awaiting their answers */
     struct fuse_init_out init_out;
     struct vnode dev_vn;        /* the open /dev/fuse */
-    char     name[32];          /* the type, for messages */
+    char     name[64];          /* the type, for messages */
 };
 
 /* Every FUSE node's ctx */

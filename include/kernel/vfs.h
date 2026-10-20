@@ -170,7 +170,7 @@ struct kstatfs {
 
 struct mount {
     char          path[VFS_PATH_MAX];
-    char          fstype[16];       /* Linux's name for it ("proc", "tmpfs", "ext2", "fuse.squashfuse"),
+    char          fstype[64];       /* Linux's name for it ("proc", "tmpfs", "ext2", "fuse.squashfuse"),
                                        or "bind": `of` is the file system shown */
     char          source[64];       /* /proc/mounts' first column (empty: the type) */
     struct mount *of;               /* bind mount: the source's file system */

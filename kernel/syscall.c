@@ -3317,18 +3317,21 @@ static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64
     if (current_task()->uid) return -EPERM;
     if ((flags & 0xffff0000u) == 0xc0ed0000u) flags &= 0xffff;      /* MS_MGC_VAL, from old programs */
     char *target = kmalloc(VFS_PATH_MAX), *canon = kmalloc(VFS_PATH_MAX), *src = kzalloc(VFS_PATH_MAX);
-    char *opts = kzalloc(PAGE_SIZE), type[32] = "";
+    char *opts = kzalloc(PAGE_SIZE), type[256] = "";
     int64_t r = target && canon && src && opts ? get_path(utarget, target) : -ENOMEM;
     struct vnode *tv = NULL, *sv = NULL;
     if (r < 0) goto out;
-    if (usrc && strncpy_from_user(src, (const char *)usrc, VFS_PATH_MAX) < 0) { r = -EFAULT; goto out; }
-    src[VFS_PATH_MAX - 1] = 0;
-    if (utype && !(flags & (MS_REMOUNT | MS_BIND | MS_MOVE))) {
-        long n = strncpy_from_user(type, (const char *)utype, sizeof type);
-        if (n < 0) { r = -EFAULT; goto out; }
-        if (n >= (long)sizeof type) { r = -ENODEV; goto out; }
+    long n;
+    if (usrc && (n = strncpy_from_user(src, (const char *)usrc, VFS_PATH_MAX)) < 0) { r = n; goto out; }
+    if (utype && !(flags & (MS_REMOUNT | MS_BIND | MS_MOVE)) &&
+        (n = strncpy_from_user(type, (const char *)utype, sizeof type)) < 0) {
+        r = n == -ENAMETOOLONG ? -ENODEV : n;
+        goto out;
     }
-    if (udata && strncpy_from_user(opts, (const char *)udata, PAGE_SIZE - 1) < 0) { r = -EFAULT; goto out; }
+    if (udata && (n = strncpy_from_user(opts, (const char *)udata, PAGE_SIZE)) < 0 && n != -ENAMETOOLONG) {
+        r = n;                                          /* a longer one is cut at a page, as Linux reads it */
+        goto out;
+    }
     if ((r = vfs_lookup(target, &tv)) < 0) goto out;
     if ((r = vfs_path_of(tv, canon, VFS_PATH_MAX)) < 0) goto out;      /* /proc/mounts shows it resolved */
 
@@ -3369,12 +3372,12 @@ static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64
         if ((r = vfs_lookup("/dev/pts", &sv)) < 0) { r = -ENODEV; goto out; }
         r = vfs_bind_node(sv, canon, "devpts");
     } else if (!strcmp(type, "fuse") || !strncmp(type, "fuse.", 5)) {
-        char full[32];
+        char full[64];
         const char *sub = strstr(opts, "subtype=");
         if (!strcmp(type, "fuse") && sub && (sub == opts || sub[-1] == ',')) {
             size_t n = 0;
             while (sub[8 + n] && sub[8 + n] != ',') n++;
-            snprintf(full, sizeof full, "fuse.%.*s", (int)(n < 26 ? n : 26), sub + 8);
+            snprintf(full, sizeof full, "fuse.%.*s", (int)(n < 58 ? n : 58), sub + 8);
         } else {
             strlcpy(full, type, sizeof full);
         }

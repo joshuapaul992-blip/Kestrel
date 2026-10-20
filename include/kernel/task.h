@@ -74,6 +74,7 @@ struct signal_struct {              /* CLONE_THREAD: the thread group        */
     int       nr_threads;           /* threads that have not exited          */
     uint64_t  shared_pending;       /* process-directed signals (kill)       */
     struct ksig_info shared_info[NSIG];
+    struct tcb *shared_to[NSIG];     /* the thread woken to take each one     */
     bool      group_exit;           /* exit_group() or a fatal signal        */
     int       group_exit_code;
     int       group_term_signal;
