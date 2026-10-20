@@ -1,4 +1,5 @@
-/* user/nettest.c -- AF_INET sockets on Kestrel: UDP, TCP, ICMP, interfaces
+/* user/nettest.c -- AF_INET sockets on Kestrel: UDP, TCP, ICMP, interfaces;
+ * netlink (rtnetlink, getifaddrs) and packet sockets with BPF filters
  *
  *   nettest                       loopback checks only
  *   nettest HOST:PORT             also: TCP and UDP echo through the network
@@ -30,6 +31,9 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <ifaddrs.h>
+#include <netpacket/packet.h>
+#include <netinet/if_ether.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("nettest:  %s  %s\n", ok_ ? "ok  " : "FAIL", what); \
@@ -140,6 +144,223 @@ static void test_interfaces(void)
 }
 
 /* ---- UDP ------------------------------------------------------------------------ */
+static void test_ping(const char *gw);
+
+/* The netlink and BPF ABI (musl ships no kernel headers): just what is used here */
+struct sockaddr_nl { unsigned short nl_family, nl_pad; uint32_t nl_pid, nl_groups; };
+struct nlmsghdr { uint32_t nlmsg_len; uint16_t nlmsg_type, nlmsg_flags; uint32_t nlmsg_seq, nlmsg_pid; };
+struct nlmsgerr { int error; struct nlmsghdr msg; };
+struct rtattr { unsigned short rta_len, rta_type; };
+struct rtgenmsg { unsigned char rtgen_family; };
+struct ifinfomsg { unsigned char ifi_family, ifi_pad; unsigned short ifi_type; int ifi_index; unsigned ifi_flags, ifi_change; };
+struct ifaddrmsg { uint8_t ifa_family, ifa_prefixlen, ifa_flags, ifa_scope; uint32_t ifa_index; };
+struct rtmsg { unsigned char rtm_family, rtm_dst_len, rtm_src_len, rtm_tos, rtm_table, rtm_protocol, rtm_scope, rtm_type; unsigned rtm_flags; };
+struct sock_filter { uint16_t code; uint8_t jt, jf; uint32_t k; };
+struct sock_fprog { unsigned short len; struct sock_filter *filter; };
+#define NETLINK_ROUTE   0
+#define NLM_F_REQUEST   1
+#define NLM_F_MULTI     2
+#define NLM_F_ACK       4
+#define NLM_F_DUMP      0x300
+#define NLM_F_CREATE    0x400
+#define NLMSG_ERROR     2
+#define NLMSG_DONE      3
+#define NLMSG_ALIGN(n)  (((n) + 3u) & ~3u)
+#define NLMSG_HDRLEN    ((int)NLMSG_ALIGN(sizeof(struct nlmsghdr)))
+#define NLMSG_LENGTH(n) ((n) + NLMSG_HDRLEN)
+#define NLMSG_DATA(h)   ((void *)((char *)(h) + NLMSG_HDRLEN))
+#define NLMSG_OK(h, n)  ((n) >= (int)sizeof(struct nlmsghdr) && (h)->nlmsg_len >= sizeof(struct nlmsghdr) && (h)->nlmsg_len <= (unsigned)(n))
+#define NLMSG_NEXT(h, n) ((n) -= NLMSG_ALIGN((h)->nlmsg_len), (struct nlmsghdr *)((char *)(h) + NLMSG_ALIGN((h)->nlmsg_len)))
+#define RTA_ALIGN(n)    (((n) + 3u) & ~3u)
+#define RTA_LENGTH(n)   (RTA_ALIGN(sizeof(struct rtattr)) + (n))
+#define RTA_DATA(a)     ((void *)((char *)(a) + RTA_LENGTH(0)))
+#define RTA_OK(a, n)    ((n) >= (int)sizeof(struct rtattr) && (a)->rta_len >= sizeof(struct rtattr) && (a)->rta_len <= (n))
+#define RTA_NEXT(a, n)  ((n) -= RTA_ALIGN((a)->rta_len), (struct rtattr *)((char *)(a) + RTA_ALIGN((a)->rta_len)))
+#define IFLA_RTA(i)     ((struct rtattr *)((char *)(i) + NLMSG_ALIGN(sizeof(struct ifinfomsg))))
+#define IFLA_PAYLOAD(h) ((h)->nlmsg_len - NLMSG_LENGTH(NLMSG_ALIGN(sizeof(struct ifinfomsg))))
+#define IFLA_IFNAME     3
+#define IFLA_MTU        4
+#define RTA_OIF         4
+#define RTM_NEWLINK     16
+#define RTM_GETLINK     18
+#define RTM_SETLINK     19
+#define RTM_NEWADDR     20
+#define RTM_GETADDR     22
+#define RTM_NEWROUTE    24
+#define RTMGRP_LINK     1
+#define RT_TABLE_MAIN   254
+#define RTN_UNICAST     1
+#define BPF_LD 0x00
+#define BPF_JMP 0x05
+#define BPF_RET 0x06
+#define BPF_B 0x10
+#define BPF_ABS 0x20
+#define BPF_JA 0x00
+#define BPF_JEQ 0x10
+#define BPF_K 0x00
+#ifndef SO_ATTACH_FILTER
+#define SO_ATTACH_FILTER 26
+#define SO_DETACH_FILTER 27
+#endif
+
+/* ---- netlink ------------------------------------------------------------------- */
+static int nl_open(unsigned groups)
+{
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    struct sockaddr_nl a = { .nl_family = AF_NETLINK, .nl_groups = groups };
+    if (s >= 0 && bind(s, (struct sockaddr *)&a, sizeof a) < 0) { close(s); return -1; }
+    return s;
+}
+
+static int nl_request(int s, int type, int flags, const void *body, size_t blen, unsigned seq)
+{
+    char buf[512];
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+    memset(buf, 0, sizeof buf);
+    h->nlmsg_len = NLMSG_LENGTH(blen);
+    h->nlmsg_type = (unsigned short)type;
+    h->nlmsg_flags = (unsigned short)(NLM_F_REQUEST | flags);
+    h->nlmsg_seq = seq;
+    memcpy(NLMSG_DATA(h), body, blen);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    return sendto(s, buf, h->nlmsg_len, 0, (struct sockaddr *)&k, sizeof k) == (ssize_t)h->nlmsg_len ? 0 : -1;
+}
+
+/* The answer to request seq: an NLMSG_ERROR's code (0 = ACK), or 1 when a reply of
+ * type `want` came; *found counts dump messages naming `name` (links) */
+static int nl_answer(int s, unsigned seq, int want, const char *name, int *count, int *found)
+{
+    static char buf[16384];
+    for (;;) {
+        struct pollfd pf = { s, POLLIN, 0 };
+        if (poll(&pf, 1, 2000) != 1) return -1000;
+        ssize_t n = recv(s, buf, sizeof buf, 0);
+        if (n < 0) return -1001;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (size_t)n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_seq != seq) continue;
+            if (h->nlmsg_type == NLMSG_DONE) return 1;
+            if (h->nlmsg_type == NLMSG_ERROR) return ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+            if (h->nlmsg_type != want) continue;
+            if (count) (*count)++;
+            if (want == RTM_NEWLINK && name && found) {
+                struct ifinfomsg *ifi = NLMSG_DATA(h);
+                int len = (int)IFLA_PAYLOAD(h);
+                for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, len); a = RTA_NEXT(a, len))
+                    if (a->rta_type == IFLA_IFNAME && !strcmp(RTA_DATA(a), name)) (*found)++;
+            }
+            if (!(h->nlmsg_flags & NLM_F_MULTI)) return 1;
+        }
+    }
+}
+
+static void test_netlink(void)
+{
+    struct ifaddrs *ifa = NULL;
+    int lo4 = 0, lopkt = 0;
+    CHECK(getifaddrs(&ifa) == 0, "getifaddrs() (netlink in musl)");
+    for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+        if (strcmp(i->ifa_name, "lo") || !i->ifa_addr) continue;
+        if (i->ifa_addr->sa_family == AF_INET && ((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) lo4++;
+        if (i->ifa_addr->sa_family == AF_PACKET) lopkt++;
+    }
+    if (ifa) freeifaddrs(ifa);
+    CHECK(lo4 == 1 && lopkt == 1, "getifaddrs: lo with 127.0.0.1 and its link");
+    struct if_nameindex *ni = if_nameindex();
+    int seen = 0;
+    for (struct if_nameindex *p = ni; p && p->if_index; p++) if (p->if_index == 1 && !strcmp(p->if_name, "lo")) seen = 1;
+    if (ni) if_freenameindex(ni);
+    CHECK(seen, "if_nameindex() lists lo as 1");
+
+    int s = nl_open(0), mon = nl_open(RTMGRP_LINK);
+    CHECK(s >= 0 && mon >= 0, "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) and bind");
+    struct sockaddr_nl me;
+    socklen_t ml = sizeof me;
+    CHECK(getsockname(s, (struct sockaddr *)&me, &ml) == 0 && me.nl_family == AF_NETLINK && me.nl_pid == (unsigned)getpid(),
+          "getsockname: the port id is the pid");
+    struct rtgenmsg g = { .rtgen_family = AF_UNSPEC };
+    int links = 0, lo = 0;
+    nl_request(s, RTM_GETLINK, NLM_F_DUMP, &g, sizeof g, 1);
+    CHECK(nl_answer(s, 1, RTM_NEWLINK, "lo", &links, &lo) == 1 && links >= 1 && lo == 1, "RTM_GETLINK dump lists lo, then NLMSG_DONE");
+    /* the next datagram's size, without taking it (iproute2 sizes its buffer so) */
+    nl_request(s, RTM_GETLINK, NLM_F_DUMP, &g, sizeof g, 2);
+    char tiny[4];
+    ssize_t full = recv(s, tiny, sizeof tiny, MSG_PEEK | MSG_TRUNC);
+    CHECK(full > (ssize_t)sizeof tiny, "recv(MSG_PEEK | MSG_TRUNC): the whole length");
+    nl_answer(s, 2, RTM_NEWLINK, NULL, NULL, NULL);
+    struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = 1 };
+    nl_request(s, RTM_GETLINK, 0, &ifi, sizeof ifi, 3);
+    int one = 0;
+    CHECK(nl_answer(s, 3, RTM_NEWLINK, "lo", &one, &one) == 1 && one == 2, "RTM_GETLINK of index 1: lo");
+    ifi.ifi_index = 4242;
+    nl_request(s, RTM_GETLINK, 0, &ifi, sizeof ifi, 4);
+    CHECK(nl_answer(s, 4, RTM_NEWLINK, NULL, NULL, NULL) == -ENODEV, "an unknown link: NLMSG_ERROR ENODEV");
+    int addrs = 0;
+    struct ifaddrmsg ia = { .ifa_family = AF_INET };
+    nl_request(s, RTM_GETADDR, NLM_F_DUMP, &ia, sizeof ia, 5);
+    CHECK(nl_answer(s, 5, RTM_NEWADDR, NULL, &addrs, NULL) == 1 && addrs >= 1, "RTM_GETADDR dump: IPv4 addresses");
+    struct { struct ifinfomsg i; struct rtattr a; unsigned mtu; } set = {
+        { .ifi_family = AF_UNSPEC, .ifi_index = 1 }, { RTA_LENGTH(4), IFLA_MTU }, 16436 };
+    nl_request(s, RTM_SETLINK, NLM_F_ACK, &set, sizeof set, 6);
+    CHECK(nl_answer(s, 6, 0, NULL, NULL, NULL) == 0, "RTM_SETLINK with NLM_F_ACK: acknowledged");
+    int news = 0;
+    CHECK(nl_answer(mon, 0, RTM_NEWLINK, NULL, &news, NULL) == 1 && news == 1, "RTMGRP_LINK listener hears the change");
+    struct { struct rtmsg r; struct rtattr a; unsigned oif; } rt = {
+        { .rtm_family = AF_INET, .rtm_dst_len = 24, .rtm_table = RT_TABLE_MAIN, .rtm_type = RTN_UNICAST }, { RTA_LENGTH(4), RTA_OIF }, 4242 };
+    nl_request(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_ACK, &rt, sizeof rt, 7);
+    CHECK(nl_answer(s, 7, 0, NULL, NULL, NULL) == -ENODEV, "RTM_NEWROUTE through an unknown link: ENODEV");
+    close(s);
+    close(mon);
+
+    /* packet sockets and their filters */
+    int p = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    CHECK(p >= 0, "socket(AF_PACKET, SOCK_RAW, ETH_P_ALL)");
+    struct sock_filter bad[] = { { BPF_JMP | BPF_JA, 0, 0, 5 }, { BPF_RET | BPF_K, 0, 0, 0 } };
+    struct sock_fprog fb = { 2, bad };
+    CHECK(setsockopt(p, SOL_SOCKET, SO_ATTACH_FILTER, &fb, sizeof fb) < 0 && errno == EINVAL, "a BPF jump out of the program: EINVAL");
+    struct sock_filter none[] = { { BPF_RET | BPF_K, 0, 0, 0 } };
+    struct sock_fprog fn = { 1, none };
+    CHECK(setsockopt(p, SOL_SOCKET, SO_ATTACH_FILTER, &fn, sizeof fn) == 0, "SO_ATTACH_FILTER");
+    CHECK(setsockopt(p, SOL_SOCKET, SO_DETACH_FILTER, NULL, 0) == 0, "SO_DETACH_FILTER");
+    close(p);
+}
+
+/* On eth0, while pinging the gateway: an ICMP-only filter sees the reply,
+ * ETH_P_ALL sees our request going out */
+static void test_packet_remote(const char *gw)
+{
+    int ifindex = (int)if_nametoindex("eth0");
+    int ip = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)), all = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    struct sockaddr_ll a = { .sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_IP), .sll_ifindex = ifindex };
+    CHECK(ip >= 0 && bind(ip, (struct sockaddr *)&a, sizeof a) == 0, "packet socket bound to eth0, ETH_P_IP");
+    struct sock_filter icmp[] = {
+        { BPF_LD | BPF_B | BPF_ABS, 0, 0, 9 },          /* the IP protocol */
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 1, IPPROTO_ICMP },
+        { BPF_RET | BPF_K, 0, 0, 0xffff },
+        { BPF_RET | BPF_K, 0, 0, 0 },
+    };
+    struct sock_fprog f = { 4, icmp };
+    CHECK(setsockopt(ip, SOL_SOCKET, SO_ATTACH_FILTER, &f, sizeof f) == 0, "an ICMP-only BPF filter");
+    a.sll_protocol = htons(ETH_P_ALL);
+    bind(all, (struct sockaddr *)&a, sizeof a);
+    test_ping(gw);
+    unsigned char b[2048];
+    struct sockaddr_ll from;
+    socklen_t fl = sizeof from;
+    int reply = 0, others = 0;
+    ssize_t n;
+    while ((n = recvfrom(ip, b, sizeof b, MSG_DONTWAIT, (struct sockaddr *)&from, &fl)) > 0) {
+        if (n >= 28 && b[9] == IPPROTO_ICMP && b[20] == 0 && from.sll_pkttype == PACKET_HOST && from.sll_ifindex == ifindex) reply++;
+        else others++;
+    }
+    CHECK(reply >= 1 && !others, "SOCK_DGRAM: the echo reply, IP header first, and nothing else");
+    int out = 0;
+    while ((n = recvfrom(all, b, sizeof b, MSG_DONTWAIT, (struct sockaddr *)&from, &fl)) > 0)
+        if (n >= 42 && from.sll_pkttype == PACKET_OUTGOING && b[12] == 8 && b[13] == 0 && b[23] == IPPROTO_ICMP && b[34] == 8) out++;
+    CHECK(out >= 1, "ETH_P_ALL: our echo request going out, with its Ethernet header");
+    close(ip);
+    close(all);
+}
+
 static void test_udp(void)
 {
     int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
@@ -427,6 +648,7 @@ static void test_remote(const char *hostport)
     CHECK(dflt, "/proc/net/route has a default route");
     if (fd >= 0) close(fd);
     test_ping(host);
+    if (!getuid()) test_packet_remote(host);
     double dt = bulk_echo(host, port, -1);
     CHECK(dt > 0, "TCP through the network card: 8 MiB echoed by the host intact");
     if (dt > 0) printf("nettest:        network echo: %.1f MiB/s each way\n", 8.0 / dt);
@@ -489,6 +711,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc == 3 && !strcmp(argv[1], "serve")) return serve(atoi(argv[2]));
     test_interfaces();
+    test_netlink();
     test_udp();
     test_tcp_basic();
     test_tcp_bulk();

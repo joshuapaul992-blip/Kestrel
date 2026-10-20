@@ -19,6 +19,7 @@
 #include <kernel/posix.h>
 #include <kernel/smp.h>
 #include <kernel/spinlock.h>
+#include <kernel/xsock.h>
 
 static struct netif *ifaces;
 static int next_index = 1;
@@ -224,6 +225,7 @@ int route_add(uint32_t dst, uint32_t mask, uint32_t gw, struct netif *nif)
     for (int i = 0; i < MAX_ROUTES; i++) {
         if (routes[i].used && routes[i].dst == (dst & mask) && routes[i].mask == mask) {
             routes[i].gw = gw; routes[i].nif = nif;     /* replace */
+            rtnl_notify_route(dst & mask, mask, gw, nif, true);
             net_unlock(f);
             return 0;
         }
@@ -231,6 +233,7 @@ int route_add(uint32_t dst, uint32_t mask, uint32_t gw, struct netif *nif)
     }
     if (free < 0) { net_unlock(f); return -1; }
     routes[free] = (struct route){ dst & mask, mask, gw, nif, true };
+    rtnl_notify_route(dst & mask, mask, gw, nif, true);
     net_unlock(f);
     return 0;
 }
@@ -246,23 +249,68 @@ struct netif *route_default_if(void)
 int route_del(uint32_t dst, uint32_t mask)
 {
     for (int i = 0; i < MAX_ROUTES; i++)
-        if (routes[i].used && routes[i].dst == (dst & mask) && routes[i].mask == mask) { routes[i].used = false; return 0; }
+        if (routes[i].used && routes[i].dst == (dst & mask) && routes[i].mask == mask) {
+            routes[i].used = false;
+            rtnl_notify_route(routes[i].dst, mask, routes[i].gw, routes[i].nif, false);
+            return 0;
+        }
     return -1;
 }
 
 void route_flush_if(struct netif *nif)
 {
-    for (int i = 0; i < MAX_ROUTES; i++) if (routes[i].used && routes[i].nif == nif) routes[i].used = false;
+    for (int i = 0; i < MAX_ROUTES; i++)
+        if (routes[i].used && routes[i].nif == nif) {
+            routes[i].used = false;
+            rtnl_notify_route(routes[i].dst, routes[i].mask, routes[i].gw, nif, false);
+        }
 }
 
 void netif_set_addr(struct netif *nif, uint32_t ip, uint32_t mask)
 {
     uint64_t f = net_lock();
+    if (nif->ip == ip && nif->mask == mask) { net_unlock(f); return; }
     if (nif->ip && nif->mask) route_del(nif->ip & nif->mask, nif->mask);
+    if (nif->ip) rtnl_notify_addr(nif, nif->ip, nif->mask, false);
     nif->ip = ip;
     nif->mask = mask;
+    if (ip) rtnl_notify_addr(nif, ip, mask, true);
     if (ip && mask) route_add(ip & mask, mask, 0, nif);
     net_unlock(f);
+}
+
+void netif_set_up(struct netif *nif, bool up)
+{
+    uint64_t f = net_lock();
+    uint32_t old = nif->flags;
+    nif->flags &= ~(uint32_t)(IFF_UP | IFF_RUNNING);
+    if (up) {
+        nif->flags |= IFF_UP;
+        if (!nif->link_up || nif->link_up(nif)) nif->flags |= IFF_RUNNING;   /* lo has no link to lose */
+    } else if (old & IFF_UP) arp_flush_if(nif);
+    if (nif->flags != old) rtnl_notify_link(nif);
+    net_unlock(f);
+}
+
+void netif_carrier(struct netif *nif, bool on)
+{
+    uint64_t f = net_lock();
+    uint32_t old = nif->flags;
+    if (on && (nif->flags & IFF_UP)) nif->flags |= IFF_RUNNING;
+    else nif->flags &= ~(uint32_t)IFF_RUNNING;
+    if (nif->flags != old) rtnl_notify_link(nif);
+    net_unlock(f);
+}
+
+int netif_xmit(struct netif *nif, const uint8_t *frame, size_t len)
+{
+    if (!(nif->flags & IFF_UP) || !nif->xmit) { nif->tx_dropped++; return -1; }
+    int rc = nif->xmit(nif, frame, len);
+    if (rc < 0) { nif->tx_dropped++; return rc; }
+    nif->tx_packets++;
+    nif->tx_bytes += len;
+    if (msocks_packet) packet_tap(nif, frame, len, true);
+    return rc;
 }
 
 bool ip_is_local(uint32_t ip)
@@ -292,6 +340,7 @@ void net_rx_frame(struct netif *nif, const void *frame, size_t len)
     if (len < ETH_HLEN || len > ETH_FRAME_MAX) { nif->rx_errors++; return; }
     nif->rx_packets++;
     nif->rx_bytes += len;
+    if (msocks_packet) packet_tap(nif, frame, len, false);
     if (!(nif->flags & IFF_UP)) { nif->rx_dropped++; return; }
     const uint8_t *f = frame;
     static const uint8_t bcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };

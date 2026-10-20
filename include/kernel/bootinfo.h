@@ -6,8 +6,8 @@
 #include <stdbool.h>
 
 #define KESTREL_NAME     "Kestrel"
-#define KESTREL_VERSION  "0.3.7"
-#define KESTREL_RELEASE  "0.3.7"
+#define KESTREL_VERSION  "0.3.7a"
+#define KESTREL_RELEASE  "0.3.7a"
 #define KESTREL_CODENAME "Stable Storage Engine"
 #define KESTREL_HOSTNAME "kestrel-pc"
 #define KESTREL_MACHINE  "x86_64"

@@ -86,7 +86,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kerne
            proc/task.c proc/exec.c proc/process.c \
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
-           net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c \
+           net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c net/msock.c net/netlink.c net/packet.c \
            drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/sound/hda.c drivers/net/rtl8169.c \
            lib/string.c lib/printf.c
 

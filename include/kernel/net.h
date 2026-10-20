@@ -48,6 +48,7 @@ void     net_sleep(void *chan, uint64_t deadline_ms);  /* lock held: all of it l
 #define IPPROTO_ICMP    1
 #define IPPROTO_TCP     6
 #define IPPROTO_UDP     17
+#define IPPROTO_RAW     255
 
 /* ---- packet buffers ------------------------------------------------------
  * One packet in one flat buffer, with headroom so that each layer can put
@@ -129,6 +130,10 @@ int  route_del(uint32_t dst, uint32_t mask);
 struct netif *route_default_if(void);   /* where the default route goes, or NULL */
 void route_flush_if(struct netif *nif);
 void netif_set_addr(struct netif *nif, uint32_t ip, uint32_t mask);   /* also the subnet route */
+void netif_set_up(struct netif *nif, bool up);   /* IFF_UP, and IFF_RUNNING from the link */
+void netif_carrier(struct netif *nif, bool on); /* a driver saw its link come or go: IFF_RUNNING */
+/* Send one Ethernet frame (at least 60 bytes) on nif: counted, shown to packet sockets. */
+int  netif_xmit(struct netif *nif, const uint8_t *frame, size_t len);
 bool ip_is_local(uint32_t ip);          /* one of ours (any interface)   */
 uint32_t ip_source_for(uint32_t dst);   /* address a packet to dst leaves with */
 uint16_t netif_mtu_for(uint32_t dst);   /* MTU of the route to dst */
@@ -145,6 +150,9 @@ int  arp_output(struct netif *nif, uint32_t nexthop, struct pkt *p);   /* takes 
 void arp_timer(uint64_t now);
 void arp_flush_if(struct netif *nif);
 size_t arp_proc(char *buf, size_t cap);
+/* Every cache entry, for netlink; and forgetting one (-1: none) */
+void arp_each(void (*fn)(void *ctx, struct netif *nif, uint32_t ip, const uint8_t *mac, bool resolved), void *ctx);
+int  arp_forget(struct netif *nif, uint32_t ip);
 
 void ip_input(struct netif *nif, struct pkt *p);
 /* Send p (payload at pkt_data) to dst; src 0 = pick. Takes p. */
@@ -163,6 +171,7 @@ void dhcp_start(struct netif *nif);
 void dhcp_timer(uint64_t now);
 void dhcp_input(struct netif *nif, struct pkt *p, uint32_t src, uint16_t sport, uint16_t dport);
 bool dhcp_busy(void);
+void dhcp_stop(struct netif *nif);       /* user space configures nif itself now */
 
 void net_proc_init(void);
 size_t tcp_proc(char *buf, size_t cap);

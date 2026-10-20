@@ -135,6 +135,18 @@ void dhcp_start(struct netif *nif)
     net_unlock(f);
 }
 
+void dhcp_stop(struct netif *nif)
+{
+    uint64_t f = net_lock();
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].nif == nif && clients[i].state != D_OFF) {
+            kprintf("net: %s: configured from user space, DHCP stops\n", nif->name);
+            clients[i].state = D_OFF;
+            clients[i].next = 0;
+        }
+    net_unlock(f);
+}
+
 static const uint8_t *find_opt(const struct dhcp_msg *m, size_t len, uint8_t code, uint8_t *olen)
 {
     const uint8_t *o = m->options, *end = (const uint8_t *)m + len;

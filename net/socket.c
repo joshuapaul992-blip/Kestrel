@@ -98,9 +98,9 @@ int inet_create(int type, int protocol, struct file **out)
         proto = protocol ? protocol : IPPROTO_UDP;
         break;
     case SOCK_RAW:
-        if (protocol != IPPROTO_ICMP) return -EPROTONOSUPPORT;
+        if (protocol != IPPROTO_ICMP && protocol != IPPROTO_RAW) return -EPROTONOSUPPORT;
         if (current_task()->uid != 0) return -EPERM;
-        proto = IPPROTO_ICMP;
+        proto = protocol;
         break;
     default:
         return -ESOCKTNOSUPPORT;
@@ -231,6 +231,28 @@ static int inet_accept_(struct file *f, int flags, struct file **out, struct soc
     return 0;
 }
 
+/* IPPROTO_RAW: the caller wrote the IP header (IP_HDRINCL); its addresses,
+ * protocol, TTL and TOS are used, options are dropped, the payload goes as
+ * it is. Such a socket receives nothing, as on Linux. */
+static long raw_ip_send(struct isock *s, const uint8_t *buf, size_t len)
+{
+    (void)s;
+    if (len < 20 || (buf[0] >> 4) != 4) return -EINVAL;
+    size_t ihl = (size_t)(buf[0] & 0xf) * 4;
+    if (ihl < 20 || ihl > len) return -EINVAL;
+    if (len - ihl > ETH_MTU - 20) return -EMSGSIZE;
+    uint32_t src, dst;
+    memcpy(&src, buf + 12, 4);
+    memcpy(&dst, buf + 16, 4);
+    struct pkt *p = pkt_alloc();
+    if (!p) return -ENOBUFS;
+    memcpy(pkt_data(p), buf + ihl, len - ihl);
+    p->len = (uint16_t)(len - ihl);
+    bool df = (buf[6] & 0x40) != 0;
+    int rc = ip_output(p, src, dst, buf[9], buf[8] ? buf[8] : 64, buf[1], df);
+    return rc < 0 ? rc : (long)len;
+}
+
 static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags, const void *to, uint32_t tolen)
 {
     struct isock *s = isk(f);
@@ -252,9 +274,10 @@ static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags,
         dport = s->rport;
     }
     uint64_t fl = net_lock();
-    long rc = autobind(s);
+    long rc = s->proto == IPPROTO_RAW ? 0 : autobind(s);
     if (!rc) {
-        if (s->err) { rc = -s->err; s->err = 0; }       /* report an ICMP error from an earlier send */
+        if (s->proto == IPPROTO_RAW) rc = raw_ip_send(s, buf, len);
+        else if (s->err) { rc = -s->err; s->err = 0; }  /* report an ICMP error from an earlier send */
         else if (s->proto == IPPROTO_UDP) rc = udp_send(s, buf, len, dst, dport);
         else rc = icmp_sock_send(s, buf, len, dst);
     }
@@ -588,15 +611,7 @@ static int net_ioctl_(unsigned long req, void *arg)
     int rc = 0;
     switch (req) {
     case SIOCGIFFLAGS:   r->u.flags = (int16_t)n->flags; break;
-    case SIOCSIFFLAGS: {
-        uint32_t nf = (uint16_t)r->u.flags;
-        if (n == netif_loopback()) nf |= IFF_LOOPBACK;
-        bool was_up = n->flags & IFF_UP;
-        n->flags = (n->flags & ~(uint32_t)(IFF_UP | IFF_RUNNING)) | (nf & IFF_UP);
-        if (!(nf & IFF_UP) && was_up) arp_flush_if(n);
-        if ((nf & IFF_UP) && (!n->link_up || n->link_up(n))) n->flags |= IFF_RUNNING;   /* lo has no link to lose */
-        break;
-    }
+    case SIOCSIFFLAGS:   netif_set_up(n, (uint16_t)r->u.flags & IFF_UP); break;
     case SIOCGIFADDR:    if (!n->ip) { rc = -EADDRNOTAVAIL; break; } set_sin(&r->u.addr, n->ip); break;
     case SIOCSIFADDR: {
         uint32_t mask = n->mask;
@@ -604,11 +619,12 @@ static int net_ioctl_(unsigned long req, void *arg)
             uint8_t a = (uint8_t)r->u.addr.sin_addr;
             mask = a < 128 ? IP4(255, 0, 0, 0) : a < 192 ? IP4(255, 255, 0, 0) : IP4(255, 255, 255, 0);
         }
+        dhcp_stop(n);                                   /* user space configures it now */
         netif_set_addr(n, r->u.addr.sin_addr, mask);
         break;
     }
     case SIOCGIFNETMASK: if (!n->ip) { rc = -EADDRNOTAVAIL; break; } set_sin(&r->u.addr, n->mask); break;
-    case SIOCSIFNETMASK: netif_set_addr(n, n->ip, r->u.addr.sin_addr); break;
+    case SIOCSIFNETMASK: dhcp_stop(n); netif_set_addr(n, n->ip, r->u.addr.sin_addr); break;
     case SIOCGIFBRDADDR: if (!n->ip) { rc = -EADDRNOTAVAIL; break; } set_sin(&r->u.addr, n->ip | ~n->mask); break;
     case SIOCSIFBRDADDR: break;
     case SIOCGIFMTU:     r->u.ival = n->mtu; break;
