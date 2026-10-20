@@ -25,6 +25,7 @@
 #include <kernel/uvm.h>
 #include <kernel/socket.h>
 #include <kernel/inet.h>
+#include <kernel/xsock.h>
 #include <kernel/uaccess.h>
 #include <kernel/termios.h>
 #include <kernel/kfb.h>
@@ -88,14 +89,14 @@ static bool fd_nolock(uint64_t fd)
     return r;
 }
 
-/* Is fd a socket: AF_INET (the network stack's lock, net_lock) or AF_UNIX
- * (fs/unixsock.c's lock, its name table included)? */
+/* Is fd a socket: AF_INET, AF_NETLINK, AF_PACKET (the network stack's lock,
+ * net_lock) or AF_UNIX (fs/unixsock.c's lock, its name table included)? */
 static bool fd_sock(uint64_t fd)
 {
     if (fd >= MAX_FDS) return false;
     struct files_struct *fs = current_task()->files;
     uint64_t fl = spin_lock_irqsave(&fs->lock);
-    bool r = inet_is(fs->fd[fd]) || usock_is(fs->fd[fd]);
+    bool r = inet_is(fs->fd[fd]) || usock_is(fs->fd[fd]) || xsock_is(fs->fd[fd]);
     spin_unlock_irqrestore(&fs->lock, fl);
     return r;
 }
@@ -575,7 +576,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
         r = 0;
         goto out;
     }
-    if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
+    if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f) || xsock_is(f))) {
         r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
     } else if (size < 0) {
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
@@ -2054,13 +2055,14 @@ static int64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags, uint64_
     return (int64_t)len;
 }
 
-/* ---- sockets: AF_UNIX (fs/unixsock.c) and AF_INET (net/socket.c) ---------- */
+/* ---- sockets: AF_UNIX (fs/unixsock.c), AF_INET (net/socket.c), AF_NETLINK
+ * and AF_PACKET (net/msock.c) ---------------------------------------------- */
 /* The socket behind fd, with a reference (fput it). */
 static int64_t sock_get(int fd, struct file **out)
 {
     struct file *f = fget(fd);
     if (!f) return -EBADF;
-    if (!usock_is(f) && !inet_is(f)) { fput(f); return -ENOTSOCK; }
+    if (!usock_is(f) && !inet_is(f) && !xsock_is(f)) { fput(f); return -ENOTSOCK; }
     *out = f;
     return 0;
 }
@@ -2087,7 +2089,9 @@ static int64_t sys_socket(uint64_t dom, uint64_t type, uint64_t proto, uint64_t 
 {
     (void)a4; (void)a5; (void)a6;
     struct file *f;
-    int rc = dom == AF_INET ? inet_create((int)type, (int)proto, &f) : usock_create((int)dom, (int)type, (int)proto, &f);
+    int rc = dom == AF_INET ? inet_create((int)type, (int)proto, &f)
+           : dom == AF_NETLINK || dom == AF_PACKET ? xsock_create((int)dom, (int)type, (int)proto, &f)
+           : usock_create((int)dom, (int)type, (int)proto, &f);
     return rc ? rc : install(f, type & SOCK_CLOEXEC);
 }
 
@@ -2111,7 +2115,8 @@ static int64_t sys_bind(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4, u
     if (rc) return rc;
     struct file *f;
     if ((rc = sock_get((int)fd, &f))) return rc;
-    rc = inet_is(f) ? inet_bind(f, &a, (uint32_t)len) : usock_bind(f, &a, (uint32_t)len);
+    rc = inet_is(f) ? inet_bind(f, &a, (uint32_t)len) : xsock_is(f) ? xsock_bind(f, &a, (uint32_t)len)
+       : usock_bind(f, &a, (uint32_t)len);
     fput(f);
     return rc;
 }
@@ -2121,7 +2126,7 @@ static int64_t sys_listen(uint64_t fd, uint64_t backlog, uint64_t a3, uint64_t a
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = inet_is(f) ? inet_listen(f, (int)backlog) : usock_listen(f, (int)backlog);
+    rc = inet_is(f) ? inet_listen(f, (int)backlog) : xsock_is(f) ? -EOPNOTSUPP : usock_listen(f, (int)backlog);
     fput(f);
     return rc;
 }
@@ -2134,7 +2139,8 @@ static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4
     if (rc) return rc;
     struct file *f;
     if ((rc = sock_get((int)fd, &f))) return rc;
-    rc = inet_is(f) ? inet_connect(f, &a, (uint32_t)len) : usock_connect(f, &a, (uint32_t)len);
+    rc = inet_is(f) ? inet_connect(f, &a, (uint32_t)len) : xsock_is(f) ? xsock_connect(f, &a, (uint32_t)len)
+       : usock_connect(f, &a, (uint32_t)len);
     fput(f);
     return rc;
 }
@@ -2148,6 +2154,7 @@ static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t f
     struct file *nf;
     struct sockaddr_un a;
     uint32_t got = sizeof a;
+    if (xsock_is(f)) { fput(f); return -EOPNOTSUPP; }
     if (inet_is(f)) {
         struct sockaddr_in sin;
         rc = inet_accept(f, (int)flags, &nf, &sin);
@@ -2209,6 +2216,28 @@ static int64_t inet_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags,
     return total;
 }
 
+/* AF_NETLINK and AF_PACKET: one message through a bounce buffer */
+#define XSOCK_MSG_MAX   (256 * 1024)
+static int64_t xsock_xfer(struct file *f, struct sock_io *io, uint64_t len, int flags, bool send,
+                          const struct sockaddr_un *to, uint32_t tolen, void *from, uint32_t *fromlen, int *mflags)
+{
+    if (send && len > XSOCK_MSG_MAX) return -EMSGSIZE;
+    size_t cap = len < XSOCK_MSG_MAX ? (size_t)len : XSOCK_MSG_MAX;
+    uint8_t *kb = kmalloc(cap ? cap : 1);
+    if (!kb) return -ENOMEM;
+    int64_t rc;
+    if (send) {
+        if (sock_io_copy(io, kb, cap, false)) rc = -EFAULT;
+        else rc = xsock_sendto(f, kb, cap, flags, to, tolen);
+    } else {
+        rc = xsock_recvfrom(f, kb, cap, flags, from, fromlen, mflags);
+        size_t got = rc > 0 ? ((size_t)rc < cap ? (size_t)rc : cap) : 0;
+        if (got && sock_io_copy(io, kb, got, true)) rc = -EFAULT;
+    }
+    kfree(kb);
+    return rc;
+}
+
 static int64_t sys_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t addr, uint64_t alen)
 {
     if ((int64_t)len < 0) return -EINVAL;
@@ -2218,6 +2247,16 @@ static int64_t sys_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flag
         struct sockaddr_un a;
         if (addr && (rc = get_sockaddr(addr, alen, &a))) { fput(f); return rc; }
         rc = inet_xfer(f, buf, len, (int)flags, true, addr ? &a : NULL, addr ? (uint32_t)alen : 0, NULL, NULL);
+        fput(f);
+        return rc;
+    }
+    if (xsock_is(f)) {
+        struct sockaddr_un a;
+        if (addr && (rc = get_sockaddr(addr, alen, &a))) { fput(f); return rc; }
+        if (len && !ubuf_ok(buf, len)) { fput(f); return -EFAULT; }
+        struct iovec v = { buf, len };
+        struct sock_io io = SOCK_IO_USER(&v, 1);
+        rc = xsock_xfer(f, &io, len, (int)flags, true, addr ? &a : NULL, addr ? (uint32_t)alen : 0, NULL, NULL, NULL);
         fput(f);
         return rc;
     }
@@ -2237,6 +2276,17 @@ static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fl
         rc = inet_xfer(f, buf, len, (int)flags, false, NULL, 0, &from, NULL);
         fput(f);
         if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, sizeof from)) return -EFAULT;
+        return rc;
+    }
+    if (xsock_is(f)) {
+        if (len && !ubuf_ok(buf, len)) { fput(f); return -EFAULT; }
+        struct iovec v = { buf, len };
+        struct sock_io io = SOCK_IO_USER(&v, 1);
+        struct sockaddr_un from;
+        uint32_t flen = 0;
+        rc = xsock_xfer(f, &io, len, (int)flags, false, NULL, 0, &from, &flen, NULL);
+        fput(f);
+        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, &from, flen)) return -EFAULT;
         return rc;
     }
     rc = sock_xfer(f, buf, len, (int)flags, false);
@@ -2372,6 +2422,45 @@ out:
     return total;
 }
 
+/* sendmsg/recvmsg on AF_NETLINK and AF_PACKET: one message, no control messages */
+static int64_t xsock_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, uint64_t flags, bool send)
+{
+    struct iovec *v = m->iovlen ? kmalloc(m->iovlen * sizeof *v) : NULL;
+    int64_t rc;
+    uint64_t len = 0;
+    if (m->iovlen && !v) return -ENOMEM;
+    if (copy_from_user(v, (const void *)m->iov, m->iovlen * sizeof *v)) { rc = -EFAULT; goto out; }
+    for (uint64_t i = 0; i < m->iovlen; i++) {
+        if ((int64_t)v[i].len < 0 || len + v[i].len < len || len + v[i].len > 0x7ffff000) { rc = -EINVAL; goto out; }
+        if (v[i].len && !ubuf_ok(v[i].base, v[i].len)) { rc = -EFAULT; goto out; }
+        len += v[i].len;
+    }
+    struct sock_io io = SOCK_IO_USER(v, m->iovlen);
+    if (send) {
+        struct sockaddr_un to;
+        bool named = m->name && m->namelen;
+        if (named && (rc = get_sockaddr(m->name, m->namelen, &to))) goto out;
+        rc = xsock_xfer(f, &io, len, (int)flags, true, named ? &to : NULL, named ? m->namelen : 0, NULL, NULL, NULL);
+    } else {
+        struct sockaddr_un from;
+        uint32_t flen = 0;
+        int mflags = 0;
+        rc = xsock_xfer(f, &io, len, (int)flags, false, NULL, 0, &from, &flen, &mflags);
+        if (rc < 0) goto out;
+        if (m->name) {
+            uint32_t nl = m->namelen < flen ? m->namelen : flen;
+            if (nl && copy_to_user((void *)m->name, &from, nl)) { rc = -EFAULT; goto out; }
+            m->namelen = flen;
+        }
+        m->controllen = 0;
+        m->flags = mflags;
+        if (copy_to_user((void *)umsg, m, sizeof *m)) rc = -EFAULT;
+    }
+out:
+    kfree(v);
+    return rc;
+}
+
 static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
 {
     struct msghdr_k m;
@@ -2381,6 +2470,7 @@ static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
     if (inet_is(f)) { rc = inet_msg_io(f, &m, umsg, flags, send); fput(f); return rc; }
+    if (xsock_is(f)) { rc = xsock_msg_io(f, &m, umsg, flags, send); fput(f); return rc; }
     struct iovec *v = m.iovlen ? kmalloc(m.iovlen * sizeof *v) : NULL;
     uint8_t *ctl = m.controllen ? kmalloc(m.controllen) : NULL;
     struct file *files[SCM_MAX_FD];
@@ -2456,7 +2546,7 @@ static int64_t sys_shutdown(uint64_t fd, uint64_t how, uint64_t a3, uint64_t a4,
     if (how > SHUT_RDWR) return -EINVAL;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = inet_is(f) ? inet_shutdown(f, (int)how) : usock_shutdown(f, (int)how);
+    rc = inet_is(f) ? inet_shutdown(f, (int)how) : xsock_is(f) ? xsock_shutdown(f, (int)how) : usock_shutdown(f, (int)how);
     fput(f);
     return rc;
 }
@@ -2472,7 +2562,8 @@ static int64_t sock_name(uint64_t fd, uint64_t addr, uint64_t lenp, bool peer)
         rc = inet_name(f, peer, &sin);
         memcpy(&tmp, &sin, sizeof sin);
         got = sizeof sin;
-    } else rc = usock_name(f, peer, &tmp, &got);
+    } else if (xsock_is(f)) rc = xsock_name(f, peer, &tmp, &got);
+    else rc = usock_name(f, peer, &tmp, &got);
     fput(f);
     return rc ? rc : put_sockaddr(addr, lenp, &tmp, got);
 }
@@ -2495,6 +2586,23 @@ static int64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
         uint32_t kl = len < sizeof kv ? (uint32_t)len : (uint32_t)sizeof kv;
         if (kl && copy_from_user(kv, (const void *)val, kl)) rc = -EFAULT;
         else rc = inet_setsockopt(f, (int)level, (int)opt, kv, kl);
+    } else if (xsock_is(f) && level == SOL_SOCKET && opt == SO_ATTACH_FILTER) {
+        struct { uint16_t len, pad[3]; uint64_t filter; } fp;  /* struct sock_fprog */
+        struct bpf_insn *insns = NULL;
+        if (len < sizeof fp || copy_from_user(&fp, (const void *)val, sizeof fp)) rc = -EFAULT;
+        else if (!fp.len || fp.len > BPF_MAXINSNS) rc = -EINVAL;
+        else if (!(insns = kmalloc(fp.len * sizeof *insns))) rc = -ENOMEM;
+        else if (copy_from_user(insns, (const void *)fp.filter, fp.len * sizeof *insns)) rc = -EFAULT;
+        else {
+            struct kfprog kp = { fp.len, insns };
+            rc = xsock_setsockopt(f, (int)level, (int)opt, &kp, sizeof kp);
+        }
+        kfree(insns);
+    } else if (xsock_is(f)) {
+        uint8_t kv[64];
+        uint32_t kl = len < sizeof kv ? (uint32_t)len : (uint32_t)sizeof kv;
+        if (kl && copy_from_user(kv, (const void *)val, kl)) rc = -EFAULT;
+        else rc = xsock_setsockopt(f, (int)level, (int)opt, kv, kl);
     }
     fput(f);
     return rc;
@@ -2511,7 +2619,9 @@ static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
     uint32_t klen = len < sizeof kv ? len : sizeof kv;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = inet_is(f) ? inet_getsockopt(f, (int)level, (int)opt, kv, &klen) : usock_getsockopt(f, (int)level, (int)opt, kv, &klen);
+    rc = inet_is(f) ? inet_getsockopt(f, (int)level, (int)opt, kv, &klen)
+       : xsock_is(f) ? xsock_getsockopt(f, (int)level, (int)opt, kv, &klen)
+       : usock_getsockopt(f, (int)level, (int)opt, kv, &klen);
     fput(f);
     if (rc) return rc;
     if (copy_to_user((void *)val, kv, klen)) return -EFAULT;

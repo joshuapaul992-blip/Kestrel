@@ -46,11 +46,8 @@ static int eth_xmit(struct netif *nif, const uint8_t *dmac, uint16_t type, struc
     memcpy(h + 6, nif->mac, ETH_ALEN);
     h[12] = (uint8_t)(type >> 8);
     h[13] = (uint8_t)type;
-    int rc;
     if (p->len < 60) { memset(h + p->len, 0, 60 - p->len); p->len = 60; }   /* minimum frame */
-    if (!(nif->flags & IFF_UP)) { nif->tx_dropped++; rc = -1; }
-    else if ((rc = nif->xmit(nif, h, p->len)) < 0) nif->tx_dropped++;
-    else { nif->tx_packets++; nif->tx_bytes += p->len; }
+    int rc = netif_xmit(nif, h, p->len);
     pkt_free(p);
     return rc;
 }
@@ -194,6 +191,21 @@ void arp_flush_if(struct netif *nif)
 {
     for (int i = 0; i < ARP_ENTRIES; i++)
         if (cache[i].used && cache[i].nif == nif) { drop_hold(&cache[i], false); cache[i].used = false; }
+}
+
+void arp_each(void (*fn)(void *ctx, struct netif *nif, uint32_t ip, const uint8_t *mac, bool resolved), void *ctx)
+{
+    for (int i = 0; i < ARP_ENTRIES; i++)
+        if (cache[i].used) fn(ctx, cache[i].nif, cache[i].ip, cache[i].mac, cache[i].resolved);
+}
+
+int arp_forget(struct netif *nif, uint32_t ip)
+{
+    struct arp_entry *e = lookup(nif, ip);
+    if (!e) return -1;
+    drop_hold(e, false);
+    e->used = false;
+    return 0;
 }
 
 /* /proc/net/arp, Linux format */

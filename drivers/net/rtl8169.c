@@ -17,10 +17,20 @@
  * PCIe-PHY tuning tables; this driver does not, and relies on what the
  * firmware and the chip's defaults set up.
  *
- * One receive and one transmit ring of 64 sixteen-byte descriptors with a
- * 2 KiB buffer each, 64-bit bus addresses. Interrupts stay masked: the
- * network thread polls the OWN bit of the next receive descriptor when the
- * system tick sees it clear (net.h).
+ * The PHY is told what to advertise (10/100 half and full, 1000 full on
+ * the gigabit parts, pause) before autonegotiation restarts: firmware and
+ * other systems going to sleep with Wake-on-LAN often leave it advertising
+ * 10 Mbit/s only, which the chip then keeps. The negotiated speed and
+ * duplex are logged when the link comes up, and IFF_RUNNING follows it.
+ *
+ * One receive and one transmit ring of 256 sixteen-byte descriptors with a
+ * 2 KiB buffer each, 64-bit bus addresses: at a gigabit, 256 frames are
+ * 3 ms of traffic, more than a whole TCP receive window, so a burst does
+ * not overrun the ring before the network thread empties it. Received
+ * frames and link changes interrupt by MSI; the handler masks the chip's
+ * interrupts and wakes the network thread, whose poll unmasks them once
+ * the ring is empty. Without MSI the thread polls the OWN bit of the next
+ * receive descriptor from the system tick (net.h), as before.
  *
  * QEMU has no model of these chips, so this driver has only been checked
  * against the documentation and Linux's driver, not run. */
@@ -28,6 +38,7 @@
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/time.h>
+#include <kernel/msi.h>
 #include "nic.h"
 
 enum {
@@ -42,7 +53,36 @@ enum {
 #define TXPOLL_NPQ  0x40
 #define CFG_UNLOCK  0xC0
 #define CFG_LOCK    0x00
+#define PS_FULL     0x01                /* PHYSTATUS */
 #define LINK_STATUS 0x02
+#define PS_10       0x04
+#define PS_100      0x08
+#define PS_1000     0x10
+#define PS_RXFLOW   0x20
+#define PS_TXFLOW   0x40
+/* IntrMask / IntrStatus */
+#define I_RXOK      0x0001
+#define I_RXERR     0x0002
+#define I_RDU       0x0010              /* receive descriptors unavailable: the ring was full */
+#define I_LINKCHG   0x0020
+#define I_FIFOOVER  0x0040
+#define I_SYSERR    0x8000
+#define I_EVENTS    (I_RXOK | I_RXERR | I_RDU | I_LINKCHG | I_FIFOOVER | I_SYSERR)
+/* MII registers */
+#define MII_BMCR    0x00
+#define MII_ANAR    0x04
+#define MII_GBCR    0x09
+#define BMCR_ANENABLE   0x1000
+#define BMCR_ANRESTART  0x0200
+#define ANAR_CSMA       0x0001
+#define ANAR_10HALF     0x0020
+#define ANAR_10FULL     0x0040
+#define ANAR_100HALF    0x0080
+#define ANAR_100FULL    0x0100
+#define ANAR_PAUSE      0x0400
+#define ANAR_ASYM_PAUSE 0x0800
+#define GBCR_1000HALF   0x0100
+#define GBCR_1000FULL   0x0200
 #define RX_DMA_BURST    (7u << 8)
 #define RX_FIFO_THRESH  (7u << 13)
 #define RX_EARLY_OFF    (1u << 11)
@@ -65,7 +105,7 @@ enum {
 #define D_LS    (1u << 28)
 #define RX_RES  (1u << 21)
 
-#define NDESC    64
+#define NDESC    256
 #define BUF_SIZE 2048
 
 struct desc { uint32_t opts1, opts2; uint64_t addr; } __attribute__((packed));
@@ -74,9 +114,13 @@ struct r8169 {
     struct netif nif;
     volatile uint8_t *regs;
     int ver;                            /* Linux's RTL_GIGA_MAC_VER_xx, 0 = unknown */
+    bool fast_only;                     /* a 10/100 part (RTL810x) */
     volatile struct desc *rx, *tx;
     uint8_t *rxbuf, *txbuf;
     uint32_t rx_next, tx_next, tx_clean;
+    int msi;                            /* the vector, or -1: polled from the tick */
+    uint16_t events;                    /* IntrStatus bits the interrupt saw, for poll */
+    uint8_t link;                       /* PHYSTATUS when the link last changed */
 };
 
 static uint8_t r8(struct r8169 *t, uint32_t o) { return *(volatile uint8_t *)(t->regs + o); }
@@ -134,6 +178,27 @@ static const char *chip_name(int v)
 }
 
 /* ---- PHY: MII registers through PHYAR, or the GPHY OCP window (8168G on) ---------- */
+static uint16_t phy_read(struct r8169 *t, int reg)
+{
+    if (t->ver >= 40) {
+        uint32_t ocp = 0xa400u + 2u * (uint32_t)reg;
+        w32(t, GPHY_OCP, ocp << 15);
+        for (int i = 0; i < 100; i++) {                         /* the flag goes up when the data is there */
+            udelay(25);
+            uint32_t v = r32(t, GPHY_OCP);
+            if (v & 0x80000000u) return (uint16_t)v;
+        }
+    } else {
+        w32(t, PHYAR, (uint32_t)(reg & 0x1f) << 16);
+        for (int i = 0; i < 100; i++) {
+            udelay(25);
+            uint32_t v = r32(t, PHYAR);
+            if (v & 0x80000000u) { udelay(20); return (uint16_t)v; }
+        }
+    }
+    return 0xffff;
+}
+
 static void phy_write(struct r8169 *t, int reg, uint16_t val)
 {
     if (t->ver >= 40) {
@@ -158,7 +223,25 @@ static void power_up(struct r8169 *t)
         w32(t, MISC, r32(t, MISC) & ~RXDV_GATED_EN);
     }
     if (v < 40) phy_write(t, 0x1f, 0);                          /* page 0 */
-    phy_write(t, 0, 0x1200);                                    /* BMCR: autonegotiate, restart; not powered down */
+    /* Advertise everything the part can do; firmware and Wake-on-LAN
+     * often leave 10 Mbit/s only. No 1000 half: the MACs don't do it. */
+    uint16_t anar = phy_read(t, MII_ANAR);
+    if (anar == 0xffff) anar = 0;
+    anar = (uint16_t)((anar & ~0x0fe0u) | ANAR_CSMA | ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL |
+                      ANAR_PAUSE | ANAR_ASYM_PAUSE);
+    phy_write(t, MII_ANAR, anar);
+    if (!t->fast_only) {
+        uint16_t gbcr = phy_read(t, MII_GBCR);
+        if (gbcr == 0xffff) gbcr = 0;
+        phy_write(t, MII_GBCR, (uint16_t)((gbcr & ~(GBCR_1000HALF | GBCR_1000FULL)) | GBCR_1000FULL));
+    }
+    phy_write(t, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);     /* and not powered down or isolated */
+}
+
+/* 10/100 parts (Linux's RTL8101/8102/8103/8105/8106/8402 versions): no 1000BASE-T */
+static bool is_fast_only(int v)
+{
+    return (v >= 7 && v <= 10) || (v >= 13 && v <= 16) || v == 29 || v == 30 || v == 37 || v == 39;
 }
 
 static bool reset(struct r8169 *t)
@@ -198,12 +281,35 @@ static int r8169_xmit(struct netif *nif, const void *frame, size_t len)
     return 0;
 }
 
+static void link_change(struct r8169 *t)
+{
+    uint8_t ps = r8(t, PHYSTATUS);
+    if ((ps ^ t->link) & LINK_STATUS) {
+        if (ps & LINK_STATUS)
+            kprintf("r8169: %s: link up, %s Mbit/s, %s duplex%s\n", t->nif.name,
+                    ps & PS_1000 ? "1000" : ps & PS_100 ? "100" : ps & PS_10 ? "10" : "?",
+                    ps & PS_FULL ? "full" : "half", ps & (PS_RXFLOW | PS_TXFLOW) ? ", flow control" : "");
+        else kprintf("r8169: %s: link down\n", t->nif.name);
+        netif_carrier(&t->nif, ps & LINK_STATUS);
+    }
+    t->link = ps;
+}
+
 static void r8169_poll(struct netif *nif)
 {
     struct r8169 *t = nif->priv;
+    uint16_t ev = __atomic_exchange_n(&t->events, 0, __ATOMIC_ACQ_REL);
+    if (t->msi < 0) {                                           /* nobody acknowledges for us */
+        ev = r16(t, INTRSTATUS);
+        if (ev) w16(t, INTRSTATUS, ev);
+    }
+    if (ev & (I_RDU | I_FIFOOVER)) nif->rx_dropped++;            /* the ring or the FIFO overran: frames lost, the chip doesn't say how many */
+    if (ev & I_SYSERR) kprintf("r8169: %s: PCI system error\n", nif->name);
+    if ((ev & I_LINKCHG) || ((r8(t, PHYSTATUS) ^ t->link) & LINK_STATUS)) link_change(t);
+
     int n = 0;
     uint32_t s;
-    while (!((s = t->rx[t->rx_next].opts1) & D_OWN) && n < 64) {
+    while (!((s = t->rx[t->rx_next].opts1) & D_OWN) && n < NDESC) {
         nic_fence();
         uint32_t i = t->rx_next;
         uint32_t len = s & 0x3fff;
@@ -216,9 +322,23 @@ static void r8169_poll(struct netif *nif)
         t->rx_next = (i + 1) % NDESC;
         n++;
     }
-    uint16_t st = r16(t, INTRSTATUS);
-    if (st) w16(t, INTRSTATUS, st);                             /* acknowledge (RX FIFO overflow, descriptors unavailable) */
     tx_reclaim(t);
+    /* Caught up: interrupts back on. A frame that came meanwhile raises
+     * one at once (its status bit is already set), and netd looks again
+     * anyway while pending() says so. */
+    if (t->msi >= 0 && (t->rx[t->rx_next].opts1 & D_OWN)) w16(t, INTRMASK, I_EVENTS);
+}
+
+/* MSI: hand the work to the network thread */
+static void r8169_irq(void *arg)
+{
+    struct r8169 *t = arg;
+    uint16_t st = r16(t, INTRSTATUS);
+    if (!st || st == 0xffff) return;
+    w16(t, INTRMASK, 0);
+    w16(t, INTRSTATUS, st);
+    __atomic_or_fetch(&t->events, st, __ATOMIC_ACQ_REL);
+    net_kick();
 }
 
 static bool r8169_pending(struct netif *nif)
@@ -250,6 +370,8 @@ static bool r8169_init(struct pci_device *d)
     }
     for (size_t i = 0; i < sizeof xids / sizeof *xids; i++)
         if ((xid & xids[i].mask) == xids[i].val) { t->ver = xids[i].ver; break; }
+    t->fast_only = is_fast_only(t->ver) || d->device_id == 0x8136;
+    t->msi = -1;
 
     w16(t, INTRMASK, 0);
     w16(t, INTRSTATUS, 0xffff);
@@ -320,8 +442,14 @@ static bool r8169_init(struct pci_device *d)
     n->pending = r8169_pending;
     n->link_up = r8169_link;
     n->priv = t;
-    kprintf("r8169: Realtek %s (XID %03x, version %d) at %02x:%02x.%u\n", chip_name(v), xid, v, d->bus, d->device, d->function);
+    t->link = r8(t, PHYSTATUS) & ~LINK_STATUS;                  /* the first poll reports the link */
     netif_register(n);
+    if (!v || v > 6) t->msi = msi_enable(d, r8169_irq, t, "r8169");   /* Linux keeps the PCI 8169s on INTx: their MSI is unreliable */
+    w16(t, INTRSTATUS, 0xffff);
+    if (t->msi >= 0) w16(t, INTRMASK, I_EVENTS);
+    kprintf("r8169: %s: Realtek %s (XID %03x, version %d) at %02x:%02x.%u, %s, %d descriptors, %s\n", n->name, chip_name(v),
+            xid, v, d->bus, d->device, d->function, t->fast_only ? "10/100" : "10/100/1000", NDESC,
+            t->msi >= 0 ? "MSI" : "polled");
     return true;
 }
 

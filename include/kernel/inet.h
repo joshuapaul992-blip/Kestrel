@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define AF_UNSPEC       0
 #define AF_INET         2
 #define AF_INET6        10
 #define AF_NETLINK      16
@@ -30,6 +31,7 @@
 #define SO_OOBINLINE    10
 #define SO_LINGER       13
 #define SO_REUSEPORT    15
+#define SO_PASSCRED     16
 #define SO_RCVLOWAT     18
 #define SO_SNDLOWAT     19
 #define SO_RCVTIMEO     20

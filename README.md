@@ -13,7 +13,7 @@ Because I want to prove that vibe-coding operating systems isn't always a bad id
 
 ## Overview
 
-Kestrel (0.3.7, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
+Kestrel (0.3.7a, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -211,7 +211,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.7`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.7a`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
@@ -1055,16 +1055,18 @@ Alpine on another disk works too: put it on an ext2 partition, label it, and boo
 - **IPv4:** routes by longest prefix; fragments what does not fit the card's MTU and reassembles what arrives in pieces (64 KiB datagrams); ICMP echo replies, and port, protocol and host unreachable errors in both directions.
 - **UDP:** broadcast (with `SO_BROADCAST`), multicast delivery to every matching socket, `connect` for a fixed peer, ICMP errors reported to connected sockets.
 - **TCP:** window scaling and the MSS option, RTO per RFC 6298 with Karn's rule, slow start, congestion avoidance and NewReno fast recovery, delayed ACKs, Nagle (`TCP_NODELAY`), zero-window probes, keepalive, `SO_LINGER`, half-close, `TIME_WAIT`, RST on close with unread data, and RFC 5961 challenge ACKs. 128 KiB send and receive buffers per connection.
-- **Sockets:** blocking and non-blocking (`connect` returns `EINPROGRESS`), with `poll`/`select`/`epoll`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_REUSEADDR`, `SO_ERROR`, ephemeral ports 32768–60999. Raw ICMP sockets and unprivileged ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) are there for `ping`.
+- **Sockets:** blocking and non-blocking (`connect` returns `EINPROGRESS`), with `poll`/`select`/`epoll`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_REUSEADDR`, `SO_ERROR`, ephemeral ports 32768–60999. Raw ICMP sockets and unprivileged ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) are there for `ping`; `IPPROTO_RAW` sockets send IP packets whose header the program writes.
+- **Netlink** (`net/netlink.c`): `NETLINK_ROUTE` sockets, which `ip` and the C library's `getifaddrs()` and `if_nameindex()` use. Dumps and lookups of links (with their counters), IPv4 addresses, routes (`ip route get` too), neighbours (the ARP cache) and the three standard rules; requests that set a link up or down, change its MTU or name, add and remove addresses and routes, and forget neighbours. Changes are announced to the `RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR` and `RTMGRP_IPV4_ROUTE` groups. Changing anything needs root.
+- **Packet sockets** (`net/packet.c`, root only): `SOCK_RAW` (whole Ethernet frames) and `SOCK_DGRAM` (the payload), for one protocol or `ETH_P_ALL`, bound to one card or all, seeing frames in both directions, with classic BPF filters (`SO_ATTACH_FILTER`) checked when they are attached. DHCP clients such as `udhcpc` use them.
 - **Loopback:** `lo` (127.0.0.1/8, MTU 16436).
 
-**How it runs.** A kernel thread, `netd`, receives frames, runs the ARP, TCP and DHCP timers and sleeps until the next deadline. Cards are polled, not interrupt-driven: on every 1 kHz tick the boot CPU checks one descriptor bit per card and wakes `netd` when a frame has arrived, so an idle network costs one memory read per millisecond. System calls send directly.
+**How it runs.** A kernel thread, `netd`, receives frames, runs the ARP, TCP and DHCP timers and sleeps until the next deadline. Most cards are polled: on every 1 kHz tick the boot CPU checks one descriptor bit per card and wakes `netd` when a frame has arrived, so an idle network costs one memory read per millisecond. The Realtek RTL8168 family interrupts by MSI instead, which wakes `netd` at once. System calls send directly.
 
 **Configuration.** A DHCP client (RFC 2131) runs on every Ethernet card it finds at boot. It applies the address, netmask, default route (the first card to get a lease keeps it), name servers, domain and MTU, and renews the lease at T1 and T2. `/etc/resolv.conf` is a symbolic link to `/proc/net/pnp`, which lists the name servers, so musl's resolver (and BusyBox `nslookup`, `wget`) find them. Boot options:
 - `kestrel.net=dhcp` (default) or `kestrel.net=off`.
 - `kestrel.ip=ADDR/PREFIX[,GATEWAY[,DNS]]`, e.g. `kestrel.ip=192.168.1.50/24,192.168.1.1,1.1.1.1`: a fixed address on the first card instead of DHCP.
 
-BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and `nslookup` work through the usual ioctls and `/proc/net/{dev,route,arp,tcp,udp,snmp}`, which use Linux's formats. `ip` needs netlink sockets and `udhcpc` needs packet sockets, which Kestrel does not have yet; the kernel's own DHCP client does `udhcpc`'s job.
+BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and `nslookup` work through the usual ioctls and `/proc/net/{dev,route,arp,tcp,udp,snmp}`, which use Linux's formats. BusyBox `ip` (`link`, `addr`, `route`, `neigh`, `rule`) works through netlink, and `udhcpc` through packet sockets, with the script in `/usr/share/udhcpc/default.script` applying the lease with `ip`. Setting an address by hand (`ip addr`, `ifconfig`) stops the kernel's DHCP client on that card, so the two don't fight over it.
 
 **Cards** (`drivers/net/`):
 
@@ -1073,22 +1075,23 @@ BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and
 | `virtio-net` | virtio 1.0 network device (QEMU, KVM, most hypervisors) | 1af4:1000, 1af4:1041 | QEMU `virtio-net-pci` |
 | `e1000` | Intel 82540/541/543/544/545/546/547, 82571/572/573/574, 82583 | 8086:100e and 47 others | QEMU `e1000` (82540EM) and `e1000e` (82574L) |
 | `rtl8139` | Realtek RTL8139/8139A/B/C/C+/D, 8100, 8130, and boards built on them | 10ec:8139 and 19 others | QEMU `rtl8139`, through I/O ports and through the memory BAR |
-| `r8169` | Realtek RTL8169/8110, RTL8168/8111 B through H, 8168EP, 8117; RTL8101E/8102E/8103E/8105E/8106E, 8402, 8411 (Fast Ethernet) | 10ec:8161/8167/8168/8169/8136 and 6 others | not run: QEMU has no model of these chips |
+| `r8169` | Realtek RTL8169/8110, RTL8168/8111 B through H, 8168EP, 8117; RTL8101E/8102E/8103E/8105E/8106E, 8402, 8411 (Fast Ethernet) | 10ec:8161/8167/8168/8169/8136 and 6 others | on real boards only: QEMU has no model of these chips |
 
 - **e1000:** the integrated Intel LAN of recent chipsets (I217, I218, I219) is a different design and is not claimed.
-- **r8169:** the chip version is read from `TxConfig` as Linux does; it decides the receive configuration, the transmit FIFO mode, and whether the PHY is reached through `PHYAR` or (8168G on) the GPHY OCP window. The PLL, the PHY and the RXDV gate are powered back up in case a previous driver shut them down. Linux also loads per-version PHY tuning tables, which this driver does not. The 2.5 and 5 gigabit RTL8125/8126 are a different design and are refused with a message.
+- **r8169:** the chip version is read from `TxConfig` as Linux does; it decides the receive configuration, the transmit FIFO mode, and whether the PHY is reached through `PHYAR` or (8168G on) the GPHY OCP window. The PLL, the PHY and the RXDV gate are powered back up in case a previous driver shut them down, and the PHY is told to advertise every speed the part has (10/100 half and full, 1000 full, pause) before autonegotiation restarts: firmware and systems that went to sleep with Wake-on-LAN often leave it offering 10 Mbit/s only. The negotiated speed and duplex are logged (`r8169: eth0: link up, 1000 Mbit/s, full duplex`), and `IFF_RUNNING` follows the cable. Rings of 256 descriptors hold more than a whole TCP window at a gigabit; received frames and link changes interrupt by MSI (the old PCI RTL8169s are polled, as Linux keeps them off MSI), and ring overruns are counted as dropped frames. Linux also loads per-version PHY tuning tables, which this driver does not. The 2.5 and 5 gigabit RTL8125/8126 are a different design and are refused with a message.
 - Each card gets a ring of receive and transmit descriptors with 2 KiB buffers (RTL8139: an 8 KiB receive ring and four transmit slots, below 4 GiB). Cards are named `eth0`, `eth1`, ... in the order they are found: virtio-net, e1000, r8169, rtl8139.
 
-**Tests:** `nettest` (in `/boot/bin`) runs 58 checks:
+**Tests:** `nettest` (in `/boot/bin`) runs 75 checks:
 - interfaces, `SIOC*` ioctls and `if_nametoindex`;
+- netlink: `getifaddrs`, `if_nameindex`, link and address dumps, `MSG_PEEK | MSG_TRUNC`, errors and acknowledgements, a change heard by an `RTMGRP_LINK` listener; packet sockets: a BPF program that jumps out of bounds is refused;
 - UDP on loopback, including 40 KB fragmented datagrams, `MSG_TRUNC` and ICMP port unreachable (`ECONNREFUSED`);
 - TCP: half-close, RST on unread data, `ECONNREFUSED`, `EADDRINUSE`, non-blocking connect with `epoll`, `/proc/net/tcp`, and 8 MiB echoed through loopback with a checksum;
-- `nettest HOST:PORT` also waits for DHCP, pings the gateway, echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, and checks `/etc/resolv.conf`;
+- `nettest HOST:PORT` also waits for DHCP, pings the gateway (as root also through an ICMP-only BPF filter on a packet socket, and watching the request leave on an `ETH_P_ALL` one), echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, and checks `/etc/resolv.conf`;
 - `nettest serve PORT` takes a connection from the host (QEMU `hostfwd`) and answers with the byte count and checksum.
 
 In QEMU (TCG, no KVM) on loopback: 200 one-byte TCP round trips take about 60 ms and bulk TCP runs at about 11 MiB/s each way; through the card, ping to the host is 2–4 ms and TCP 5–7 MiB/s each way.
 
-**Not yet:** IPv6, TCP selective acknowledgement (SACK) and timestamps, IP forwarding, card interrupts, checksum and segmentation offload, `SO_REUSEPORT` load balancing, netlink and packet sockets, and reacting to the cable being unplugged (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
+**Not yet:** IPv6, TCP selective acknowledgement (SACK) and timestamps, IP forwarding, interrupts for cards other than the RTL8168 family, checksum and segmentation offload, `SO_REUSEPORT` load balancing, `ip -s` and `ip monitor` (BusyBox's `ip` has neither), more than one IPv4 address per card, and noticing an unplugged cable on cards other than the Realtek RTL8169/8168 (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
 
 ## Sound: HD Audio (`drivers/sound/hda.c`)
 
