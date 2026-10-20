@@ -55,6 +55,10 @@ struct percpu {
     uint64_t       kernel_rsp;          /* gs:8   SYSCALL: top of kernel stack */
     uint64_t       user_rsp;            /* gs:16  SYSCALL: user RSP scratch    */
     struct tcb    *current;             /* gs:24  running task                 */
+    uint64_t       kern_cr3;            /* gs:32  low window (uvm.h): the kernel's
+                                           root, loaded on entry from ring 3; 0 */
+    uint64_t       user_cr3;            /* gs:40  ... and the user's, on the way out */
+    uint64_t       entry_scratch;       /* gs:48  entry code's spare register  */
     int            id;                  /* 0 = boot CPU                        */
     uint32_t       apic_id;
     bool           online;
@@ -77,6 +81,9 @@ struct percpu {
 _Static_assert(__builtin_offsetof(struct percpu, kernel_rsp) == 8, "gs:8");
 _Static_assert(__builtin_offsetof(struct percpu, user_rsp) == 16, "gs:16");
 _Static_assert(__builtin_offsetof(struct percpu, current) == 24, "gs:24");
+_Static_assert(__builtin_offsetof(struct percpu, kern_cr3) == 32, "gs:32");
+_Static_assert(__builtin_offsetof(struct percpu, user_cr3) == 40, "gs:40");
+_Static_assert(__builtin_offsetof(struct percpu, entry_scratch) == 48, "gs:48");
 
 extern struct percpu cpus[MAX_CPUS];
 extern int ncpus;                       /* CPUs online                         */

@@ -125,6 +125,8 @@ struct vma {
 
 struct mm {
     uint64_t     pml4;          /* physical address of the top table        */
+    uint64_t     kpml4;         /* low window (uvm.h): the kernel's root, in
+                                   CR3 while the kernel runs; else 0        */
     struct vma  *vmas;          /* sorted, non-overlapping                  */
     int          users;         /* tasks running in it (threads, vfork)     */
     struct kmutex lock;         /* regions and page tables                  */
@@ -133,6 +135,8 @@ struct mm {
     uint64_t     brk_start, brk;
     uint64_t     rss;           /* user pages mapped (statistics, OOM)      */
     bool         oom_victim;    /* the OOM killer is waiting for it to go   */
+    bool         thp_disable;   /* prctl(PR_SET_THP_DISABLE): only remembered,
+                                   there are no huge pages to turn off      */
 };
 
 /* With interrupts on; may sleep. Needs no lock held (it takes the big
@@ -143,6 +147,10 @@ int vm_fault(uint64_t addr, uint64_t err, bool user_mode);   /* 0, -EFAULT, -EAC
 bool vm_fault_fast(uint64_t addr, uint64_t err);
 
 struct mm *mm_create(void);                 /* empty address space; NULL on OOM */
+/* Give an empty address space the low window (uvm.h); -ENOMEM. */
+int        mm_make_low(struct mm *mm);
+/* What CR3 holds while the kernel runs in mm. */
+static inline uint64_t mm_cr3(const struct mm *mm) { return mm->kpml4 ? mm->kpml4 : mm->pml4; }
 void       mm_get(struct mm *mm);
 void       mm_put(struct mm *mm);           /* destroys at 0 users              */
 struct mm *mm_fork(struct mm *src);         /* copy-on-write copy; NULL on OOM  */

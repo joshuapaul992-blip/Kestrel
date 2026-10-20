@@ -16,6 +16,7 @@
 #include <kernel/tty.h>
 #include <kernel/kinput.h>
 #include <kernel/uaccess.h>
+#include <kernel/fuse.h>
 
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 
@@ -427,6 +428,25 @@ static void add_dev(struct vnode *dir, const char *name, uint32_t mode, uint32_t
     vfs_node_add(dir, d);
 }
 
+/* /dev/fd, /dev/stdin, ...: fixed symbolic links into /proc/self/fd */
+static int devlink_read(struct vnode *vn, char *buf, size_t size)
+{
+    const char *t = vn->ctx;
+    size_t n = strlen(t);
+    if (n > size) n = size;
+    memcpy(buf, t, n);
+    return (int)n;
+}
+static const struct vnode_ops devlink_ops = { .readlink = devlink_read, .nolock = true };
+
+static void add_link(struct vnode *dir, const char *name, const char *target)
+{
+    struct vnode *l = vfs_node_new(dir->fs, name, VLNK, 0777, &devlink_ops);
+    if (!l) return;
+    l->ctx = (void *)target;
+    vfs_node_add(dir, l);
+}
+
 static void add_tty(struct vnode *dir, const char *name, uint32_t mode, uint32_t rdev,
                     const struct vnode_ops *ops, struct kestrel_tty *t)
 {
@@ -482,7 +502,7 @@ struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
 void devfs_init(const char *mountpoint)
 {
     struct mount *m;
-    struct vnode *r = vfs_mkfs("devfs", MNT_NOCREATE, &m);
+    struct vnode *r = vfs_mkfs("devtmpfs", MNT_NOCREATE, &m);
     devfs_root = r;
     add_dev(r, "null",    0666, MKDEV(1, 3),  &null_ops);
     add_dev(r, "zero",    0666, MKDEV(1, 5),  &zero_ops);
@@ -500,6 +520,11 @@ void devfs_init(const char *mountpoint)
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
     add_dev(r, "report",  0600, MKDEV(10, 240), &report_ops);
     add_dev(r, "results", 0600, MKDEV(10, 241), &results_ops);
+    add_dev(r, "fuse",    0666, MKDEV(10, 229), &fuse_ctl_ops);
+    add_link(r, "fd", "/proc/self/fd");
+    add_link(r, "stdin", "/proc/self/fd/0");
+    add_link(r, "stdout", "/proc/self/fd/1");
+    add_link(r, "stderr", "/proc/self/fd/2");
     for (int i = 0; i < tty_count; i++) {              /* one per monitor */
         char name[8];
         snprintf(name, sizeof name, "fb%d", i);

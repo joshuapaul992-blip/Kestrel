@@ -74,6 +74,7 @@ struct signal_struct {              /* CLONE_THREAD: the thread group        */
     int       nr_threads;           /* threads that have not exited          */
     uint64_t  shared_pending;       /* process-directed signals (kill)       */
     struct ksig_info shared_info[NSIG];
+    struct tcb *shared_to[NSIG];     /* the thread woken to take each one     */
     bool      group_exit;           /* exit_group() or a fatal signal        */
     int       group_exit_code;
     int       group_term_signal;
@@ -154,6 +155,8 @@ struct tcb {
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
     int       vfs_depth;        /* the file tree's lock, held this many times (fs/vfs.c) */
     bool      vfs_excl;         /* ... exclusively                                    */
+    bool      vfs_may_drop;     /* in walk_locked: a directory to load ends the walk  */
+    struct vnode *vfs_load;     /* ... and this is the one (fs/vfs.c: find)           */
     bool      sched_cur;        /* some CPU's current task (under the scheduler lock) */
     int       on_cpu;           /* until its registers are saved at a switch-out    */
     struct kstat_task ks;       /* performance counters (kstat.h)            */
@@ -256,7 +259,10 @@ void        task_sleep_ms(uint64_t ms);
 int         task_wait(int pid);         /* exit status, or -ECHILD        */
 
 int         task_snapshot(struct tcb *out, int max);
-struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
+struct tcb *task_find(int pid);
+struct mm;
+/* t's CR3 (and, running, the CPU's) from now on are mm's. */
+void task_use_mm(struct tcb *t, struct mm *mm);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
 uint8_t *task_fpu(struct tcb *t);       /* its user FPU state (fpu.h)       */
 struct mm  *task_mm_get(struct tcb *t); /* its address space, referenced    */

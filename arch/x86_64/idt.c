@@ -10,6 +10,7 @@
 #include <kernel/vm.h>
 #include <kernel/posix.h>
 #include <kernel/smp.h>
+#include <kernel/uvm.h>
 #include <kernel/msi.h>
 
 struct idt_gate {
@@ -48,16 +49,16 @@ void idt_init(void)
     memset(idt, 0, sizeof idt);
     for (int v = 0; v < 256; v++) {
         uint8_t ist = v == 8 ? IST_DOUBLE_FAULT : v == 2 ? IST_NMI : v == 18 ? IST_MACHINE_CHECK : 0;
-        set_gate(v, isr_stub_table[v], ist, v == 3 || v == 4 ? 3 : 0);   /* int3/into allowed from ring 3 */
+        set_gate(v, uvm_direct(isr_stub_table[v]), ist, v == 3 || v == 4 ? 3 : 0);   /* int3/into allowed from ring 3 */
     }
     /* POSIX syscall gate: DPL 3 so ring-3 code may execute `int $0x80` */
-    set_gate(SYSCALL_VECTOR, (uint64_t)isr_syscall_stub, 0, 3);
+    set_gate(SYSCALL_VECTOR, uvm_direct((uint64_t)isr_syscall_stub), 0, 3);
     idt_load();
 }
 
 void idt_load(void)
 {
-    struct idt_ptr p = { sizeof idt - 1, (uint64_t)idt };
+    struct idt_ptr p = { sizeof idt - 1, uvm_direct((uint64_t)idt) };   /* see gdt.c */
     __asm__ volatile("lidt %0" :: "m"(p));
 }
 
@@ -302,6 +303,7 @@ static bool lockless(struct int_frame *f)
          * manager resolve it (demand paging, copy-on-write) unless the caller
          * asked for no fault handling (page faults off, maybe under a
          * spinlock), else resume at the fixup (-EFAULT). */
+        if (addr >= UVM_LOW_ALIAS) addr -= UVM_LOW_ALIAS;   /* a low window's page (uaccess.c) */
         if (user_range_ok(addr, 1) && !pagefault_disabled()) {
             if (f->rflags & 0x200) sti();               /* the copy ran with interrupts on */
             int r = vm_fault(addr, f->error, false);

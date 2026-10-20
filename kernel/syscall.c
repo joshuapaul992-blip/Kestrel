@@ -35,6 +35,7 @@
 #include <kernel/vmobj.h>
 #include <kernel/futex.h>
 #include <kernel/vdso.h>
+#include <kernel/fuse.h>
 
 extern void syscall_entry(void);
 
@@ -44,6 +45,7 @@ static uint64_t counts[SYS_MAX];
 
 #define UNUSED6(a, b, c, d, e, f) do { (void)(a); (void)(b); (void)(c); (void)(d); (void)(e); (void)(f); } while (0)
 #define IO_CHUNK    65536u                  /* bounce buffer for read/write and friends */
+#define WHOLE_MAX   (1u << 20)              /* a write to a whole_writes device, at most */
 
 /* A user buffer the call may touch: inside the user half (kernel threads
  * calling through int 0x80 pass kernel buffers). */
@@ -237,6 +239,14 @@ static int64_t write_from_user(struct file *f, uint64_t ubuf, uint64_t len)
     if (usock_is(f)) return sock_xfer(f, ubuf, len, 0, true);
     if (!len) return vfs_write(f, "", 0);
     if (!ubuf_ok(ubuf, len)) return -EFAULT;
+    if (f->vn && f->vn->ops && f->vn->ops->whole_writes) {     /* one message, one call (FUSE) */
+        if (len > WHOLE_MAX) return -EINVAL;
+        uint8_t *kb = kmalloc(len);
+        if (!kb) return -ENOMEM;
+        int64_t n = copy_from_user(kb, (const void *)ubuf, len) ? -EFAULT : vfs_write(f, kb, len);
+        kfree(kb);
+        return n;
+    }
     size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
     uint8_t *kb = kmalloc(chunk);
     if (!kb) return -ENOMEM;
@@ -542,6 +552,7 @@ static int64_t net_user_ioctl(unsigned long req, uint64_t arg)
 static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
+    req = (uint32_t)req;                                /* an unsigned int, as on Linux: musl sign-extends it */
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     int size = -1, dir = 0;
@@ -1223,6 +1234,7 @@ static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uin
     if (n < 0) return -EINVAL;                          /* longer than 249 bytes */
     struct file *f = ramfs_anon_file(name, O_RDWR);
     if (!f) return -ENOMEM;
+    f->vn->mode = (f->vn->mode & ~07777u) | ((flags & MFD_NOEXEC_SEAL) ? 0666 : 0777);  /* as Linux */
     struct vm_object *o = vfs_vmobject(f->vn);
     if (!o) { vfs_close(f); return -ENOMEM; }
     if (flags & MFD_NOEXEC_SEAL) o->seals = 0x0020;        /* F_SEAL_EXEC */
@@ -1332,6 +1344,18 @@ static int64_t rw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, bool wr)
     for (uint64_t i = 0; i < cnt; i++) {
         if ((int64_t)v[i].len < 0 || sum + v[i].len < sum) { total = -EINVAL; goto out; }
         sum += v[i].len;
+    }
+    if (wr && f->vn && f->vn->ops && f->vn->ops->whole_writes) {   /* gathered into one write (FUSE) */
+        uint8_t *kb = sum <= WHOLE_MAX ? kmalloc(sum ? sum : 1) : NULL;
+        if (!kb) { total = sum > WHOLE_MAX ? -EINVAL : -ENOMEM; goto out; }
+        uint64_t at = 0;
+        for (uint64_t i = 0; i < cnt && total == 0; i++) {
+            if (v[i].len && copy_from_user(kb + at, (const void *)v[i].base, v[i].len)) total = -EFAULT;
+            at += v[i].len;
+        }
+        if (total == 0) total = vfs_write(f, kb, sum);
+        kfree(kb);
+        goto out;
     }
     if (usock_is(f)) {
         if (sum > 0x7ffff000) { total = -EINVAL; goto out; }
@@ -1777,9 +1801,7 @@ static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, u
     return ret == -ERESTARTNOHAND ? -EINTR : ret;
 }
 
-/* readlink: there are no symbolic links, except /proc/self/exe and
- * /proc/self/fd/N */
-/* readlink: symbolic links, plus /proc/self/exe and /proc/self/fd/N */
+/* readlink: symbolic links, plus /proc/self/exe (procfs has /proc/PID/fd/N) */
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t len, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
@@ -1791,19 +1813,6 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint6
     if (!strcmp(p, "/proc/self/exe") && t->exe[0]) {
         strlcpy(out, t->exe, sizeof out);
         n = (int)strlen(out);
-    } else if (!strncmp(p, "/proc/self/fd/", 14)) {     /* ttyname(): the file behind a descriptor */
-        int fd = 0;
-        const char *q = p + 14;
-        n = -ENOENT;
-        if (*q) {
-            for (; *q >= '0' && *q <= '9' && fd < MAX_FDS; q++) fd = fd * 10 + (*q - '0');
-            struct file *f = *q ? NULL : fget(fd);
-            if (f) {
-                n = vfs_path_of(f->vn, out, sizeof out);
-                if (!n) n = (int)strlen(out);
-                fput(f);
-            }
-        }
     } else {
         n = vfs_readlink_at(base, p, out, sizeof out);
     }
@@ -1862,11 +1871,17 @@ static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, ui
     return was[1] > now ? (int64_t)((was[1] - now + 999) / 1000) : 0;
 }
 
-/* prctl: process names (busybox renames its no-exec applets), and a few
- * options that are accepted without effect. */
+/* prctl: process names (busybox renames its no-exec applets), and the
+ * options glibc, Bionic and Chromium-style sandboxes ask about. Those for
+ * features Kestrel lacks (timer slack, huge pages, ambient capabilities,
+ * named anonymous memory) succeed with the answer a Linux kernel gives
+ * when the feature is idle. */
+#define PR_SET_VMA           0x53564d41
+#define PR_SET_VMA_ANON_NAME 0
+#define PR_SET_PTRACER       0x59616d61
 static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a5; (void)a6;
     struct tcb *t = current_task();
     switch (op) {
     case 15: {                                          /* PR_SET_NAME */
@@ -1882,15 +1897,51 @@ static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, ui
         strlcpy(name, t->name, sizeof name);
         return copy_to_user((void *)arg, name, sizeof name) ? -EFAULT : 0;
     }
-    case 1: return 0;                                   /* PR_SET_PDEATHSIG: never sent */
+    case 1: return arg <= 64 ? 0 : -EINVAL;              /* PR_SET_PDEATHSIG: never sent */
+    case 2: return put_user_u32((void *)arg, 0) ? -EFAULT : 0;     /* PR_GET_PDEATHSIG */
     case 3: return 1;                                   /* PR_GET_DUMPABLE */
-    case 4: return 0;                                   /* PR_SET_DUMPABLE */
+    case 4: return arg <= 1 ? 0 : -EINVAL;               /* PR_SET_DUMPABLE */
+    case 7: return 0;                                   /* PR_GET_KEEPCAPS */
+    case 8: return arg <= 1 ? 0 : -EINVAL;               /* PR_SET_KEEPCAPS */
+    case 21: return 0;                                  /* PR_GET_SECCOMP: no filter */
     case 23: return arg <= 40 ? 1 : -EINVAL;             /* PR_CAPBSET_READ: every capability (sys_capget) */
     case 24: return arg <= 40 ? 0 : -EINVAL;             /* PR_CAPBSET_DROP */
+    case 29: return 0;                                  /* PR_SET_TIMERSLACK: timers are exact anyway */
+    case 30: return 50000;                              /* PR_GET_TIMERSLACK: Linux's default, in ns */
     case 36: return 0;                                  /* PR_SET_CHILD_SUBREAPER: orphans go to init regardless */
     case 37: return put_user_u32((void *)arg, 0) ? -EFAULT : 0;    /* PR_GET_CHILD_SUBREAPER */
     case 38: return 0;                                  /* PR_SET_NO_NEW_PRIVS: nothing gains them anyway */
     case 39: return 0;                                  /* PR_GET_NO_NEW_PRIVS */
+    case 40: {                                          /* PR_GET_TID_ADDRESS */
+        uint64_t v = t->tid_address;
+        return copy_to_user((void *)arg, &v, sizeof v) ? -EFAULT : 0;
+    }
+    case 41:                                            /* PR_SET_THP_DISABLE */
+        if (a3 || a4 || a5) return -EINVAL;
+        if (t->mm) t->mm->thp_disable = arg != 0;
+        return 0;
+    case 42: return t->mm && t->mm->thp_disable;        /* PR_GET_THP_DISABLE */
+    case 47:                                            /* PR_CAP_AMBIENT */
+        if (arg == 1) return 0;                         /* IS_SET: the ambient set is empty */
+        if (arg >= 2 && arg <= 4) return 0;             /* RAISE, LOWER, CLEAR_ALL */
+        return -EINVAL;
+    case 52: return 0;                                  /* PR_GET_SPECULATION_CTRL: not affected */
+    case PR_SET_PTRACER: return 0;                      /* no Yama: anyone may already trace */
+    case PR_SET_VMA: {                                  /* name anonymous memory, as Bionic does */
+        if (arg != PR_SET_VMA_ANON_NAME) return -EINVAL;
+        if ((a3 & (UVM_PAGE - 1)) || !uvm_range_ok(a3, (a4 + UVM_PAGE - 1) & ~(UVM_PAGE - 1))) return -EINVAL;
+        if (a5) {                                       /* the name: printable, no [ ] \\ $ ` */
+            char name[80];
+            long n = strncpy_from_user(name, (const char *)a5, sizeof name);
+            if (n < 0) return n;
+            if (n >= (long)sizeof name) return -EINVAL;
+            for (long i = 0; i < n; i++) {
+                char c = name[i];
+                if (c < ' ' || c > '~' || c == '[' || c == ']' || c == '\\' || c == '$' || c == '`') return -EINVAL;
+            }
+        }
+        return 0;                                       /* accepted; /proc/self/maps doesn't show names */
+    }
     default: return -EINVAL;
     }
 }
@@ -2928,6 +2979,425 @@ static int64_t sys_personality(uint64_t persona, uint64_t a2, uint64_t a3, uint6
 static int64_t sys_absent(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
+/* ---- the newer variants glibc 2.3x/2.4x and other libraries call ---------- */
+
+/* preadv/pwritev (and the *2 forms without RWF_ flags): each segment at its
+ * offset; offset -1 in the *2 forms means the file position (readv). */
+static int64_t prw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, int64_t off, bool wr)
+{
+    if (off < 0) return -EINVAL;
+    if (cnt > 1024) return -EINVAL;
+    struct iovec *v = cnt ? kmalloc(cnt * sizeof *v) : NULL;
+    if (cnt && !v) return -ENOMEM;
+    int64_t total = 0;
+    if (copy_from_user(v, (const void *)iov, cnt * sizeof *v)) { total = -EFAULT; goto out; }
+    for (uint64_t i = 0; i < cnt; i++) {
+        if ((int64_t)v[i].len < 0) { total = -EINVAL; goto out; }
+        if (!v[i].len) continue;
+        int64_t n = pio(fd, v[i].base, v[i].len, off + total, wr);
+        if (n < 0) { if (!total) total = n; break; }
+        total += n;
+        if ((uint64_t)n < v[i].len) break;
+    }
+    if (!cnt) {                                         /* still check the descriptor */
+        struct file *f = fget((int)fd);
+        if (!f) total = -EBADF; else fput(f);
+    }
+out:
+    kfree(v);
+    return total;
+}
+static int64_t sys_preadv(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t lo, uint64_t hi, uint64_t a6)
+{ (void)hi; (void)a6; return prw_vec(fd, iov, cnt, (int64_t)lo, false); }
+static int64_t sys_pwritev(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t lo, uint64_t hi, uint64_t a6)
+{ (void)hi; (void)a6; return prw_vec(fd, iov, cnt, (int64_t)lo, true); }
+static int64_t sys_preadv2(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t lo, uint64_t hi, uint64_t flags)
+{
+    (void)hi;
+    if (flags & ~0x1full) return -EOPNOTSUPP;           /* RWF_HIPRI, DSYNC, SYNC, NOWAIT, APPEND: hints here */
+    return (int64_t)lo == -1 ? rw_vec(fd, iov, cnt, false) : prw_vec(fd, iov, cnt, (int64_t)lo, false);
+}
+static int64_t sys_pwritev2(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t lo, uint64_t hi, uint64_t flags)
+{
+    (void)hi;
+    if (flags & ~0x1full) return -EOPNOTSUPP;
+    return (int64_t)lo == -1 ? rw_vec(fd, iov, cnt, true) : prw_vec(fd, iov, cnt, (int64_t)lo, true);
+}
+
+/* epoll_pwait2: the timeout as a timespec (NULL: forever), rounded up to ms */
+static int64_t sys_epoll_pwait2(uint64_t epfd, uint64_t uev, uint64_t max, uint64_t uts, uint64_t sig, uint64_t size)
+{
+    int64_t ms = -1;
+    if (uts) {
+        struct timespec ts;
+        if (copy_from_user(&ts, (const void *)uts, sizeof ts)) return -EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
+        ms = ts.tv_sec > 0x7fffffff / 1000 ? 0x7fffffff : ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000;
+    }
+    return epoll_wait_common(epfd, uev, (int32_t)max, ms, sig, size);
+}
+
+/* fchmodat2: fchmodat with flags. A symbolic link has no mode of its own to
+ * change (EOPNOTSUPP, as on Linux); AT_EMPTY_PATH changes dirfd's file. */
+static int64_t sys_fchmodat2(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -EINVAL;
+    if (flags & AT_EMPTY_PATH) {
+        char c;
+        if (copy_from_user(&c, (const void *)path, 1)) return -EFAULT;
+        if (!c) return sys_fchmod(dirfd, mode, 0, 0, 0, 0);
+    }
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        AT_PATH(dirfd, path);
+        struct stat st;
+        int r = vfs_stat_at(base, p, false, &st);
+        if (r == 0 && S_ISLNK(st.st_mode)) r = -EOPNOTSUPP;
+        if (r == 0) r = vfs_chmod_at(base, p, false, (mode_t)mode);
+        fput(hold);
+        return r;
+    }
+    return sys_fchmodat(dirfd, path, mode, 0, 0, 0);
+}
+
+/* execveat: execve of a path relative to dirfd, or (AT_EMPTY_PATH, "") of
+ * dirfd's own file -- fexecve. The program is found again by its path, so
+ * a file no longer in the tree (a memfd) cannot run this way yet. */
+static int64_t sys_execveat(uint64_t dirfd, uint64_t upath, uint64_t argv, uint64_t envp, uint64_t flags, uint64_t a6)
+{
+    (void)a6;
+    if (flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -EINVAL;
+    char *p = kmalloc(VFS_PATH_MAX), *full = kmalloc(VFS_PATH_MAX);
+    int64_t r = p && full ? get_path(upath, p) : -ENOMEM;
+    if (r == -ENOENT && (flags & AT_EMPTY_PATH)) { p[0] = 0; r = 0; }    /* "" */
+    if (r < 0) goto fail;
+    if (p[0] == '/' || ((int)dirfd == AT_FDCWD && p[0])) {
+        strlcpy(full, p, VFS_PATH_MAX);
+    } else {
+        struct file *f = fget((int)dirfd);
+        if (!f) { r = -EBADF; goto fail; }
+        if (!p[0] && !(flags & AT_EMPTY_PATH)) { fput(f); r = -ENOENT; goto fail; }
+        if (p[0] && f->vn->type != VDIR) { fput(f); r = -ENOTDIR; goto fail; }
+        if (!p[0]) {                                    /* the file itself (fexecve): even a memfd */
+            fput(f);
+            snprintf(full, VFS_PATH_MAX, "/proc/self/fd/%d", (int)dirfd);
+            flags &= ~(uint64_t)AT_SYMLINK_NOFOLLOW;    /* that link is ours, not the caller's */
+            goto have;
+        }
+        r = vfs_path_of(f->vn, full, VFS_PATH_MAX);
+        bool gone = f->vn->unlinked;
+        fput(f);
+        if (r < 0) goto fail;
+        if (gone) { r = -ENOENT; goto fail; }
+        if (p[0]) {
+            if (strlen(full) + 1 + strlen(p) + 1 > VFS_PATH_MAX) { r = -ENAMETOOLONG; goto fail; }
+            if (full[1]) strlcat(full, "/", VFS_PATH_MAX);
+            strlcat(full, p, VFS_PATH_MAX);
+        }
+    }
+have:
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        struct stat st;
+        if (vfs_stat_at(NULL, full, false, &st) == 0 && S_ISLNK(st.st_mode)) { r = -ELOOP; goto fail; }
+    }
+    kfree(p);
+    return proc_execve_path(full, argv, envp);
+fail:
+    kfree(p);
+    kfree(full);
+    return r;
+}
+
+/* rt_sigtimedwait: take a signal of `set` that is pending, waiting for one
+ * up to the timeout (NULL: forever). Another signal arriving that has a
+ * handler ends the wait with EINTR. */
+static int64_t sys_rt_sigtimedwait(uint64_t uset, uint64_t uinfo, uint64_t uts, uint64_t size, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (size != 8) return -EINVAL;
+    uint64_t set, deadline = 0;
+    if (get_user_u64(&set, (const void *)uset)) return -EFAULT;
+    set &= ~((1ull << (SIGKILL - 1)) | (1ull << (19 - 1)));        /* SIGKILL, SIGSTOP */
+    if (uts) {
+        struct timespec ts;
+        if (copy_from_user(&ts, (const void *)uts, sizeof ts)) return -EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
+        uint64_t ms = (uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
+        deadline = time_ms() + ms;
+        if (!ms) deadline = time_ms();                  /* poll: never sleeps */
+    }
+    for (;;) {
+        struct ksig_info info;
+        int sig = signal_dequeue(set, &info);
+        if (sig) {
+            if (uinfo) {
+                uint8_t si[128];
+                signal_user_info(sig, &info, si);
+                if (copy_to_user((void *)uinfo, si, sizeof si)) return -EFAULT;
+            }
+            return sig;
+        }
+        if (signal_pending()) return -EINTR;
+        if (uts && time_ms() >= deadline) return -EAGAIN;
+        signal_wait_mask_until(set, uts ? (deadline ? deadline : 1) : 0);
+    }
+}
+
+/* sendmmsg/recvmmsg: sendmsg/recvmsg over an array of struct mmsghdr
+ * (a msghdr and the bytes moved). Stops at the first error, which is
+ * returned only if nothing was moved. MSG_WAITFORONE: only the first
+ * receive waits. recvmmsg's timeout is not applied. */
+#define MSG_DONTWAIT    0x40
+#define MSG_WAITFORONE  0x10000
+static int64_t mmsg(uint64_t fd, uint64_t vec, uint64_t vlen, uint64_t flags, bool send)
+{
+    if (vlen > 1024) vlen = 1024;                       /* UIO_MAXIOV */
+    int64_t done = 0;
+    for (uint64_t i = 0; i < vlen; i++) {
+        uint64_t hdr = vec + i * 64, f = flags & ~(uint64_t)MSG_WAITFORONE;
+        if (!send && (flags & MSG_WAITFORONE) && i) f |= MSG_DONTWAIT;
+        int64_t n = send ? sys_sendmsg(fd, hdr, f, 0, 0, 0) : sys_recvmsg(fd, hdr, f, 0, 0, 0);
+        if (n < 0) return done ? done : n;
+        uint32_t len = (uint32_t)n;
+        if (copy_to_user((void *)(hdr + 56), &len, sizeof len)) return done ? done : -EFAULT;
+        done++;
+    }
+    return done;
+}
+static int64_t sys_sendmmsg(uint64_t fd, uint64_t vec, uint64_t vlen, uint64_t flags, uint64_t a5, uint64_t a6)
+{ (void)a5; (void)a6; return mmsg(fd, vec, vlen, flags, true); }
+static int64_t sys_recvmmsg(uint64_t fd, uint64_t vec, uint64_t vlen, uint64_t flags, uint64_t tmo, uint64_t a6)
+{ (void)tmo; (void)a6; return mmsg(fd, vec, vlen, flags, false); }
+
+/* sched_getattr/sched_setattr: SCHED_OTHER with a nice value is all there is */
+struct sched_attr { uint32_t size, policy; uint64_t flags; int32_t nice; uint32_t priority;
+                    uint64_t runtime, deadline, period; uint32_t util_min, util_max; };
+static int64_t sys_sched_getattr(uint64_t pid, uint64_t uattr, uint64_t size, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (!uattr || flags || size < 48 || size > 4096) return -EINVAL;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    struct sched_attr a = { .size = sizeof a };
+    int64_t pr = sys_getpriority(0, pid, 0, 0, 0, 0);   /* 20 - nice */
+    a.nice = pr > 0 ? (int32_t)(20 - pr) : 0;
+    size_t n = size < sizeof a ? (size_t)size : sizeof a;
+    if (n < sizeof a) a.size = (uint32_t)n;
+    return copy_to_user((void *)uattr, &a, n) ? -EFAULT : 0;
+}
+static int64_t sys_sched_setattr(uint64_t pid, uint64_t uattr, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (!uattr || flags) return -EINVAL;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    struct sched_attr a = { 0 };
+    uint32_t size;
+    if (get_user_u32(&size, (const void *)uattr)) return -EFAULT;
+    if (!size) size = 48;                               /* SCHED_ATTR_SIZE_VER0 */
+    if (size < 48 || size > 4096) return -E2BIG;
+    if (copy_from_user(&a, (const void *)uattr, size < sizeof a ? size : sizeof a)) return -EFAULT;
+    if (a.policy == 1 || a.policy == 2 || a.policy == 6) return -EPERM;      /* FIFO, RR, DEADLINE */
+    if (a.policy != 0 && a.policy != 3 && a.policy != 5) return -EINVAL;     /* OTHER, BATCH, IDLE */
+    if (a.flags & ~0x1ull) return -EINVAL;              /* SCHED_FLAG_RESET_ON_FORK only */
+    return sys_setpriority(0, pid, (uint64_t)(int64_t)a.nice, 0, 0, 0);
+}
+
+/* copy_file_range: a read-and-write loop between two regular files, at
+ * the offsets given or the files' positions. */
+static int64_t sys_copy_file_range(uint64_t ifd, uint64_t uioff, uint64_t ofd, uint64_t uooff, uint64_t len, uint64_t flags)
+{
+    if (flags) return -EINVAL;
+    struct file *in = fget((int)ifd), *out = fget((int)ofd);
+    int64_t total = 0;
+    uint8_t *buf = NULL;
+    uint64_t io = 0, oo = 0;
+    if (!in || !out) { total = -EBADF; goto done; }
+    if ((in->flags & O_ACCMODE) == O_WRONLY || (out->flags & O_ACCMODE) == O_RDONLY || (out->flags & O_APPEND)) {
+        total = -EBADF; goto done;
+    }
+    if (in->vn->type == VDIR || out->vn->type == VDIR) { total = -EISDIR; goto done; }
+    if (in->vn->type != VREG || out->vn->type != VREG) { total = -EINVAL; goto done; }
+    if ((uioff && get_user_u64(&io, (const void *)uioff)) || (uooff && get_user_u64(&oo, (const void *)uooff))) {
+        total = -EFAULT; goto done;
+    }
+    if ((int64_t)io < 0 || (int64_t)oo < 0) { total = -EINVAL; goto done; }
+    if (in->vn == out->vn) {                            /* overlapping ranges of one file */
+        uint64_t a = uioff ? io : in->off, b = uooff ? oo : out->off;
+        if (a < b + len && b < a + len) { total = -EINVAL; goto done; }
+    }
+    if (!(buf = kmalloc(IO_CHUNK))) { total = -ENOMEM; goto done; }
+    while ((uint64_t)total < len) {
+        size_t want = len - (uint64_t)total < IO_CHUNK ? (size_t)(len - (uint64_t)total) : IO_CHUNK;
+        ssize_t n = uioff ? vfs_pread(in, buf, want, io + (uint64_t)total) : vfs_read(in, buf, want);
+        if (n <= 0) { if (!total && n < 0) total = n; break; }
+        ssize_t w = uooff ? vfs_pwrite(out, buf, (size_t)n, oo + (uint64_t)total) : vfs_write(out, buf, (size_t)n);
+        if (w < 0) { if (!total) total = w; break; }
+        total += w;
+        if (w < n) break;
+    }
+    if (total > 0) {
+        if (uioff && put_user_u64((void *)uioff, io + (uint64_t)total)) total = -EFAULT;
+        else if (uooff && put_user_u64((void *)uooff, oo + (uint64_t)total)) total = -EFAULT;
+    }
+done:
+    kfree(buf);
+    if (in) fput(in);
+    if (out) fput(out);
+    return total;
+}
+
+/* ---- mount(2) and umount2(2) ------------------------------------------------
+ * For root only. What can be mounted: tmpfs and ramfs (new, empty), FUSE
+ * file systems (fs/fuse.c), and proc, sysfs, devtmpfs and devpts, which are
+ * their one instance shown again (a bind mount of /proc, ...). Plus bind
+ * mounts of directories, moves (MS_MOVE), remounts that change the flags,
+ * and propagation changes, which are accepted: every mount is private, as
+ * there is one mount namespace. Block devices can't be mounted this way. */
+#define MS_RDONLY      0x1
+#define MS_NOSUID      0x2
+#define MS_NODEV       0x4
+#define MS_NOEXEC      0x8
+#define MS_REMOUNT     0x20
+#define MS_BIND        0x1000
+#define MS_MOVE        0x2000
+#define MS_PROPAGATION ((1u << 17) | (1u << 18) | (1u << 19) | (1u << 20))     /* UNBINDABLE PRIVATE SLAVE SHARED */
+
+static uint32_t mnt_flags(uint64_t ms)
+{
+    return ((ms & MS_RDONLY) ? MNT_RDONLY : 0) | ((ms & MS_NOSUID) ? MNT_NOSUID : 0) |
+           ((ms & MS_NODEV) ? MNT_NODEV : 0) | ((ms & MS_NOEXEC) ? MNT_NOEXEC : 0);
+}
+
+/* "key=octal" in a mount's options */
+static bool mount_opt_octal(const char *o, const char *key, uint32_t *v)
+{
+    size_t kl = strlen(key);
+    for (const char *p = o; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL)
+        if (!strncmp(p, key, kl) && p[kl] == '=') {
+            uint32_t n = 0;
+            for (p += kl + 1; *p >= '0' && *p <= '7'; p++) n = n * 8 + (uint32_t)(*p - '0');
+            *v = n;
+            return true;
+        }
+    return false;
+}
+
+static bool mount_opt_dec(const char *o, const char *key, uint32_t *v)
+{
+    size_t kl = strlen(key);
+    for (const char *p = o; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL)
+        if (!strncmp(p, key, kl) && p[kl] == '=') {
+            uint32_t n = 0;
+            for (p += kl + 1; *p >= '0' && *p <= '9'; p++) n = n * 10 + (uint32_t)(*p - '0');
+            *v = n;
+            return true;
+        }
+    return false;
+}
+
+/* The mounted instance of a pseudo file system (its first mount) */
+static struct vnode *pseudo_root(const char *fstype)
+{
+    struct vnode *r = NULL;
+    vfs_tree_lock(false);
+    for (struct mount *m = vfs_mounts(); m && !r; m = m->next)
+        if (!strcmp(m->fstype, fstype)) { r = m->root; vfs_vnode_get(r); }
+    vfs_tree_unlock();
+    return r;
+}
+
+static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64_t flags, uint64_t udata, uint64_t a6)
+{
+    (void)a6;
+    if (current_task()->uid) return -EPERM;
+    if ((flags & 0xffff0000u) == 0xc0ed0000u) flags &= 0xffff;      /* MS_MGC_VAL, from old programs */
+    char *target = kmalloc(VFS_PATH_MAX), *canon = kmalloc(VFS_PATH_MAX), *src = kzalloc(VFS_PATH_MAX);
+    char *opts = kzalloc(PAGE_SIZE), type[256] = "";
+    int64_t r = target && canon && src && opts ? get_path(utarget, target) : -ENOMEM;
+    struct vnode *tv = NULL, *sv = NULL;
+    if (r < 0) goto out;
+    long n;
+    if (usrc && (n = strncpy_from_user(src, (const char *)usrc, VFS_PATH_MAX)) < 0) { r = n; goto out; }
+    if (utype && !(flags & (MS_REMOUNT | MS_BIND | MS_MOVE)) &&
+        (n = strncpy_from_user(type, (const char *)utype, sizeof type)) < 0) {
+        r = n == -ENAMETOOLONG ? -ENODEV : n;
+        goto out;
+    }
+    if (udata && (n = strncpy_from_user(opts, (const char *)udata, PAGE_SIZE)) < 0 && n != -ENAMETOOLONG) {
+        r = n;                                          /* a longer one is cut at a page, as Linux reads it */
+        goto out;
+    }
+    if ((r = vfs_lookup(target, &tv)) < 0) goto out;
+    if ((r = vfs_path_of(tv, canon, VFS_PATH_MAX)) < 0) goto out;      /* /proc/mounts shows it resolved */
+
+    if (flags & MS_REMOUNT) {
+        struct mount *m = vfs_mount_at(canon);
+        if (!m) { r = -EINVAL; goto out; }
+        uint32_t want = mnt_flags(flags), keep = m->flags & ~(MNT_RDONLY | MNT_NOSUID | MNT_NODEV | MNT_NOEXEC);
+        bool mem = !strcmp(m->fstype, "tmpfs") || !strcmp(m->fstype, "ramfs");
+        if ((m->flags & MNT_RDONLY) && !(want & MNT_RDONLY) && !mem && !(flags & MS_BIND)) { r = -EACCES; goto out; }
+        if (flags & MS_BIND) want = (want & ~MNT_RDONLY) | (m->flags & MNT_RDONLY) | (want & MNT_RDONLY);
+        m->flags = keep | want;
+        r = 0;
+        goto out;
+    }
+    if (flags & MS_BIND) {
+        if ((r = vfs_lookup(src, &sv)) < 0) goto out;
+        r = vfs_bind_node(sv, canon, src);
+        goto out;
+    }
+    if (flags & MS_MOVE) { r = vfs_move_mount(src, canon); goto out; }
+    if ((flags & MS_PROPAGATION) && !type[0]) { r = 0; goto out; }  /* one namespace: all private */
+    if (tv->type != VDIR) { r = -ENOTDIR; goto out; }
+    uint32_t mf = mnt_flags(flags);
+    if (!strcmp(type, "tmpfs") || !strcmp(type, "ramfs")) {
+        struct mount *m;
+        struct vnode *root = vfs_mkfs(type, mf, &m);
+        uint32_t mode = !strcmp(type, "tmpfs") ? 01777 : 0755;
+        mount_opt_octal(opts, "mode", &mode);
+        root->mode = S_IFDIR | (mode & 07777);
+        mount_opt_dec(opts, "uid", &root->uid);
+        mount_opt_dec(opts, "gid", &root->gid);
+        strlcpy(m->source, src[0] ? src : type, sizeof m->source);
+        r = vfs_mount(m, canon);
+    } else if (!strcmp(type, "proc") || !strcmp(type, "sysfs") || !strcmp(type, "devtmpfs")) {
+        if (!(sv = pseudo_root(type))) { r = -ENODEV; goto out; }
+        r = vfs_bind_node(sv, canon, src[0] ? src : type);
+    } else if (!strcmp(type, "devpts")) {
+        if ((r = vfs_lookup("/dev/pts", &sv)) < 0) { r = -ENODEV; goto out; }
+        r = vfs_bind_node(sv, canon, "devpts");
+    } else if (!strcmp(type, "fuse") || !strncmp(type, "fuse.", 5)) {
+        char full[64];
+        const char *sub = strstr(opts, "subtype=");
+        if (!strcmp(type, "fuse") && sub && (sub == opts || sub[-1] == ',')) {
+            size_t n = 0;
+            while (sub[8 + n] && sub[8 + n] != ',') n++;
+            snprintf(full, sizeof full, "fuse.%.*s", (int)(n < 58 ? n : 58), sub + 8);
+        } else {
+            strlcpy(full, type, sizeof full);
+        }
+        r = fuse_mount(canon, src[0] ? src : full, full, mf, opts);
+    } else {
+        r = -ENODEV;
+    }
+out:
+    vfs_vnode_put(tv);
+    vfs_vnode_put(sv);
+    kfree(target); kfree(canon); kfree(src); kfree(opts);
+    return r;
+}
+
+static int64_t sys_umount2(uint64_t utarget, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (current_task()->uid) return -EPERM;
+    if (flags & ~0xfull) return -EINVAL;                /* FORCE DETACH EXPIRE NOFOLLOW */
+    if ((flags & 4) && (flags & 3)) return -EINVAL;     /* MNT_EXPIRE with FORCE or DETACH */
+    char p[VFS_PATH_MAX];
+    int r = get_path(utarget, p);
+    if (r) return r;
+    return vfs_umount(p, (int)flags);
+}
+
 /* ---- inotify (fs/inotify.c) ------------------------------------------------- */
 static int64_t sys_inotify_init1(uint64_t flags, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -3102,6 +3572,14 @@ void syscall_init(void)
     REG(SYS_personality, sys_personality);
     REG(SYS_readahead, sys_readahead); REG(SYS_waitid, sys_waitid);
     REG(SYS_capget, sys_capget);       REG(SYS_capset, sys_capset);
+    REG(SYS_mount, sys_mount);         REG(SYS_umount2, sys_umount2);
+    REG(SYS_preadv, sys_preadv);       REG(SYS_pwritev, sys_pwritev);
+    REG(SYS_preadv2, sys_preadv2);     REG(SYS_pwritev2, sys_pwritev2);
+    REG(SYS_epoll_pwait2, sys_epoll_pwait2); REG(SYS_fchmodat2, sys_fchmodat2);
+    REG(SYS_execveat, sys_execveat);   REG(SYS_rt_sigtimedwait, sys_rt_sigtimedwait);
+    REG(SYS_sendmmsg, sys_sendmmsg);   REG(SYS_recvmmsg, sys_recvmmsg);
+    REG(SYS_sched_getattr, sys_sched_getattr); REG(SYS_sched_setattr, sys_sched_setattr);
+    REG(SYS_copy_file_range, sys_copy_file_range); REG(SYS_mlock2, sys_mlock_ok);
     REG(SYS_rseq, sys_absent);         REG(SYS_pidfd_open, sys_absent);
     REG(SYS_quotactl, sys_absent);     REG(SYS_mbind, sys_absent);
     REG(SYS_set_mempolicy, sys_absent); REG(SYS_get_mempolicy, sys_absent);
@@ -3119,7 +3597,7 @@ void syscall_cpu_init(void)
 {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);                       /* EFER.SCE */
     wrmsr(MSR_STAR, ((uint64_t)(GDT_USER_DATA - 8) << 48) | ((uint64_t)GDT_KERNEL_CODE << 32));
-    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_LSTAR, uvm_direct((uint64_t)syscall_entry));   /* see uvm.h */
     /* SFMASK: RFLAGS bits cleared on entry. IF off until the kernel stack is
      * in place; DF, TF, AC and NT never leak from user space into the kernel. */
     wrmsr(MSR_FMASK, 0x200 | 0x400 | 0x100 | 0x40000 | 0x4000);
@@ -3134,6 +3612,27 @@ void syscall_cpu_init(void)
 static bool strace_on(const struct tcb *t)
 {
     return strace_pat[0] && t->user && strstr(t->exe, strace_pat);
+}
+
+/* ... and the path a call names, on a line of its own. */
+static void strace_path(const struct tcb *t, uint64_t nr, const struct int_frame *f)
+{
+    uint64_t a;
+    switch (nr) {
+    case SYS_open: case SYS_stat: case SYS_lstat: case SYS_access: case SYS_execve: case SYS_readlink:
+    case SYS_chdir: case SYS_mkdir: case SYS_rmdir: case SYS_unlink: case SYS_statfs: case SYS_umount2:
+    case SYS_truncate: case SYS_chmod: case SYS_rename: case SYS_symlink: case SYS_link:
+        a = f->rdi; break;
+    case SYS_openat: case SYS_newfstatat: case SYS_unlinkat: case SYS_mkdirat: case SYS_readlinkat:
+    case SYS_faccessat: case SYS_faccessat2: case SYS_statx: case SYS_execveat: case SYS_renameat2: case SYS_mount:
+        a = f->rsi; break;
+    default:
+        return;
+    }
+    char buf[160];
+    long n = strncpy_from_user(buf, (const char *)a, sizeof buf);
+    if (n == -ENAMETOOLONG) n = (long)sizeof buf - 1;
+    if (n >= 0) kprintf("strace %d   path \"%s\"\n", t->pid, buf);
 }
 
 static bool may_block(uint64_t nr)
@@ -3228,7 +3727,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * a file that needs the big lock takes it there (vfs_close). */
     case SYS_exit: case SYS_exit_group: case SYS_wait4: case SYS_waitid:
     case SYS_rt_sigaction: case SYS_rt_sigreturn: case SYS_rt_sigpending:
-    case SYS_rt_sigsuspend: case SYS_pause: case SYS_tkill: case SYS_tgkill:
+    case SYS_rt_sigsuspend: case SYS_pause: case SYS_tkill: case SYS_tgkill: case SYS_rt_sigtimedwait:
         return true;
     case SYS_kill:           return f->rdi != 1;        /* the kernel may play init: poweroff */
     /* a new thread or process: its slot and the tree under proc_lock, the
@@ -3238,7 +3737,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* a new program: the image is read with the big lock only from a file
      * that needs it (proc/exec.c); the rest is the task's own, the tree's
      * (proc_lock) or the address space's */
-    case SYS_execve:
+    case SYS_execve: case SYS_execveat:
         return true;
     /* data through a file that locks itself: a unix socket, a pipe, an
      * eventfd, an ext2 or tmpfs file (the file system's lock, and the
@@ -3247,6 +3746,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_pread64: case SYS_pwrite64: case SYS_lseek: case SYS_readahead: case SYS_fadvise64:
     case SYS_fstat: case SYS_fsync: case SYS_fdatasync:
     case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
+    case SYS_preadv: case SYS_pwritev: case SYS_preadv2: case SYS_pwritev2: case SYS_recvmmsg: case SYS_sendmmsg:
     /* ioctl on such a file, a terminal or the sound card: their ioctls lock
      * what they touch (a pty's ownership requests and the network ones
      * take the big lock themselves) */
@@ -3255,7 +3755,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* waiting on descriptors: fget takes the kernel lock at the first file
      * that needs it, and the call keeps it from then on */
     case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
-    case SYS_epoll_wait: case SYS_epoll_pwait:
+    case SYS_epoll_wait: case SYS_epoll_pwait: case SYS_epoll_pwait2:
         return true;
     /* the address space: mm->lock (mm/vm.c). Mapping a file that needs the
      * big lock takes it in fget, MAP_POPULATE in sys_mmap. */
@@ -3275,7 +3775,8 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_capget: case SYS_capset: case SYS_getcpu: case SYS_ioprio_get: case SYS_ioprio_set:
     case SYS_personality: case SYS_times: case SYS_sched_get_priority_max: case SYS_sched_get_priority_min:
     case SYS_sched_setaffinity: case SYS_get_robust_list: case SYS_mincore: case SYS_msync: case SYS_fallocate:
-    case SYS_mlock: case SYS_munlock: case SYS_mlockall: case SYS_munlockall:
+    case SYS_mlock: case SYS_munlock: case SYS_mlockall: case SYS_munlockall: case SYS_mlock2:
+    case SYS_sched_getattr: case SYS_sched_setattr:
     case SYS_setuid: case SYS_setgid: case SYS_setreuid: case SYS_setregid: case SYS_setresuid:
     case SYS_setresgid: case SYS_setgroups:
     /* the process tree's ids: proc_lock */
@@ -3283,7 +3784,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
         return true;
     /* a descriptor's file: fget takes the big lock for one that needs it.
      * timerfd, signalfd, inotify and memfd files lock themselves. */
-    case SYS_ftruncate: case SYS_fchmod: case SYS_fchown: case SYS_fstatfs: case SYS_sendfile:
+    case SYS_ftruncate: case SYS_fchmod: case SYS_fchown: case SYS_fstatfs: case SYS_sendfile: case SYS_copy_file_range:
     case SYS_close_range: case SYS_memfd_create:
     case SYS_timerfd_create: case SYS_timerfd_settime: case SYS_timerfd_gettime:
     case SYS_signalfd: case SYS_signalfd4:
@@ -3307,7 +3808,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_getdents64: case SYS_getcwd: case SYS_chdir: case SYS_fchdir: case SYS_umask:
     case SYS_mkdir: case SYS_mkdirat: case SYS_rmdir: case SYS_unlink: case SYS_unlinkat:
     case SYS_rename: case SYS_renameat: case SYS_renameat2: case SYS_link: case SYS_linkat:
-    case SYS_symlink: case SYS_symlinkat: case SYS_chmod: case SYS_fchmodat: case SYS_chown:
+    case SYS_symlink: case SYS_symlinkat: case SYS_chmod: case SYS_fchmodat: case SYS_fchmodat2: case SYS_chown:
     case SYS_lchown: case SYS_fchownat: case SYS_utimensat:
         return true;
     default:
@@ -3346,6 +3847,7 @@ int syscall_dispatch(struct int_frame *f)
             kprintf("strace %d %s(%lx, %lx, %lx, %lx) ...\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4);
         uint64_t w0 = rdtsc(), c0 = kstat_run_cycles(t);
         if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
+        if (tr) strace_path(t, nr, f);
         int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
         f->rax = (uint64_t)r;
         if (!locked && bkl_depth()) locked = true;      /* fget took the lock on the way */

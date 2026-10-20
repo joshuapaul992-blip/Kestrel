@@ -106,6 +106,8 @@ bool signal_pending(void);                      /* for blocking loops         */
  * mask (its own first, then the process'); 0 if none. */
 int  signal_dequeue(uint64_t mask, struct ksig_info *info);
 void signal_wait_mask(uint64_t mask);          /* until one in mask, or one to deliver */
+void signal_wait_mask_until(uint64_t mask, uint64_t deadline_ms);  /* ... or deadline (0: none) */
+void signal_user_info(int sig, const struct ksig_info *i, void *out128);   /* siginfo_t, 128 bytes */
 uint64_t signal_pending_mask(void);             /* pending for the current thread */
 extern int signal_wait_chan;                    /* woken whenever a signal is queued */
 /* Deliver pending signals to the current process before it returns to
@@ -116,6 +118,7 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall);
 /* ---- system calls ------------------------------------------------------- */
 int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid, uint64_t tls);
 int64_t proc_execve(uint64_t path, uint64_t argv, uint64_t envp);
+int64_t proc_execve_path(char *path, uint64_t argv, uint64_t envp);   /* path: kmalloc'd, freed */
 int64_t proc_wait4(int64_t pid, uint64_t status, uint64_t options, uint64_t rusage);
 int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options);
 int64_t proc_setsid(void);

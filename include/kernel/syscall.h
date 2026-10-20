@@ -235,7 +235,23 @@ struct int_frame;
 #define SYS_shmat         30
 #define SYS_shmctl        31
 #define SYS_shmdt         67
-#define SYS_MAX           450
+#define SYS_rt_sigtimedwait 128
+#define SYS_mount         165
+#define SYS_umount2       166
+#define SYS_recvmmsg      299
+#define SYS_preadv        295
+#define SYS_pwritev       296
+#define SYS_sendmmsg      307
+#define SYS_sched_setattr 314
+#define SYS_sched_getattr 315
+#define SYS_execveat      322
+#define SYS_mlock2        325
+#define SYS_copy_file_range 326
+#define SYS_preadv2       327
+#define SYS_pwritev2      328
+#define SYS_epoll_pwait2  441
+#define SYS_fchmodat2     452
+#define SYS_MAX           470
 
 typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6);
