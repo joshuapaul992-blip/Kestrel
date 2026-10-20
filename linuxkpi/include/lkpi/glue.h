@@ -161,6 +161,9 @@ struct lkpi_cdev_ops {
     long (*ioctl)(void *file, unsigned int cmd, unsigned long arg);
     int  (*poll)(void *file, int events);
     int  (*mmap)(void *file, struct lkpi_mmap *m);          /* optional: MAP_SHARED */
+    /* files without a node (lkpi_fd_fill): */
+    unsigned long long (*size)(void *file);                 /* for lseek(SEEK_END) and fstat */
+    void (*hold)(void *file);                               /* one more reference, for lkpi_fd_file */
 };
 void         *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                             const struct lkpi_cdev_ops *ops, void *dev);
@@ -170,6 +173,20 @@ void          lkpi_cdev_remove(void *node);
 void          lkpi_sysfs_class_dev(void *pci, const char *cls, const char *name, const char *devname,
                                    unsigned int major, unsigned int minor);
 void          lkpi_sysfs_pci_driver(void *pci, const char *driver);
+
+/* Descriptors of the calling process for files without a node in /dev
+ * (anon_inode_getfile: dma-bufs, sync files, DRM sync objects), from inside
+ * a system call. lkpi_fd_reserve() holds a free descriptor (or returns
+ * -EMFILE), lkpi_fd_fill() puts the file there, served by `ops` (named
+ * `name`, as /proc/self/fd shows it); the descriptor's last close calls
+ * ops->release(file). lkpi_fd_unreserve() gives an unused one back.
+ * lkpi_fd_file() is the file behind fd if `ops` serve it (an open of a
+ * device node with them, or a file filled in with them), with
+ * ops->hold() called on it, or NULL. */
+int           lkpi_fd_reserve(int cloexec);
+int           lkpi_fd_fill(int fd, const char *name, int flags, const struct lkpi_cdev_ops *ops, void *file);
+void          lkpi_fd_unreserve(int fd);
+void         *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops);
 
 /* ---- device memory mapped into a process (mmap of a device node) -------- */
 /* The region [start, end) at file offset `off` of the process `mm` (opaque)

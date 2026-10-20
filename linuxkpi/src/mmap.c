@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -86,6 +87,7 @@ static void *kpi_dup(void *ctx, void *mm, unsigned long start, unsigned long end
 
     if (!n) return NULL;
     *n = *lv;
+    if (n->vma.vm_file) get_file(n->vma.vm_file);
     if (mm) n->vma.vm_mm = mm;
     n->vma.vm_start = start;
     n->vma.vm_end = end;
@@ -110,6 +112,7 @@ static void kpi_close(void *ctx)
 
     unlink_vma(lv);
     if (lv->vma.vm_ops && lv->vma.vm_ops->close) lv->vma.vm_ops->close(&lv->vma);
+    if (lv->vma.vm_file) fput(lv->vma.vm_file);
     kfree(lv);
 }
 
@@ -133,7 +136,7 @@ int lkpi_file_mmap(struct file *file, struct lkpi_mmap *m)
     vma->vm_end = m->end;
     vma->vm_pgoff = m->off >> PAGE_SHIFT;
     vma->vm_mm = m->mm;
-    vma->vm_file = file;
+    vma->vm_file = get_file(file);      /* the region's reference (vma_set_file may swap it) */
     vma->vm_flags = VM_SHARED | VM_MAYSHARE | VM_MAYREAD | VM_MAYEXEC;
     if (file->f_mode & FMODE_WRITE) vma->vm_flags |= VM_MAYWRITE;
     if (m->prot & LKPI_PROT_READ) vma->vm_flags |= VM_READ;
@@ -141,7 +144,7 @@ int lkpi_file_mmap(struct file *file, struct lkpi_mmap *m)
     if (m->prot & LKPI_PROT_EXEC) vma->vm_flags |= VM_EXEC;
     vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
     r = file->f_op->mmap(file, vma);
-    if (r) { kfree(lv); return r; }
+    if (r) { fput(vma->vm_file); kfree(lv); return r; }
     link_vma(lv);
     m->ops = &kpi_mmap_ops;
     m->ctx = lv;
@@ -149,6 +152,15 @@ int lkpi_file_mmap(struct file *file, struct lkpi_mmap *m)
 }
 
 /* ---- what drivers call -------------------------------------------------------------------- */
+/* the region maps another file's object (a dma-buf's mmap hands it to the GEM object's file) */
+void vma_set_file(struct vm_area_struct *vma, struct file *file)
+{
+    struct file *old = vma->vm_file;
+    vma->vm_file = get_file(file);
+    fput(old);
+}
+EXPORT_SYMBOL(vma_set_file);
+
 vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot)
 {
     if (addr < vma->vm_start || addr >= vma->vm_end) return VM_FAULT_SIGBUS;

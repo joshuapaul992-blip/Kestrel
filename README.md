@@ -662,14 +662,17 @@ linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see 
   src/device.c pci.c         driver model, devres, platform bus; PCI devices and drivers
   src/slab.c page.c dma.c    kmalloc, kmem_cache, vmalloc; struct page; DMA mappings and pools
   src/io.c firmware.c        ioremap, port I/O, regions; request_firmware from /lib/firmware
-  src/chardev.c watchdog.c   chrdev/cdev/misc devices and user copies; the watchdog core
+  src/chardev.c watchdog.c   chrdev/cdev/misc devices, the KPI's files and their descriptors
+                             (anon_inode_getfile, fget, fd_install) and user copies; the watchdog core
   src/notifier.c idr.c       notifier chains, panic and reboot hooks; IDR/IDA
   src/printk.c vsprintf.c    printk, dev_*, hex dumps; vsprintf with %p extensions, sscanf
   src/lib.c selftest.c       strings, kstrto*, bitmaps; the linuxkpi.selftest=1 self-test
   src/ww_mutex.c dma-fence.c wound/wait mutexes and SRCU; DMA fences, fence arrays and chains
   src/sort.c                 sort, sort_r, list_sort
   src/drm.c                  what DRM needs beyond its MIT files: drm_managed, the /dev/dri
-                             names, PRIME stubs, anonymous files, boot_cpu_data; linuxkpi.drm
+                             names, sync object stubs, shmem files, boot_cpu_data; linuxkpi.drm
+  src/dma-buf.c sync_file.c  dma-bufs and sync files (after NetBSD's, BSD-2-Clause)
+  src/drm_prime.c            PRIME: GEM objects to dma-buf descriptors and back
   src/mmap.c                 drivers' memory mapped into processes: vm_area_struct, faults,
                              vmf_insert_pfn_prot, unmap_mapping_range
   src/drm_kestrel.c          drm_fbdev_ttm_setup(): Kestrel's terminals on DRM drivers
@@ -1377,7 +1380,8 @@ nouveau takes the boot display over like bochs does (above). Without firmware in
 - **Keyboard and mouse as evdev devices.** `/dev/input/event0` (the keyboard, 13:64) and `event1` (the mouse, 13:65) give Linux's `struct input_event` records from the PS/2 and USB keyboards and mice, with the evdev ioctls X's evdev driver and libinput ask (version, ids, names, the event types and codes they send, key state, `EVIOCGRAB`, which takes the keys away from the text terminal). Both are in `/sys/class/input`.
 - **Terminals for X.** The VT and KD ioctls an X server makes on its terminal work on `/dev/tty1`..`ttyN` and `/dev/tty0` (the terminal in front): `VT_GETSTATE`, `VT_OPENQRY`, `VT_GETMODE`/`VT_SETMODE`, `VT_ACTIVATE`, `VT_WAITACTIVE`, `KDSETMODE` (`KD_GRAPHICS` stops the terminal drawing), `KDSKBMODE` (`K_OFF` stops it reading the keyboard) and the LED calls. Closing the terminal puts its modes back.
 - **Xorg.** On the Firefox image, `/bin/startx` runs XLibre's Xorg with its `modesetting` driver on `/dev/dri/card0` when there is one, with GLX and the evdev input driver (`/etc/X11/kestrel-xorg.conf`; Kestrel has no udev, so the devices are named there), and Xkestrel elsewhere (`KESTREL_X=xkestrel` asks for Xkestrel anyway). libpciaccess finds the GPU through `/sys`. `ports/xorg/build.sh` builds the server and the evdev driver on the Ubuntu host and `tools/mkfirefoxroot.sh` adds them, with the libraries they load, when `XORG_ROOT` names them. In QEMU (bochs) LXDE comes up on Xorg, `glxgears` runs on llvmpipe, and logging out gives the text terminal back.
-- **Test:** `evdevtest` (in `/bin`) checks the evdev ioctls, the grab, and the VT and KD ioctls; `evdevtest -w N` also waits N seconds for a key typed on the keyboard. `drmtest` (in `/bin`) checks the sysfs entries the way libdrm reads them, the version and capabilities, the KMS objects, two dumb buffers drawn through their mappings and read back, `SETCRTC`, a page flip and its event, the mapping after `fork()` and a partial `munmap()`, the render node when there is one, and the terminal's frame buffer coming back after the last close. `drmtest -h N` keeps the colour bars up for N seconds.
+- **PRIME.** `DRM_IOCTL_PRIME_HANDLE_TO_FD` turns a GEM object into a dma-buf descriptor and `PRIME_FD_TO_HANDLE` turns one back, so Mesa can hand buffers to the X server (DRI3). A dma-buf knows its size (`lseek(SEEK_END)`, `fstat`), maps, takes `DMA_BUF_IOCTL_SYNC` around CPU access, polls on the buffer's fences, and gives those fences out as a sync file (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`) or takes one in. Sync files poll ready when their fence signals and answer `SYNC_IOC_MERGE` and `SYNC_IOC_FILE_INFO`. Linux's dma-buf and sync-file code is GPL-2.0-only, so `linuxkpi/src/dma-buf.c` and `sync_file.c` follow NetBSD's (`sys/external/bsd/drm2/linux`, BSD-2-Clause, notice kept) and `drm_prime.c` is the KPI's own. They are files of the KPI with descriptors of their own: `anon_inode_getfile()`, `get_unused_fd_flags()`, `fd_install()` and `fget()` work on the calling process's descriptor table (`fd_reserve()` and `fd_fill()` in `kernel/syscall.c`), and a file lives until its last reference, from a descriptor, a mapping or the driver, is dropped. Sync objects (which Vulkan needs) are not there yet.
+- **Test:** `evdevtest` (in `/bin`) checks the evdev ioctls, the grab, and the VT and KD ioctls; `evdevtest -w N` also waits N seconds for a key typed on the keyboard. `drmtest` (in `/bin`) checks the sysfs entries the way libdrm reads them, the version and capabilities, the KMS objects, two dumb buffers drawn through their mappings and read back, `SETCRTC`, a page flip and its event, the mapping after `fork()` and a partial `munmap()`, the render node when there is one, PRIME (a dumb buffer exported, mapped as a dma-buf, its fences as a sync file, imported again by the same file and by a second open, and kept alive by the dma-buf after its handle is closed), and the terminal's frame buffer coming back after the last close. `drmtest -h N` keeps the colour bars up for N seconds.
 
 ## Memory map at boot
 
@@ -1411,7 +1415,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 
 Kestrel source: the GNU General Public License, version 3 (`LICENSE`).
 
-Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The x86emu real-mode emulator (`third_party/x86emu`, from X.org): SciTech/X11 permissive licence (`third_party/x86emu/LICENSE`), © SciTech Software, David Mosberger-Tang, Egbert Eich, Bart Trojanowski. The terminal fonts (`third_party/kestrel_font`) are the project's own.
+Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The KPI's dma-bufs and sync files (`linuxkpi/src/dma-buf.c`, `sync_file.c`) are derived from NetBSD's `linux_dma_buf.c` and `linux_sync_file.c`: BSD-2-Clause, © The NetBSD Foundation (notice in each file). The x86emu real-mode emulator (`third_party/x86emu`, from X.org): SciTech/X11 permissive licence (`third_party/x86emu/LICENSE`), © SciTech Software, David Mosberger-Tang, Egbert Eich, Bart Trojanowski. The terminal fonts (`third_party/kestrel_font`) are the project's own.
 
 NVIDIA register and VBIOS table knowledge in `drivers/gpu/nvidia/` is derived from nouveau (`third_party/nouveau/LICENSE`): MIT, © Red Hat Inc.
 
