@@ -326,6 +326,8 @@ void     epoll_file_used(struct file *f);       /* I/O on it: re-arm edge-trigge
 
 /* fs/anonfd.c */
 int      eventfd_create(uint32_t initval, int flags, struct file **out);
+int      eventfd_fget(int fd, struct file **out);  /* the eventfd behind fd, with a reference */
+void     eventfd_file_signal(struct file *f);       /* add 1, from any context */
 int      timerfd_create_file(int clockid, int flags, struct file **out);
 int      timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], int64_t old[4]);
 int      timerfd_gettime_file(struct file *f, int64_t cur[4]);

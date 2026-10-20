@@ -27,8 +27,10 @@
 #include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 #include <linux/iosys-map.h>
 #include <linux/dma-resv.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_client.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_connector.h>
@@ -37,10 +39,12 @@
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_fbdev_ttm.h>
+#include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 #include <drm/drm_rect.h>
@@ -458,6 +462,50 @@ void drm_fbdev_ttm_setup(struct drm_device *dev, unsigned int preferred_bpp)
 }
 EXPORT_SYMBOL(drm_fbdev_ttm_setup);
 
+/* the same client for drivers whose buffers are system memory (virtio-gpu) */
+void drm_fbdev_shmem_setup(struct drm_device *dev, unsigned int preferred_bpp)
+{
+    drm_fbdev_ttm_setup(dev, preferred_bpp);
+}
+EXPORT_SYMBOL(drm_fbdev_shmem_setup);
+
 /* drm_modeset_helper.c tells fbdev about suspend; there is no fbdev. */
 void drm_fb_helper_set_suspend_unlocked(struct drm_fb_helper *fb_helper, bool suspend) { }
 EXPORT_SYMBOL(drm_fb_helper_set_suspend_unlocked);
+
+/* /proc/dri (include/kernel/linuxkpi.h): every DRM device's atomic state, as
+ * Linux's debugfs dri/N/state prints it, under all of the device's modeset
+ * locks. */
+extern struct xarray drm_minors_xa;
+
+struct state_buf { char *buf; size_t cap, n; };
+
+static void state_printfn(struct drm_printer *p, struct va_format *vaf)
+{
+    struct state_buf *s = p->arg;
+    if (s->n < s->cap) s->n += vscnprintf(s->buf + s->n, s->cap - s->n, vaf->fmt, *vaf->va);
+}
+
+size_t linuxkpi_drm_state(char *buf, size_t cap)
+{
+    struct state_buf s = { buf, cap, 0 };
+    struct drm_printer p = { .printfn = state_printfn, .arg = &s };
+    unsigned int id;
+
+    for (id = 0; id < 64; id++) {                   /* the primary nodes, card0 to card63 */
+        struct drm_minor *minor = drm_minor_acquire(&drm_minors_xa, id);
+        struct drm_device *dev;
+        if (IS_ERR(minor)) continue;
+        dev = minor->dev;
+        drm_printf(&p, "card%u: %s on %s\n", id, dev->driver->name, dev->dev ? dev_name(dev->dev) : "-");
+        if (drm_drv_uses_atomic_modeset(dev)) {
+            drm_modeset_lock_all(dev);
+            drm_state_dump(dev, &p);
+            drm_modeset_unlock_all(dev);
+        } else {
+            drm_printf(&p, "no atomic modesetting\n");
+        }
+        drm_minor_release(minor);
+    }
+    return s.n;
+}

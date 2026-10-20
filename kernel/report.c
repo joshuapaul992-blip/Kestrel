@@ -1,4 +1,5 @@
-/* kernel/report.c -- REPORT.TXT and VBIOS.ROM on the stick's report volume
+/* kernel/report.c -- REPORT.TXT, VBIOS.ROM and RESULTS.TAR on the stick's
+ * report volume
  *
  * FAT handling is deliberately minimal and read-only for the metadata: the
  * boot sector (BPB) and root directory are read, the FAT is only followed to
@@ -32,7 +33,7 @@ struct fat_file {
 struct section { const char *title; size_t (*fn)(char *, size_t); };
 
 static struct blkdev  *vol;             /* partition (or whole disk) holding the volume */
-static struct fat_file f_report, f_vbios;
+static struct fat_file f_report, f_vbios, f_results;
 static struct section sections[MAX_SECTIONS];
 static int            nsections;
 static const void    *blob;
@@ -118,7 +119,8 @@ static void scan_dir_sector(struct fat_vol *v, const uint8_t *s, bool *end)
         const uint8_t *d = s + i;
         if (d[0] == 0x00) { *end = true; return; }
         if (d[0] == 0xE5 || (d[11] & 0x0F) == 0x0F || (d[11] & 0x18)) continue;   /* deleted, LFN, dir, label */
-        struct fat_file *f = !memcmp(d, "REPORT  TXT", 11) ? &f_report : !memcmp(d, "VBIOS   ROM", 11) ? &f_vbios : NULL;
+        struct fat_file *f = !memcmp(d, "REPORT  TXT", 11) ? &f_report : !memcmp(d, "VBIOS   ROM", 11) ? &f_vbios :
+                             !memcmp(d, "RESULTS TAR", 11) ? &f_results : NULL;
         if (!f || f->found) continue;
         uint32_t first = rd16(d + 26) | (v->bits == 32 ? (uint32_t)rd16(d + 20) << 16 : 0);
         f->size = rd32(d + 28);
@@ -155,6 +157,7 @@ static bool try_volume(struct blkdev *b, uint8_t *sec)
     v.sec = s + 512;
     memset(&f_report, 0, sizeof f_report);
     memset(&f_vbios, 0, sizeof f_vbios);
+    memset(&f_results, 0, sizeof f_results);
     bool end = false;
     if (bits == 16) {
         for (uint32_t i = 0; i < root_secs && !end; i++)
@@ -167,9 +170,9 @@ static bool try_volume(struct blkdev *b, uint8_t *sec)
     }
     kfree(s);
     if (!f_report.found && !f_vbios.found) return false;
-    snprintf(where, sizeof where, "%s (FAT%d \"" REPORT_LABEL "\"): %s%s%s", b->name, bits,
+    snprintf(where, sizeof where, "%s (FAT%d \"" REPORT_LABEL "\"): %s%s%s%s", b->name, bits,
              f_report.found ? "REPORT.TXT" : "", f_report.found && f_vbios.found ? ", " : "",
-             f_vbios.found ? "VBIOS.ROM" : "");
+             f_vbios.found ? "VBIOS.ROM" : "", f_results.found ? ", RESULTS.TAR" : "");
     return true;
 }
 
@@ -289,4 +292,74 @@ long report_user_write(const void *buf, size_t len)
     user_len += k;
     int rc = report_save("written through /dev/report");
     return rc ? rc : (long)len;
+}
+
+/* ---- /dev/results: a tar archive of test results ------------------------------ */
+/* Sector `sec` of file f: its LBA and how many sectors follow it in the same
+ * run, or false past the end. */
+static bool file_sector(const struct fat_file *f, uint64_t sec, uint64_t *lba, uint32_t *left)
+{
+    for (int r = 0; r < f->nruns; r++) {
+        if (sec < f->run[r].count) {
+            *lba = f->run[r].lba + sec;
+            *left = (uint32_t)(f->run[r].count - sec);
+            return true;
+        }
+        sec -= f->run[r].count;
+    }
+    return false;
+}
+
+static uint64_t results_end;            /* the furthest byte written since the last close */
+
+long report_results_write(const void *buf, size_t len, uint64_t off)
+{
+    if (!vol && !report_locate()) return -ENODEV;
+    if (!f_results.found) return -ENODEV;
+    if (off >= f_results.size) return len ? -ENOSPC : 0;
+    if (len > f_results.size - off) len = (size_t)(f_results.size - off);
+    uint8_t *bounce = kmalloc(IO_CHUNK);
+    if (!bounce) return -ENOMEM;
+    const uint8_t *src = buf;
+    uint64_t pos = off, end = off + len;
+    int rc = 0;
+    while (pos < end && rc == 0) {
+        uint64_t sec = pos / 512, lba;
+        uint32_t left;
+        if (!file_sector(&f_results, sec, &lba, &left)) { rc = -ENOSPC; break; }
+        uint32_t nsec = (uint32_t)((end - sec * 512 + 511) / 512);
+        if (nsec > IO_CHUNK / 512) nsec = IO_CHUNK / 512;
+        if (nsec > left) nsec = left;
+        uint64_t first = sec * 512, last = first + (uint64_t)nsec * 512;
+        size_t skip = (size_t)(pos - first), n = (size_t)((end < last ? end : last) - pos);
+        if (skip || skip + n < (size_t)nsec * 512)          /* a partial sector: keep what is there */
+            rc = blk_read(vol, lba, nsec, bounce);
+        if (rc == 0) {
+            memcpy(bounce + skip, src + (pos - off), n);
+            rc = blk_write(vol, lba, nsec, bounce);
+        }
+        pos += n;
+    }
+    kfree(bounce);
+    if (rc) {
+        kprintf("report: writing RESULTS.TAR on %s failed: %s\n", vol->name, blk_strerror(rc));
+        return rc;
+    }
+    if (end > results_end) results_end = end;
+    return (long)len;
+}
+
+/* Last close: two zero blocks after the furthest write end the archive there
+ * even if the writer stopped early (tar writes its own), then a flush. */
+void report_results_close(void)
+{
+    if (!vol || !f_results.found) return;
+    static const uint8_t zero[1024];
+    uint64_t at = (results_end + 511) & ~511ull;
+    if (results_end && at < f_results.size) report_results_write(zero, sizeof zero, at);
+    if (results_end) {
+        blk_flush(vol);
+        kprintf("report: RESULTS.TAR: %lu bytes written to %s\n", results_end, vol->name);
+    }
+    results_end = 0;
 }

@@ -132,7 +132,9 @@ LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c linuxkpi/src/dma-b
                 third_party/linux/drivers/video/aperture.c third_party/linux/drivers/video/hdmi.c \
                 $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c)) \
                 $(sort $(wildcard third_party/linux/drivers/gpu/drm/ttm/*.c)) \
-                third_party/linux/drivers/gpu/drm/tiny/bochs.c
+                third_party/linux/drivers/gpu/drm/tiny/bochs.c \
+                linuxkpi/src/drm_gem_shmem.c linuxkpi/src/virtio.c \
+                $(sort $(wildcard third_party/linux/drivers/gpu/drm/virtio/*.c)) linuxkpi/virtio-gpu/kestrel.c
 LKPI_DRM_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_DRM_SRC))
 LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linux/include/uapi \
                    -include linux/kernel.h -include linux/export.h -include linux/module.h -include linux/slab.h -include linux/rbtree.h \
@@ -143,8 +145,12 @@ LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linu
 # the command line, since the force-included headers would define it first.
 lkpi_drm_prfmt = $(if $(filter %/ttm_device.c,$(1)),-D'pr_fmt(fmt)="[TTM DEVICE] " fmt',$(if \
                  $(filter %/ttm_bo.c %/ttm_tt.c %/ttm_bo_vm.c,$(1)),-D'pr_fmt(fmt)="[TTM] " fmt'))
-# KBUILD_MODNAME as Linux's modules: drm, ttm, bochs; the library files by name
-lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1)))))))
+# KBUILD_MODNAME as Linux's modules: drm, ttm, bochs, virtio_gpu; the library files by name
+lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if \
+                   $(findstring /virtio/,$(1))$(findstring /virtio-gpu/,$(1)),virtio_gpu,$(if \
+                   $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1))))))))
+# virtio-gpu's files see the KPI's stand-ins for its GPL-2.0-only ones, and the KPI's for the driver's
+lkpi_drm_overlay = $(if $(findstring /virtio/,$(1))$(findstring /virtio-gpu/,$(1)),-iquote linuxkpi/virtio-gpu -iquote third_party/linux/drivers/gpu/drm/virtio)
 
 # Phase 2, nouveau: the driver as Linux's Kbuild builds it on x86 without
 # ACPI, debugfs, LEDs, backlight, SVM or the Tegra platform driver (the list
@@ -251,7 +257,7 @@ lkpi-nv-check:
 $(LKPI_DRM_OBJS): $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC [L]  $<"
-	@$(CC) $(LKPI_DRM_CFLAGS) $(call lkpi_drm_prfmt,$<) -DKBUILD_MODNAME='"$(call lkpi_drm_modname,$<)"' -c $< -o $@
+	@$(CC) $(LKPI_DRM_CFLAGS) $(call lkpi_drm_prfmt,$<) $(call lkpi_drm_overlay,$<) -DKBUILD_MODNAME='"$(call lkpi_drm_modname,$<)"' -c $< -o $@
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
@@ -308,7 +314,7 @@ $(BUILD)/nouveau.stamp: FORCE
 # ---- bootable ISO (BIOS El Torito + UEFI, whatever GRUB platforms are installed)
 $(BUILD)/cmdline.stamp: FORCE
 	@mkdir -p $(BUILD)
-	@echo '$(KERNEL_CMDLINE)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE)' > $@
+	@echo '$(KERNEL_CMDLINE) default=$(GRUB_DEFAULT)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE) default=$(GRUB_DEFAULT)' > $@
 
 $(BUILD)/rootbase.stamp: FORCE
 	@mkdir -p $(BUILD)
@@ -507,9 +513,12 @@ USBIMG_FLAGS ?=
 # /bin/kestrel-bench (boot/grub/grub-bench.cfg). Use it with the Firefox
 # root (ROOTFS_BASE), which has Firefox and Xvfb.
 BENCH_LINUX ?=
+# GRUB_DEFAULT: the menu entry the stick boots by itself after 5 s, counting
+# from 0 (boot/grub/grub-usb.cfg); 4 is the GPU self-test.
+GRUB_DEFAULT ?= 0
 ESP_MB := $(if $(BENCH_LINUX),48,8)
 USBIMG_ROOT  := $(if $(MKE2FS),$(ROOTDISK))
-USBIMG_SIZE  ?= $(shell echo $$(($(if $(MKE2FS),$(ROOTDISK_MB),0) + 56 + $(ESP_MB))))
+USBIMG_SIZE  ?= $(shell echo $$(($(if $(MKE2FS),$(ROOTDISK_MB),0) + 96 + $(ESP_MB))))
 $(BUILD)/bench.stamp: FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(abspath $(BENCH_LINUX))' | cmp -s - $@ || echo '$(abspath $(BENCH_LINUX))' > $@
@@ -532,7 +541,7 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg boot/grub/grub-bench.cfg tools/mku
 	        MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BENCH_LINUX)/vmlinuz $(BENCH_LINUX)/initrd.gz ::/boot/linux/; fi; \
 	else test -z "$(BENCH_LINUX)" || { echo "error: BENCH_LINUX needs mtools and GRUB's x86_64-efi files"; exit 1; }; \
 	    cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf; fi; \
-	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
+	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e 's|@GRUB_DEFAULT@|$(GRUB_DEFAULT)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
 	    $(if $(BENCH_LINUX),-e '/@BENCH_ENTRIES@/r boot/grub/grub-bench.cfg') -e '/@BENCH_ENTRIES@/d' \
 	    boot/grub/grub-usb.cfg > $(BUILD)/usbdir/boot/grub/grub.cfg
 	@tar --format=ustar -C $(BUILD)/usbdir -cf $(BUILD)/usb-memdisk.tar boot

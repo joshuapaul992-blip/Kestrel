@@ -246,41 +246,6 @@ struct device *drm_sysfs_minor_alloc(struct drm_minor *minor)
     return kdev;
 }
 
-/* ---- sync objects (for Vulkan): not offered yet ------------------------------------------ */
-#define LKPI_DRM_NO_IOCTL(name)                                                         \
-    int name(struct drm_device *dev, void *data, struct drm_file *file_priv) { return -EOPNOTSUPP; }
-LKPI_DRM_NO_IOCTL(drm_syncobj_create_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_destroy_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_handle_to_fd_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_fd_to_handle_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_transfer_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_wait_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_timeline_wait_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_eventfd_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_reset_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_signal_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_timeline_signal_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_query_ioctl)
-
-void drm_syncobj_open(struct drm_file *file_private) { }
-void drm_syncobj_release(struct drm_file *file_private) { }
-
-/* Sync objects only come from user space, which cannot make one yet: a
- * handle never names one. */
-struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private, u32 handle) { return NULL; }
-int drm_syncobj_find_fence(struct drm_file *file_private, u32 handle, u64 point, u64 flags,
-                           struct dma_fence **fence)
-{
-    *fence = NULL;
-    return -ENOENT;
-}
-void drm_syncobj_add_point(struct drm_syncobj *syncobj, struct dma_fence_chain *chain,
-                           struct dma_fence *fence, uint64_t point) { WARN_ON_ONCE(1); }
-void drm_syncobj_replace_fence(struct drm_syncobj *syncobj, struct dma_fence *fence) { WARN_ON_ONCE(1); }
-void drm_syncobj_free(struct kref *kref) { WARN_ON_ONCE(1); }
-EXPORT_SYMBOL(drm_syncobj_find);
-EXPORT_SYMBOL(drm_syncobj_find_fence);
-
 int drm_writeback_set_fb(struct drm_connector_state *conn_state, struct drm_framebuffer *fb) { return -EINVAL; }
 int drm_writeback_prepare_job(struct drm_writeback_job *job) { return 0; }
 void drm_writeback_cleanup_job(struct drm_writeback_job *job) { kfree(job); }
@@ -391,8 +356,17 @@ pgprot_t vm_get_page_prot(unsigned long vm_flags)
     return vm_flags & VM_WRITE ? PAGE_SHARED : __pgprot(0x25UL);
 }
 
-/* xarray nodes */
+/* xarray nodes: lib/xarray.c takes them as they come from the cache and
+ * expects empty slots (Linux's cache has a constructor that clears them,
+ * and frees them cleared), so each one is cleared when it is handed out */
 struct kmem_cache *radix_tree_node_cachep;
+
+static void radix_tree_node_ctor(void *p)
+{
+    struct xa_node *node = p;
+    memset(node, 0, sizeof(*node));
+    INIT_LIST_HEAD(&node->private_list);
+}
 
 void radix_tree_node_rcu_free(struct rcu_head *head)
 {
@@ -431,7 +405,8 @@ int wbinvd_on_all_cpus(void)
 void lkpi_drm_core_init(void)
 {
     cpu_fill();
-    radix_tree_node_cachep = kmem_cache_create("radix_tree_node", sizeof(struct xa_node), 0, 0, NULL);
+    radix_tree_node_cachep = kmem_cache_create("radix_tree_node", sizeof(struct xa_node), 0, 0,
+                                               radix_tree_node_ctor);
     lkpi_drm_enabled = lkpi_display_drm();
     printk(KERN_INFO "linuxkpi: DRM drivers %s\n", lkpi_drm_enabled ? "may take over displays"
            : "are off (linuxkpi.drm=0 or Safe Mode): the firmware's frame buffer only");

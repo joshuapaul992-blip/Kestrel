@@ -100,20 +100,27 @@ static void update_command(struct pci_dev *dev, u16 clear, u16 set)
 }
 
 /* ---- capabilities ------------------------------------------------------------- */
-u8 pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap)
+/* the capability list from the pointer at `ptr` (0x34, or a capability's next field) */
+static u8 find_cap_from(struct pci_dev *dev, u8 ptr, int cap)
 {
     u8 next;
     int ttl = 48;
-    pci_read_config_byte(dev, pos, &next);
+    pci_read_config_byte(dev, ptr, &next);
     while (ttl-- && next >= 0x40) {
         u8 id;
         next &= ~3;
         pci_read_config_byte(dev, next, &id);
         if (id == 0xff) break;
         if (id == cap) return next;
-        pci_read_config_byte(dev, next + 1, &next);
+        pci_read_config_byte(dev, next + PCI_CAP_LIST_NEXT, &next);
     }
     return 0;
+}
+
+/* the next capability `cap` after the one at `pos` */
+u8 pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap)
+{
+    return find_cap_from(dev, pos + PCI_CAP_LIST_NEXT, cap);
 }
 
 u8 pci_find_capability(struct pci_dev *dev, int cap)
@@ -122,7 +129,7 @@ u8 pci_find_capability(struct pci_dev *dev, int cap)
     pci_read_config_word(dev, PCI_STATUS, &status);
     if (!(status & PCI_STATUS_CAP_LIST)) return 0;
     u8 pos = (dev->hdr_type & 0x7f) == PCI_HEADER_TYPE_CARDBUS ? 0x14 : PCI_CAPABILITY_LIST;
-    return pci_find_next_capability(dev, pos, cap);
+    return find_cap_from(dev, pos, cap);
 }
 
 u16 pci_find_vsec_capability(struct pci_dev *dev, u16 vendor, int cap) { return 0; }   /* extended space */

@@ -10,6 +10,8 @@
  *                registered section (e.g. the NVIDIA report, text written
  *                to /dev/report) and the complete kernel log
  *   VBIOS.ROM    a registered binary blob (the graphics card's video BIOS)
+ *   RESULTS.TAR  what programs write to /dev/results: a tar archive of
+ *                test results (kestrel-selftest)
  *
  * File sizes, the FAT and the directory are never changed, so the volume
  * stays valid for every OS. Only a volume with exactly that label is
@@ -19,6 +21,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /* A section of REPORT.TXT: fn fills buf (at most cap bytes) and returns the
  * length. Sections appear in registration order. */
@@ -36,5 +39,11 @@ const char *report_where(void);
  * is kept, at most 32 KiB in all, as a section of REPORT.TXT, which is
  * rewritten on every write. Returns len or -errno. */
 long report_user_write(const void *buf, size_t len);
+/* /dev/results: bytes written at `off` go to RESULTS.TAR at that offset, so
+ * `tar -cf /dev/results DIR` puts an archive of test results on the stick.
+ * Returns the bytes written or -errno (-ENOSPC past the file's end).
+ * report_results_close() ends the archive and flushes (last close). */
+long report_results_write(const void *buf, size_t len, uint64_t off);
+void report_results_close(void);
 
 #endif

@@ -288,6 +288,15 @@ static ssize_t report_dev_write(struct vnode *v, const void *buf, size_t n, uint
 }
 static const struct vnode_ops report_ops = { .read = null_read, .write = report_dev_write };
 
+/* ---- results: RESULTS.TAR on the boot stick (report.h) ------------------- */
+static ssize_t results_dev_write(struct vnode *v, const void *buf, size_t n, uint64_t off)
+{
+    (void)v;
+    return report_results_write(buf, n, off);
+}
+static void results_release(struct file *f) { (void)f; report_results_close(); }
+static const struct vnode_ops results_ops = { .read = null_read, .write = results_dev_write, .release = results_release };
+
 /* ---- kmsg -------------------------------------------------------------- */
 static ssize_t kmsg_read(struct vnode *v, void *buf, size_t n, uint64_t off)
 {
@@ -490,6 +499,7 @@ void devfs_init(const char *mountpoint)
     }
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
     add_dev(r, "report",  0600, MKDEV(10, 240), &report_ops);
+    add_dev(r, "results", 0600, MKDEV(10, 241), &results_ops);
     for (int i = 0; i < tty_count; i++) {              /* one per monitor */
         char name[8];
         snprintf(name, sizeof name, "fb%d", i);
