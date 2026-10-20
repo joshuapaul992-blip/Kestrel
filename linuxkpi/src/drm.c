@@ -246,75 +246,6 @@ struct device *drm_sysfs_minor_alloc(struct drm_minor *minor)
     return kdev;
 }
 
-/* ---- what serves user space: not offered yet ------------------------------------------- */
-#define LKPI_DRM_NO_IOCTL(name)                                                         \
-    int name(struct drm_device *dev, void *data, struct drm_file *file_priv) { return -EOPNOTSUPP; }
-LKPI_DRM_NO_IOCTL(drm_prime_handle_to_fd_ioctl)
-LKPI_DRM_NO_IOCTL(drm_prime_fd_to_handle_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_create_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_destroy_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_handle_to_fd_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_fd_to_handle_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_transfer_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_wait_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_timeline_wait_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_eventfd_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_reset_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_signal_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_timeline_signal_ioctl)
-LKPI_DRM_NO_IOCTL(drm_syncobj_query_ioctl)
-
-void drm_prime_init_file_private(struct drm_prime_file_private *prime_fpriv)
-{
-    mutex_init(&prime_fpriv->lock);
-    prime_fpriv->dmabufs = RB_ROOT;
-    prime_fpriv->handles = RB_ROOT;
-}
-void drm_prime_destroy_file_private(struct drm_prime_file_private *prime_fpriv) { }
-void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv, uint32_t handle) { }
-void drm_syncobj_open(struct drm_file *file_private) { }
-void drm_syncobj_release(struct drm_file *file_private) { }
-
-/* Sync objects and PRIME buffers only come from user space, which has no DRM
- * device files yet: a handle never names one, and nothing is exported. */
-struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private, u32 handle) { return NULL; }
-int drm_syncobj_find_fence(struct drm_file *file_private, u32 handle, u64 point, u64 flags,
-                           struct dma_fence **fence)
-{
-    *fence = NULL;
-    return -ENOENT;
-}
-void drm_syncobj_add_point(struct drm_syncobj *syncobj, struct dma_fence_chain *chain,
-                           struct dma_fence *fence, uint64_t point) { WARN_ON_ONCE(1); }
-void drm_syncobj_replace_fence(struct drm_syncobj *syncobj, struct dma_fence *fence) { WARN_ON_ONCE(1); }
-void drm_syncobj_free(struct kref *kref) { WARN_ON_ONCE(1); }
-EXPORT_SYMBOL(drm_syncobj_find);
-EXPORT_SYMBOL(drm_syncobj_find_fence);
-
-struct sg_table *drm_prime_pages_to_sg(struct drm_device *dev, struct page **pages, unsigned int nr_pages)
-{
-    return ERR_PTR(-EOPNOTSUPP);
-}
-struct dma_buf *drm_gem_prime_export(struct drm_gem_object *obj, int flags) { return ERR_PTR(-EOPNOTSUPP); }
-void drm_prime_gem_destroy(struct drm_gem_object *obj, struct sg_table *sg) { WARN_ON_ONCE(1); }
-
-/* The DMA address of every page of an imported buffer (none are imported
- * yet, but this one is simple enough to be real). */
-int drm_prime_sg_to_dma_addr_array(struct sg_table *sgt, dma_addr_t *addrs, int max_pages)
-{
-    struct sg_dma_page_iter iter;
-    int n = 0;
-
-    for_each_sgtable_dma_page(sgt, &iter, 0) {
-        if (WARN_ON(n >= max_pages)) return -1;
-        addrs[n++] = sg_page_iter_dma_address(&iter);
-    }
-    return 0;
-}
-EXPORT_SYMBOL(drm_prime_pages_to_sg);
-EXPORT_SYMBOL(drm_gem_prime_export);
-EXPORT_SYMBOL(drm_prime_sg_to_dma_addr_array);
-
 int drm_writeback_set_fb(struct drm_connector_state *conn_state, struct drm_framebuffer *fb) { return -EINVAL; }
 int drm_writeback_prepare_job(struct drm_writeback_job *job) { return 0; }
 void drm_writeback_cleanup_job(struct drm_writeback_job *job) { kfree(job); }
@@ -365,57 +296,20 @@ void iput(struct inode *inode)
     kfree(inode);
 }
 
-struct file *anon_inode_getfile(const char *name, const struct file_operations *fops, void *priv, int flags)
-{
-    return ERR_PTR(-ENODEV);
-}
-
-int anon_inode_getfd(const char *name, const struct file_operations *fops, void *priv, int flags)
-{
-    return -ENODEV;
-}
-
-/* ---- files that are not in a process ---------------------------------------------------- */
-struct lkpi_kfile {
-    struct file file;
-    struct inode *inode;
-};
-
-/* a file the KPI made (shmem_file_setup): dropped at the last fput */
-void fput(struct file *file)
-{
-    struct lkpi_kfile *kf = container_of(file, struct lkpi_kfile, file);
-
-    if (!atomic_long_dec_and_test(&file->f_count)) return;
-    if (file->f_op && file->f_op->release) file->f_op->release(kf->inode, file);
-    iput(kf->inode);
-    kfree(kf);
-}
-
-struct file *fget(unsigned int fd) { return NULL; }
-int get_unused_fd_flags(unsigned flags) { return -EMFILE; }
-void put_unused_fd(unsigned int fd) { }
-void fd_install(unsigned int fd, struct file *file) { }
 struct file *file_clone_open(struct file *file) { return ERR_PTR(-EOPNOTSUPP); }
 
 /* GEM objects get one so they can be mapped by offset; it has no pages behind it
  * (objects that want shmem pages, rather than VRAM, are not supported yet) */
 struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags)
 {
-    struct lkpi_kfile *kf = kzalloc(sizeof(*kf), GFP_KERNEL);
-    struct inode *inode;
+    struct inode *inode = lkpi_new_inode();
+    struct file *file;
 
-    if (!kf) return ERR_PTR(-ENOMEM);
-    inode = lkpi_new_inode();
-    if (IS_ERR(inode)) { kfree(kf); return ERR_CAST(inode); }
+    if (IS_ERR(inode)) return ERR_CAST(inode);
     inode->i_size = size;
-    kf->inode = inode;
-    kf->file.f_inode = inode;
-    kf->file.f_mapping = inode->i_mapping;
-    kf->file.f_mode = FMODE_READ | FMODE_WRITE;
-    atomic_long_set(&kf->file.f_count, 1);
-    mutex_init(&kf->file.f_pos_lock);
-    return &kf->file;
+    file = lkpi_file_new(NULL, inode, O_RDWR, NULL);
+    if (IS_ERR(file)) iput(inode);
+    return file;
 }
 
 struct page *shmem_read_mapping_page_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
@@ -462,8 +356,17 @@ pgprot_t vm_get_page_prot(unsigned long vm_flags)
     return vm_flags & VM_WRITE ? PAGE_SHARED : __pgprot(0x25UL);
 }
 
-/* xarray nodes */
+/* xarray nodes: lib/xarray.c takes them as they come from the cache and
+ * expects empty slots (Linux's cache has a constructor that clears them,
+ * and frees them cleared), so each one is cleared when it is handed out */
 struct kmem_cache *radix_tree_node_cachep;
+
+static void radix_tree_node_ctor(void *p)
+{
+    struct xa_node *node = p;
+    memset(node, 0, sizeof(*node));
+    INIT_LIST_HEAD(&node->private_list);
+}
 
 void radix_tree_node_rcu_free(struct rcu_head *head)
 {
@@ -502,7 +405,8 @@ int wbinvd_on_all_cpus(void)
 void lkpi_drm_core_init(void)
 {
     cpu_fill();
-    radix_tree_node_cachep = kmem_cache_create("radix_tree_node", sizeof(struct xa_node), 0, 0, NULL);
+    radix_tree_node_cachep = kmem_cache_create("radix_tree_node", sizeof(struct xa_node), 0, 0,
+                                               radix_tree_node_ctor);
     lkpi_drm_enabled = lkpi_display_drm();
     printk(KERN_INFO "linuxkpi: DRM drivers %s\n", lkpi_drm_enabled ? "may take over displays"
            : "are off (linuxkpi.drm=0 or Safe Mode): the firmware's frame buffer only");

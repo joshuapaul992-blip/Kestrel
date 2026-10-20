@@ -21,6 +21,7 @@
 #include <kernel/bootvol.h>
 #include <kernel/time.h>
 #include <kernel/sound.h>
+#include <kernel/linuxkpi.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -200,6 +201,7 @@ static size_t gen_usb(char *buf, size_t cap, void *ctx) { (void)ctx; return usb_
 static size_t gen_partitions(char *buf, size_t cap, void *ctx) { (void)ctx; return blk_proc(buf, cap); }
 static size_t gen_bootvol(char *buf, size_t cap, void *ctx) { (void)ctx; return bootvol_proc(buf, cap); }
 static size_t gen_sound(char *buf, size_t cap, void *ctx) { (void)ctx; return hda_proc(buf, cap); }
+static size_t gen_dri(char *buf, size_t cap, void *ctx) { (void)ctx; return linuxkpi_drm_state(buf, cap); }
 
 /* NVIDIA: probe results and the modeset outcome (also the "gpu" command). */
 static size_t gen_gpu(char *buf, size_t cap, void *ctx)
@@ -604,6 +606,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "partitions",  gen_partitions, NULL);
     pseudo_file_locked(r, "bootvol", gen_bootvol, NULL);
     pseudo_file_locked(r, "sound", gen_sound, NULL);
+    pseudo_file(r, "dri",         gen_dri, NULL);      /* takes the devices' modeset locks */
     struct vnode *sys = pseudo_dir(r, "sys");
     struct vnode *sk = pseudo_dir(sys, "kernel");
     pseudo_file(sk, "ostype",    gen_sys_ostype, NULL);

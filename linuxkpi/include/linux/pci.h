@@ -358,5 +358,10 @@ static inline int pci_set_dma_mask(struct pci_dev *dev, u64 mask) { return dma_s
 static inline int pci_set_consistent_dma_mask(struct pci_dev *dev, u64 mask) { return dma_set_coherent_mask(&dev->dev, mask); }
 
 static inline bool dev_is_pci(const struct device *dev) { return dev && dev->bus == &pci_bus_type; }
+/* a VGA-compatible display controller (class 03:00, or the pre-2.0 00:01) */
+static inline bool pci_is_vga(struct pci_dev *pdev)
+{
+    return (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA || (pdev->class >> 8) == 0x0001;
+}
 
 #endif

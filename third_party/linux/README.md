@@ -54,10 +54,11 @@ means GPL-2.0), are written in the KPI instead, under `linuxkpi/include`:
 `drm/drm_writeback.h`, `drm/drm_sysfs.h`, `linux/ww_mutex.h`,
 `linux/dma-fence.h`, `linux/iosys-map.h`, `linux/seqlock.h` and the rest.
 
-Three files of the DRM core are left out because they serve user space,
-which phase 2 does not offer yet: `drm_prime.c` (dma-buf sharing),
-`drm_syncobj.c` (sync objects) and `drm_flip_work.c`. The KPI answers their
-calls.
+Three files of the DRM core were left out in phase 2 because they serve
+user space: `drm_prime.c` (dma-buf sharing), `drm_syncobj.c` (sync
+objects) and `drm_flip_work.c`. Since 0.3.6 the KPI writes PRIME itself
+(`linuxkpi/src/drm_prime.c`), `drm_syncobj.c` is vendored with virtio-gpu
+(below), and `drm_flip_work.c` is still answered by the KPI.
 
 | File here | License (SPDX, or the license text when there is no SPDX line) | SHA-256 |
 |---|---|---|
@@ -237,3 +238,34 @@ calls.
 | `lib/radix-tree.h` | GPL-2.0+ | `fa9aeb8dc0b7ef14854330cd4d3a50f423e6f690ac269a61d62a9ae6c0147125` |
 | `lib/rbtree.c` | GPL-2.0-or-later | `af9e0683db2dc9ce457a3262d9aaa8c73ce46cb5019e1a968502bb30d69f5dd5` |
 | `lib/xarray.c` | GPL-2.0+ | `34b1800a58931a13cda948ab8ef5ae66e06cf91714618af887c24b03e32f2c32` |
+
+## 0.3.6: virtio-gpu and sync objects
+
+QEMU's paravirtual GPU (`virtio-vga`, `virtio-gpu-gl` with virgl) and DRM
+sync objects, from the same tag. Of the driver's files,
+`virtgpu_vram.c` (host-visible blob memory) and its trace points
+(`virtgpu_trace.h`, `virtgpu_trace_points.c`) are GPL-2.0-only and stay out:
+`linuxkpi/virtio-gpu/` has stand-ins (no host-visible memory is offered, and
+the trace points record nothing). The virtio core is written in the KPI from
+the virtio specification (`linuxkpi/src/virtio.c`, the modern virtio-pci
+transport and split virtqueues), as is the shmem GEM helper
+(`linuxkpi/src/drm_gem_shmem.c`; Linux's is GPL-2.0-only).
+
+| File here | License (SPDX, or the license text when there is no SPDX line) | SHA-256 |
+|---|---|---|
+| `drivers/gpu/drm/drm_syncobj.c` | MIT (license text) | `b63512a4298e5c7ec706ab1d9f03d2e41ead67017abd9ca2239e8aa1d7bd2ac1` |
+| `drivers/gpu/drm/virtio/virtgpu_debugfs.c` | MIT (license text) | `dff7ba80109b2e8e5b16a7e0879aaab546b48d0a326f19c4ac2f8b16c82ce1f7` |
+| `drivers/gpu/drm/virtio/virtgpu_display.c` | MIT (license text) | `165b6f646790a772354ae87a334c6e8b1cb363567c796c19ac97d3dcfd554843` |
+| `drivers/gpu/drm/virtio/virtgpu_drv.c` | MIT (license text) | `4f3402a82bbb434ca174599810e89378db2a3672492c330cedfb49550a34b0b3` |
+| `drivers/gpu/drm/virtio/virtgpu_drv.h` | MIT (license text) | `6ef97df0ade4764d5623672c456c991029d120f11f539df25b0b37a39ab9a7b5` |
+| `drivers/gpu/drm/virtio/virtgpu_fence.c` | MIT (license text) | `83199ad3f23fab434eba62d6cc821939fac4d3967f4ebe7f6b4f0fe73da62fb3` |
+| `drivers/gpu/drm/virtio/virtgpu_gem.c` | MIT (license text) | `8508331c97838c144011e5c6e789c3350825468c4ccf7388d2bf9696863d0cba` |
+| `drivers/gpu/drm/virtio/virtgpu_ioctl.c` | MIT (license text) | `509cc5f489a489849e163fc7947859b7febf15237cb05c620762f69a207d6865` |
+| `drivers/gpu/drm/virtio/virtgpu_kms.c` | MIT (license text) | `9388cdb019b5bbf52f442d8d5073fcc7c6d00b2952d8ddc2c8b7229947346a7d` |
+| `drivers/gpu/drm/virtio/virtgpu_object.c` | MIT (license text) | `a26e29eecee86b60b9654cddfc50945bc2c7bd37ce1f669b4f446c62a112d912` |
+| `drivers/gpu/drm/virtio/virtgpu_plane.c` | MIT (license text) | `236b87a7de4a1f85787aa621a93952ee2a5023075de13da8276577c12b7377cd` |
+| `drivers/gpu/drm/virtio/virtgpu_prime.c` | MIT (license text) | `c6c137fb93d93530b32c9a8dafd51071628029ab63679f9ddbd758a50f194450` |
+| `drivers/gpu/drm/virtio/virtgpu_submit.c` | MIT | `d3f947bc18f181d1d95f946fee3e4220a471b878991dc06968a48c0c24f2f3eb` |
+| `drivers/gpu/drm/virtio/virtgpu_vq.c` | MIT (license text) | `ae7c9bab76af9672414dc7fe001259a0cfbc617dc2888445c504c4f96b994be8` |
+| `include/uapi/drm/virtgpu_drm.h` | MIT (license text) | `7280341d812e0e9ecfddaafd2a3fb0d5a748873ddf3e0f253dd52c8c2a04bdd7` |
+| `include/uapi/linux/virtio_gpu.h` | BSD-3-Clause (license text) | `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6` |

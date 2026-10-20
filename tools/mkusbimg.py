@@ -12,9 +12,10 @@ Layout (MBR, the default):
   then        optional EFI System Partition (type 0xEF, from --esp-img) with
               EFI/BOOT/BOOTX64.EFI, so the same stick boots on UEFI machines
   after it    FAT16 partition "KESTREL RPT" (MBR type 0x0E, first table entry
-              so that every OS mounts it): README.TXT, plus REPORT.TXT and
-              VBIOS.ROM, which the kernel overwrites in place with its
-              diagnostic report and the graphics card's video BIOS
+              so that every OS mounts it): README.TXT, plus REPORT.TXT,
+              VBIOS.ROM and RESULTS.TAR, which the kernel overwrites in
+              place with its diagnostic report, the graphics card's video
+              BIOS and the archive programs write to /dev/results
 
 GPT layout (--layout gpt): protective MBR + GPT; partition 1 is a BIOS boot
 partition holding core.img, partition 2 has the Kestrel type GUID
@@ -36,13 +37,14 @@ BASIC_DATA_GUID = uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7")
 ESP_GUID = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
 
 # Report volume: the kernel finds it by this exact FAT volume label and only
-# ever overwrites the data clusters of REPORT.TXT and VBIOS.ROM.
+# ever overwrites the data clusters of REPORT.TXT, VBIOS.ROM and RESULTS.TAR.
 REPORT_LABEL = b"KESTREL RPT"
-REPORT_MIB = 24
+REPORT_MIB = 64
 REPORT_FILES = [  # (8.3 name, size, initial contents)
     (b"README  TXT", None, None),
     (b"REPORT  TXT", 2 * 1024 * 1024, None),
     (b"VBIOS   ROM", 1024 * 1024, b"\0"),
+    (b"RESULTS TAR", 32 * 1024 * 1024, b"\0"),   # empty: a tar archive of zero blocks
 ]
 README = b"""Kestrel report volume\r
 =====================\r
@@ -54,7 +56,12 @@ Kestrel writes two files here every time it boots from this stick:\r
               their EDID) and the complete kernel log\r
   VBIOS.ROM   the graphics card's video BIOS image (NVIDIA cards)\r
 \r
-Both files keep their size; unused space is padded. Copy them off the\r
+The GPU self-test (kestrel-selftest) also writes\r
+\r
+  RESULTS.TAR its logs, the DRM state, test results and screenshots, as\r
+              a tar archive (7-Zip, or Windows 11's File Explorer, opens it)\r
+\r
+The files keep their size; unused space is padded. Copy them off the\r
 stick to share them. The shell command 'report' writes them again with the\r
 log up to that moment; boot with kestrel.report=0 to stop automatic writes.\r
 """

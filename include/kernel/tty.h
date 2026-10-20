@@ -216,6 +216,12 @@ void tty_write_current(const char *s, size_t n);
 /* Hand monitor `index` to a graphics client (on) or give it back to the
  * terminal (off: the text is repainted from the cell model). */
 int  tty_set_graphics(int index, bool on);
+/* Linux's VT and KD ioctls on TTY `index` (fs/devfs.c), from /dev/ttyN and
+ * its console pty: -ENOTTY for any other request. vt_release() at a file's
+ * last close puts back the modes that file set. */
+struct file;
+int  vt_console_ioctl(struct file *f, int index, unsigned long req, void *arg);
+void vt_release(struct file *f);
 /* Copy a w x h rectangle of 32-bpp pixels (in this monitor's format) from
  * `src` (pitch bytes per row) to (x, y) and show it. Clipped. */
 int  tty_blit(int index, int x, int y, int w, int h, const void *src, uint32_t pitch);

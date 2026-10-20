@@ -91,7 +91,30 @@ int lkpi_task_slot(void *task)
 int lkpi_task_pid(void *task) { return ((struct tcb *)task)->pid; }
 const char *lkpi_task_name(void *task) { return ((struct tcb *)task)->name; }
 int lkpi_task_is_user(void *task) { return ((struct tcb *)task)->user; }
-void *lkpi_task_create(const char *name, int (*fn)(void *), void *arg) { return task_create(name, fn, arg); }
+/* The KPI's threads (kthreads: workqueues, timers, interrupt threads, the
+ * drivers' own) run without the big kernel lock: the Linux side locks
+ * everything it shares, and what it calls here takes the lock where
+ * Kestrel's state needs it. A new task starts holding it. */
+struct kpi_start { int (*fn)(void *); void *arg; };
+
+static int kpi_thread(void *p)
+{
+    struct kpi_start s = *(struct kpi_start *)p;
+    kfree(p);
+    if (bkl_depth()) bkl_exit();
+    return s.fn(s.arg);
+}
+
+void *lkpi_task_create(const char *name, int (*fn)(void *), void *arg)
+{
+    struct kpi_start *s = kmalloc(sizeof *s);
+    if (!s) return NULL;
+    s->fn = fn;
+    s->arg = arg;
+    struct tcb *t = task_create(name, kpi_thread, s);
+    if (!t) kfree(s);
+    return t;
+}
 void lkpi_task_exit(int code) { task_exit(code); }
 void lkpi_task_block(void *chan, unsigned long long deadline_ms)
 {
@@ -118,12 +141,14 @@ void lkpi_task_switch(void)
  * halt until the next interrupt when there was nothing to yield to. */
 void lkpi_boot_wait(volatile int *flag)
 {
+    int depth = bkl_release_all();              /* the KPI's start-up runs without it */
     while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) {
         sched_yield();
         uint64_t f = irq_save();
         if (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) { sti(); hlt(); cli(); }
         irq_restore(f);
     }
+    bkl_reacquire(depth);
 }
 
 /* ---- logging, boot parameters, hooks ------------------------------------------ */
@@ -140,6 +165,7 @@ void lkpi_die(const char *msg) { panic("%s", msg); }
 
 void lkpi_power(int what)
 {
+    bkl_enter();
     if (what == POWER_HOOK_REBOOT) power_reboot();
     if (what == POWER_HOOK_HALT) power_halt();
     power_off();
@@ -192,7 +218,20 @@ static int lkpi_switch_mode(void *ctx, int index, const struct display_mode *m)
     return sw->fn(sw->ctx, index, &lm);
 }
 
+/* The display registry and the terminals are Kestrel's, under the big
+ * lock; the Linux side calls these from its own threads, never inside a
+ * spinlock. */
+static int display_add(const struct lkpi_display *d);
+
 int lkpi_display_add(const struct lkpi_display *d)
+{
+    bkl_enter();
+    int r = display_add(d);
+    bkl_exit();
+    return r;
+}
+
+static int display_add(const struct lkpi_display *d)
 {
     struct display_head h = {
         .phys = d->phys, .vram = d->vram, .width = d->width, .height = d->height, .pitch = d->pitch,
@@ -223,7 +262,17 @@ int lkpi_display_add(const struct lkpi_display *d)
     return idx;
 }
 
+static int display_update_locked(int monitor, const struct lkpi_display *d);
+
 int lkpi_display_update(int monitor, const struct lkpi_display *d)
+{
+    bkl_enter();
+    int r = display_update_locked(monitor, d);
+    bkl_exit();
+    return r;
+}
+
+static int display_update_locked(int monitor, const struct lkpi_display *d)
 {
     const struct display_head *cur = display_get(monitor);
     if (!cur || d->width <= 0 || d->height <= 0 || d->pitch < d->width * 4) return -EINVAL;
@@ -246,7 +295,9 @@ int lkpi_display_update(int monitor, const struct lkpi_display *d)
 
 void lkpi_display_reclaim(void *handle)
 {
+    bkl_enter();
     display_reclaim(handle);
+    bkl_exit();
 }
 
 /* While monitor 0 waits for the driver's first monitor the screen may stay
@@ -264,16 +315,24 @@ static int handover_watch(void *arg)
     return 0;
 }
 
-bool lkpi_display_drm(void) { return display_linux_drm(); }
+bool lkpi_display_drm(void)
+{
+    bkl_enter();
+    bool r = display_linux_drm();
+    bkl_exit();
+    return r;
+}
 
 int lkpi_display_handover(void *handle)
 {
+    bkl_enter();
     int idx = display_handover(handle);
     /* A dark screen from here on leaves only the report on the boot stick */
     if (idx >= 0 && !strstr(g_boot.cmdline, "kestrel.report=0") && report_locate()) {
         report_save("a Linux driver takes over monitor 0");
         task_create("handover-watch", handover_watch, NULL);
     }
+    bkl_exit();
     return idx;
 }
 
@@ -299,16 +358,31 @@ void lkpi_pci_write(void *handle, int off, int size, unsigned int v)
     pci_cfg_write(d->bus, d->device, d->function, (uint8_t)off, size, v);
 }
 
+/* The KPI's interrupt trampoline (linuxkpi/src/irq.c) runs the handlers
+ * under the descriptor's own lock: no big lock in the interrupt. */
 int lkpi_pci_msi_enable(void *handle, void (*fn)(void *), void *arg, const char *name)
 {
-    return msi_enable(handle, fn, arg, name);
+    int v = msi_enable(handle, fn, arg, name);
+    if (v >= 0) msi_set_lockless(v);
+    return v;
 }
 
 void lkpi_pci_msi_disable(void *handle, int vector) { msi_disable(handle, vector); }
 int lkpi_pci_msi_is_msix(int vector) { return msi_is_msix(vector); }
 
 /* ---- files ------------------------------------------------------------------ */
+static long file_read_all(const char *path, void **data, unsigned long max);
+
+/* firmware files: the boot volume's FAT reads under the big lock */
 long lkpi_file_read_all(const char *path, void **data, unsigned long max)
+{
+    bkl_enter();
+    long r = file_read_all(path, data, max);
+    bkl_exit();
+    return r;
+}
+
+static long file_read_all(const char *path, void **data, unsigned long max)
 {
     struct stat st;
     int r = vfs_stat(path, &st);

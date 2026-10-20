@@ -23,6 +23,11 @@
 #include <linux/string.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
+#include <linux/file.h>
+#include <linux/anon_inodes.h>
+#include <linux/pseudo_fs.h>
+#include <linux/eventfd.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 /* ---- user memory ----------------------------------------------------------- */
@@ -267,10 +272,62 @@ void misc_deregister(struct miscdevice *misc)
 }
 
 /* ---- the files ------------------------------------------------------------------------ */
-struct lkpi_file {
+/* Every struct file the KPI makes: an open of a device node, an anonymous
+ * file (anon_inode_getfile: sync objects, sync files, dma-bufs), a GEM
+ * object's shmem file. Counted by f_count; a descriptor holds one
+ * reference, fget() takes another, and the last fput() releases it. */
+struct lkpi_kfile {
     struct file     file;
-    struct inode    inode;
+    struct inode   *inode;              /* freed with the file, unless it is the shared anon inode */
+    const char     *name;               /* for the descriptor ("anon_inode:..."), or NULL */
 };
+
+static struct inode anon_inode;         /* anonymous files share it, as on Linux */
+
+struct file *lkpi_file_new(const struct file_operations *fops, struct inode *inode, unsigned int flags,
+                           void *priv)
+{
+    struct lkpi_kfile *kf = kzalloc(sizeof *kf, GFP_KERNEL);
+    if (!kf) return ERR_PTR(-ENOMEM);
+    kf->inode = inode;
+    kf->file.f_op = fops;
+    kf->file.f_inode = inode ? inode : &anon_inode;
+    kf->file.f_mapping = kf->file.f_inode->i_mapping;
+    kf->file.f_flags = flags;
+    kf->file.f_mode = FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
+    if ((flags & O_ACCMODE) != O_WRONLY) kf->file.f_mode |= FMODE_READ;
+    if ((flags & O_ACCMODE) != O_RDONLY) kf->file.f_mode |= FMODE_WRITE;
+    kf->file.private_data = priv;
+    mutex_init(&kf->file.f_pos_lock);
+    atomic_long_set(&kf->file.f_count, 1);
+    return &kf->file;
+}
+
+void lkpi_file_set_name(struct file *file, const char *name)
+{
+    container_of(file, struct lkpi_kfile, file)->name = name;
+}
+
+/* a file whose open failed: freed without release */
+static void file_free(struct file *file)
+{
+    struct lkpi_kfile *kf = container_of(file, struct lkpi_kfile, file);
+    iput(kf->inode);
+    kfree(kf);
+}
+
+void fput(struct file *file)
+{
+    if (!atomic_long_dec_and_test(&file->f_count)) return;
+    if (file->f_op && file->f_op->release) file->f_op->release(file->f_inode, file);
+    file_free(file);
+}
+
+struct file *get_file(struct file *file)
+{
+    atomic_long_inc(&file->f_count);
+    return file;
+}
 
 /* the operations behind a device number, and the misc device if it is one */
 static const struct file_operations *lookup(dev_t devt, struct miscdevice **misc, struct cdev **cdev)
@@ -313,46 +370,37 @@ static int node_open(void *ctx, int flags, void **out)
     const struct file_operations *fops = lookup(dn->devt, &misc, &cdev);
     if (!fops) return -ENXIO;
 
-    struct lkpi_file *lf = kzalloc(sizeof *lf, GFP_KERNEL);
-    if (!lf) return -ENOMEM;
-    lf->inode.i_mode = S_IFCHR | 0600;
-    lf->inode.i_rdev = dn->devt;
-    lf->inode.i_cdev = cdev;
-    lf->file.f_op = fops;
-    lf->file.f_inode = &lf->inode;
-    lf->file.f_flags = (unsigned int)flags;
-    lf->file.f_mode = FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
-    if ((flags & O_ACCMODE) != O_WRONLY) lf->file.f_mode |= FMODE_READ;
-    if ((flags & O_ACCMODE) != O_RDONLY) lf->file.f_mode |= FMODE_WRITE;
-    mutex_init(&lf->file.f_pos_lock);
-    lf->file.private_data = misc;               /* as misc_open does */
+    struct inode *inode = kzalloc(sizeof *inode, GFP_KERNEL);
+    if (!inode) return -ENOMEM;
+    inode->i_mode = S_IFCHR | 0600;
+    inode->i_rdev = dn->devt;
+    inode->i_cdev = cdev;
+    struct file *file = lkpi_file_new(fops, inode, (unsigned int)flags, misc);   /* as misc_open does */
+    if (IS_ERR(file)) { kfree(inode); return (int)PTR_ERR(file); }
     if (fops->open) {
-        int r = fops->open(&lf->inode, &lf->file);
-        if (r) { kfree(lf); return r; }
+        int r = fops->open(inode, file);
+        if (r) { file_free(file); return r; }
     }
-    *out = lf;
+    *out = file;
     return 0;
 }
 
-static void node_release(void *f)
-{
-    struct lkpi_file *lf = f;
-    if (lf->file.f_op->release) lf->file.f_op->release(&lf->inode, &lf->file);
-    kfree(lf);
-}
+static void node_release(void *f) { fput(f); }
+static void node_hold(void *f) { get_file(f); }
+static unsigned long long node_size(void *f) { return (unsigned long long)((struct file *)f)->f_inode->i_size; }
 
-static long node_rw(struct lkpi_file *lf, char *buf, unsigned long n, long long *pos, bool write)
+static long node_rw(struct file *file, char *buf, unsigned long n, long long *pos, bool write)
 {
-    const struct file_operations *fops = lf->file.f_op;
+    const struct file_operations *fops = file->f_op;
     if (write ? !fops->write : !fops->read) return -EINVAL;
     struct task_struct *me = current;
     int saved = me->lkpi_uaccess_kernel;
     loff_t p = *pos;
     me->lkpi_uaccess_kernel = 1;
-    ssize_t r = write ? fops->write(&lf->file, (const char __user *)buf, n, &p)
-                      : fops->read(&lf->file, (char __user *)buf, n, &p);
+    ssize_t r = write ? fops->write(file, (const char __user *)buf, n, &p)
+                      : fops->read(file, (char __user *)buf, n, &p);
     me->lkpi_uaccess_kernel = saved;
-    if (r >= 0) { *pos = p; lf->file.f_pos = p; }
+    if (r >= 0) { *pos = p; file->f_pos = p; }
     return r;
 }
 
@@ -361,31 +409,64 @@ static long node_write(void *f, const char *buf, unsigned long n, long long *pos
 
 static long node_ioctl(void *f, unsigned int cmd, unsigned long arg)
 {
-    struct lkpi_file *lf = f;
-    if (!lf->file.f_op->unlocked_ioctl) return -ENOTTY;
-    long r = lf->file.f_op->unlocked_ioctl(&lf->file, cmd, arg);
+    struct file *file = f;
+    if (!file->f_op->unlocked_ioctl) return -ENOTTY;
+    long r = file->f_op->unlocked_ioctl(file, cmd, arg);
     return r == -ENOIOCTLCMD ? -ENOTTY : r;
 }
 
 static int node_poll(void *f, int events)
 {
-    struct lkpi_file *lf = f;
-    if (!lf->file.f_op->poll) return events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM);
+    struct file *file = f;
+    if (!file->f_op->poll) return events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM);
     poll_table pt = { ._key = (__poll_t)events };
-    __poll_t mask = lf->file.f_op->poll(&lf->file, &pt);
+    __poll_t mask = file->f_op->poll(file, &pt);
     return (int)(mask & ((__poll_t)events | POLLERR | POLLHUP));
 }
 
-static int node_mmap(void *f, struct lkpi_mmap *m)
-{
-    struct lkpi_file *lf = f;
-    return lkpi_file_mmap(&lf->file, m);
-}
+static int node_mmap(void *f, struct lkpi_mmap *m) { return lkpi_file_mmap(f, m); }
 
 static const struct lkpi_cdev_ops node_ops = {
     .open = node_open, .release = node_release, .read = node_read, .write = node_write,
-    .ioctl = node_ioctl, .poll = node_poll, .mmap = node_mmap,
+    .ioctl = node_ioctl, .poll = node_poll, .mmap = node_mmap, .size = node_size, .hold = node_hold,
 };
+
+/* ---- descriptors ------------------------------------------------------------------------ */
+struct file *anon_inode_getfile(const char *name, const struct file_operations *fops, void *priv, int flags)
+{
+    struct file *file = lkpi_file_new(fops, NULL, (unsigned int)flags & (O_ACCMODE | O_NONBLOCK), priv);
+    if (!IS_ERR(file)) lkpi_file_set_name(file, name);
+    return file;
+}
+
+int anon_inode_getfd(const char *name, const struct file_operations *fops, void *priv, int flags)
+{
+    int fd = get_unused_fd_flags((unsigned int)flags);
+    if (fd < 0) return fd;
+    struct file *file = anon_inode_getfile(name, fops, priv, flags);
+    if (IS_ERR(file)) { put_unused_fd((unsigned int)fd); return (int)PTR_ERR(file); }
+    fd_install((unsigned int)fd, file);
+    return fd;
+}
+
+int get_unused_fd_flags(unsigned flags) { return lkpi_fd_reserve((flags & O_CLOEXEC) != 0); }
+void put_unused_fd(unsigned int fd) { lkpi_fd_unreserve((int)fd); }
+
+/* The descriptor takes the caller's reference. Kestrel shows the file in
+ * /proc/self/fd as anon_inode:<name>, as Linux does. */
+void fd_install(unsigned int fd, struct file *file)
+{
+    struct lkpi_kfile *kf = container_of(file, struct lkpi_kfile, file);
+    char name[48];
+    snprintf(name, sizeof name, "anon_inode:%s", kf->name ? kf->name : "[lkpi]");
+    if (lkpi_fd_fill((int)fd, name, (int)file->f_flags, &node_ops, file) < 0) {
+        lkpi_fd_unreserve((int)fd);         /* out of memory: as if closed at once */
+        fput(file);
+    }
+}
+
+/* any file of the KPI's behind fd, with a reference */
+struct file *fget(unsigned int fd) { return lkpi_fd_file((int)fd, &node_ops); }
 
 void *lkpi_devnode_add(struct device *dev)
 {
@@ -500,3 +581,46 @@ ssize_t simple_write_to_buffer(void *to, size_t available, loff_t *ppos, const v
     *ppos = pos + (loff_t)count;
     return (ssize_t)count;
 }
+
+/* ---- user space's eventfds (linux/eventfd.h) ------------------------------------------ */
+/* A sync object signals one from a fence callback, which may run in an
+ * interrupt, and drops it there too: the last reference of Kestrel's file
+ * goes in a worker. */
+struct eventfd_ctx {
+    void               *efd;
+    struct work_struct  put_work;
+};
+
+static void eventfd_put_work(struct work_struct *w)
+{
+    struct eventfd_ctx *ctx = container_of(w, struct eventfd_ctx, put_work);
+    lkpi_eventfd_put(ctx->efd);
+    kfree(ctx);
+}
+
+struct eventfd_ctx *eventfd_ctx_fdget(int fd)
+{
+    struct eventfd_ctx *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    int r;
+    if (!ctx) return ERR_PTR(-ENOMEM);
+    r = lkpi_eventfd_get(fd, &ctx->efd);
+    if (r) {
+        kfree(ctx);
+        return ERR_PTR(r);
+    }
+    INIT_WORK(&ctx->put_work, eventfd_put_work);
+    return ctx;
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_fdget);
+
+void eventfd_signal(struct eventfd_ctx *ctx)
+{
+    lkpi_eventfd_signal(ctx->efd);
+}
+EXPORT_SYMBOL_GPL(eventfd_signal);
+
+void eventfd_ctx_put(struct eventfd_ctx *ctx)
+{
+    schedule_work(&ctx->put_work);
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_put);

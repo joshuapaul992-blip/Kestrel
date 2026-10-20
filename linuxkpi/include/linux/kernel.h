@@ -75,5 +75,6 @@ struct dentry;
 struct inode;
 struct file;
 struct seq_file;
+struct poll_table_struct;
 
 #endif

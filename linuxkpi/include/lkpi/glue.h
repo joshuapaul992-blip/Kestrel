@@ -161,6 +161,9 @@ struct lkpi_cdev_ops {
     long (*ioctl)(void *file, unsigned int cmd, unsigned long arg);
     int  (*poll)(void *file, int events);
     int  (*mmap)(void *file, struct lkpi_mmap *m);          /* optional: MAP_SHARED */
+    /* files without a node (lkpi_fd_fill): */
+    unsigned long long (*size)(void *file);                 /* for lseek(SEEK_END) and fstat */
+    void (*hold)(void *file);                               /* one more reference, for lkpi_fd_file */
 };
 void         *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                             const struct lkpi_cdev_ops *ops, void *dev);
@@ -171,6 +174,26 @@ void          lkpi_sysfs_class_dev(void *pci, const char *cls, const char *name,
                                    unsigned int major, unsigned int minor);
 void          lkpi_sysfs_pci_driver(void *pci, const char *driver);
 
+/* Descriptors of the calling process for files without a node in /dev
+ * (anon_inode_getfile: dma-bufs, sync files, DRM sync objects), from inside
+ * a system call. lkpi_fd_reserve() holds a free descriptor (or returns
+ * -EMFILE), lkpi_fd_fill() puts the file there, served by `ops` (named
+ * `name`, as /proc/self/fd shows it); the descriptor's last close calls
+ * ops->release(file). lkpi_fd_unreserve() gives an unused one back.
+ * lkpi_fd_file() is the file behind fd if `ops` serve it (an open of a
+ * device node with them, or a file filled in with them), with
+ * ops->hold() called on it, or NULL. */
+int           lkpi_fd_reserve(int cloexec);
+int           lkpi_fd_fill(int fd, const char *name, int flags, const struct lkpi_cdev_ops *ops, void *file);
+void          lkpi_fd_unreserve(int fd);
+void         *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops);
+/* Kestrel's eventfds: the one behind fd (a reference, or -EBADF/-EINVAL),
+ * adding 1 to it from any context, and dropping the reference (it may
+ * sleep: not from an interrupt) */
+int           lkpi_eventfd_get(int fd, void **efd);
+void          lkpi_eventfd_signal(void *efd);
+void          lkpi_eventfd_put(void *efd);
+
 /* ---- device memory mapped into a process (mmap of a device node) -------- */
 /* The region [start, end) at file offset `off` of the process `mm` (opaque)
  * is set up by the cdev's mmap(), which fills in ops and ctx. Each region
@@ -178,7 +201,7 @@ void          lkpi_sysfs_pci_driver(void *pci, const char *driver);
  * part of a split region (mm NULL: the same process, and resize() shrinks
  * the original); close() ends it. fault() maps at least `va` with
  * lkpi_vm_insert() and returns 0, -EIO (SIGBUS), -ENOMEM or -EFAULT. All
- * of them may sleep and run under Kestrel's big kernel lock. */
+ * of them may sleep; they run without Kestrel's big kernel lock. */
 struct lkpi_mmap_ops {
     int   (*fault)(void *ctx, unsigned long va, int write);
     void *(*dup)(void *ctx, void *mm, unsigned long start, unsigned long end, unsigned long off);

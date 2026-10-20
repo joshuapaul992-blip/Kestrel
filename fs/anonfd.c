@@ -125,6 +125,29 @@ int eventfd_create(uint32_t initval, int flags, struct file **out)
     return r;
 }
 
+/* The eventfd behind descriptor fd, with a reference (vfs_close): Linux
+ * drivers signal one when a sync object's fence does. -EBADF, or -EINVAL
+ * for another kind of file. */
+int eventfd_fget(int fd, struct file **out)
+{
+    struct file *f = fd_file(fd);
+    if (!f) return -EBADF;
+    if (!f->vn || f->vn->ops != &efd_ops) { vfs_close(f); return -EINVAL; }
+    *out = f;
+    return 0;
+}
+
+/* Add 1, as a write of 1 would, without waiting: from any context,
+ * interrupts included. A counter at its maximum stays there. */
+void eventfd_file_signal(struct file *f)
+{
+    struct eventfd *e = f->vn->data;
+    uint64_t fl = spin_lock_irqsave(&e->lock);
+    if (e->count < EFD_MAX) e->count++;
+    wakeup(e);
+    spin_unlock_irqrestore(&e->lock, fl);
+}
+
 /* ---- timerfd -------------------------------------------------------------------- */
 struct timerfd {
     struct vnode vn;

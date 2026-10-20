@@ -87,6 +87,7 @@ static inline void vm_flags_mod(struct vm_area_struct *vma, vm_flags_t set, vm_f
 { vma->vm_flags = (vma->vm_flags | set) & ~clear; }
 pgprot_t vm_get_page_prot(unsigned long vm_flags);
 /* inserting pages into a process from a fault (src/mmap.c) */
+void vma_set_file(struct vm_area_struct *vma, struct file *file);
 vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot);
 vm_fault_t vmf_insert_pfn(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn);
 vm_fault_t vmf_insert_page(struct vm_area_struct *vma, unsigned long addr, struct page *page);

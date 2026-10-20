@@ -5,6 +5,7 @@
 #include <kernel/mm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 #include "pci.h"
 
 #define CAP_MSI         0x05
@@ -20,6 +21,7 @@ struct msi_slot {
     bool          lockless;             /* msi_set_lockless */
 };
 static struct msi_slot slots[VEC_MSI_COUNT];
+static struct spinlock slot_lock;       /* claiming and freeing slots: drivers off the big lock */
 
 /* Offset of capability `id` in the function's list, 0 if absent. */
 static uint8_t find_cap(const struct pci_device *d, uint8_t id)
@@ -74,17 +76,17 @@ int msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *
     uint8_t msix = find_cap(dev, CAP_MSIX), msi = find_cap(dev, CAP_MSI);
     if (!msix && !msi) return -1;
     int i;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&slot_lock);
     for (i = 0; i < VEC_MSI_COUNT && slots[i].fn; i++) {}
     if (i < VEC_MSI_COUNT) { slots[i].fn = fn; slots[i].arg = arg; slots[i].name = name; }
-    irq_restore(f);
+    spin_unlock_irqrestore(&slot_lock, f);
     if (i == VEC_MSI_COUNT) return -1;
     int vector = VEC_MSI_BASE + i;
     uint32_t addr = MSI_ADDR_BASE | (cpus[0].apic_id << 12);   /* physical destination: the boot CPU */
     uint32_t data = (uint32_t)vector;                          /* fixed delivery, edge */
     bool x = msix && setup_msix(dev, msix, addr, data);
     bool ok = x || (msi && setup_msi(dev, msi, addr, data));
-    if (!ok) { slots[i].fn = NULL; return -1; }
+    if (!ok) { __atomic_store_n(&slots[i].fn, NULL, __ATOMIC_RELEASE); return -1; }
     slots[i].msix = x;
     uint16_t cmd = pci_read16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND);
     pci_write16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND, (uint16_t)(cmd | PCI_CMD_INTX_DISABLE));
@@ -102,12 +104,12 @@ void msi_disable(struct pci_device *dev, int vector)
         ctl = s->msix ? (uint16_t)(ctl & ~0x8000) : (uint16_t)(ctl & ~0x0001);
         pci_write16(dev->bus, dev->device, dev->function, (uint8_t)(cap + 2), ctl);
     }
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&slot_lock);
     s->fn = NULL;
     s->arg = NULL;
     s->msix = false;
     s->lockless = false;
-    irq_restore(f);
+    spin_unlock_irqrestore(&slot_lock, f);
 }
 
 void msi_set_lockless(int vector)

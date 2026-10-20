@@ -3,7 +3,12 @@
  * A node registered here looks like any other device in /dev. Each open
  * gets a vnode of its own, outside the tree (as /dev/ptmx does), so the
  * Linux side can keep per-open state (its struct file) in it; the open
- * file's last close calls release and frees it. */
+ * file's last close calls release and frees it.
+ *
+ * The Linux side locks its own state, so its files and mappings run
+ * without the big kernel lock (vnode_ops.nolock, vm_devmap_ops.nolock):
+ * opens, reads, writes, ioctls, polls, mmap, page faults and the last
+ * close. */
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
 #include <kernel/string.h>
@@ -97,6 +102,7 @@ static void dmap_close(void *c)
 
 static const struct vm_devmap_ops dmap_ops = {
     .fault = dmap_fault, .dup = dmap_dup, .resize = dmap_resize, .close = dmap_close,
+    .nolock = true,
 };
 
 static int cdev_mmap(struct file *f, struct vm_devmap *m)
@@ -135,7 +141,21 @@ static void cdev_release(struct file *f)
 
 static const struct vnode_ops open_ops = {
     .fread = cdev_fread, .fwrite = cdev_fwrite, .fioctl = cdev_fioctl,
-    .poll = cdev_poll, .release = cdev_release, .mmap = cdev_mmap,
+    .poll = cdev_poll, .release = cdev_release, .mmap = cdev_mmap, .nolock = true,
+};
+
+/* files without a node: seekable to their size (a dma-buf's size is found
+ * with lseek(SEEK_END)) */
+static uint64_t anon_size(struct vnode *vn)
+{
+    struct cdev_open *o = (struct cdev_open *)vn;
+    return o->node->ops->size ? o->node->ops->size(o->file) : 0;
+}
+
+static const struct vnode_ops anon_ops = {
+    .fread = cdev_fread, .fwrite = cdev_fwrite, .fioctl = cdev_fioctl,
+    .poll = cdev_poll, .release = cdev_release, .mmap = cdev_mmap, .size = anon_size,
+    .nolock = true,
 };
 
 static int cdev_open(struct vnode *vn, int flags, struct file **out)
@@ -162,7 +182,51 @@ static int cdev_open(struct vnode *vn, int flags, struct file **out)
     return 0;
 }
 
-static const struct vnode_ops node_ops = { .open = cdev_open };
+static const struct vnode_ops node_ops = { .open = cdev_open, .nolock = true };
+
+int lkpi_fd_reserve(int cloexec) { return fd_reserve(cloexec != 0); }
+void lkpi_fd_unreserve(int fd) { fd_unreserve(fd); }
+
+int lkpi_fd_fill(int fd, const char *name, int flags, const struct lkpi_cdev_ops *ops, void *file)
+{
+    struct cdev_open *o = kzalloc(sizeof *o + sizeof(struct cdev_node));
+    if (!o) return -ENOMEM;
+    struct cdev_node *n = (struct cdev_node *)(o + 1);  /* its own: no device behind it */
+    n->ops = ops;
+    strlcpy(o->vn.name, name, sizeof o->vn.name);
+    o->vn.type = VCHR;
+    o->vn.mode = S_IFCHR | 0600;
+    o->vn.ops = &anon_ops;
+    o->node = n;
+    o->file = file;
+    struct file *f = vfs_file_new(&o->vn, flags & (O_ACCMODE | O_NONBLOCK));
+    if (!f) { kfree(o); return -ENOMEM; }
+    fd_fill(fd, f);
+    return 0;
+}
+
+void *lkpi_fd_file(int fd, const struct lkpi_cdev_ops *ops)
+{
+    struct file *f = fd_file(fd);
+    void *lf = NULL;
+    if (f && (f->vn->ops == &open_ops || f->vn->ops == &anon_ops) && of(f)->node->ops == ops) {
+        lf = of(f)->file;
+        if (ops->hold) ops->hold(lf);
+    }
+    vfs_close(f);
+    return lf;
+}
+
+int lkpi_eventfd_get(int fd, void **efd)
+{
+    struct file *f;
+    int r = eventfd_fget(fd, &f);
+    if (!r) *efd = f;
+    return r;
+}
+
+void lkpi_eventfd_signal(void *efd) { eventfd_file_signal(efd); }
+void lkpi_eventfd_put(void *efd) { vfs_close(efd); }
 
 void *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, unsigned int minor,
                     const struct lkpi_cdev_ops *ops, void *dev)
@@ -179,7 +243,7 @@ void *lkpi_cdev_add(const char *name, unsigned int mode, unsigned int major, uns
 /* The node stays in /dev (devfs has no removal yet) but opens fail; files
  * already open keep their callbacks, which the Linux side keeps valid. */
 static int gone_open(struct vnode *vn, int flags, struct file **out) { return -ENODEV; }
-static const struct vnode_ops gone_ops = { .open = gone_open };
+static const struct vnode_ops gone_ops = { .open = gone_open, .nolock = true };
 
 void lkpi_cdev_remove(void *node)
 {

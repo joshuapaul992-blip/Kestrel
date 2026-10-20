@@ -1,8 +1,11 @@
 #!/bin/sh
 # /boot/bin/startx -- the Kestrel desktop: the X server on :0, then LXDE
 # where the root file system has it (the Firefox image's Ubuntu root), else
-# IceWM with one xterm. Logout in the desktop's menu ends the session; the
-# X server stops too and the monitors return to their text terminals.
+# IceWM with one xterm. The X server is Xorg with the modesetting driver
+# where there is a DRM device (/dev/dri/card0) and the root has Xorg
+# (ports/xorg), else Xkestrel; KESTREL_X=xkestrel picks Xkestrel anyway.
+# Logout in the desktop's menu ends the session; the X server stops too
+# and the monitors return to their text terminals.
 export DISPLAY=:0
 export NO_AT_BRIDGE=1                  # no accessibility bus: GTK programs would warn
 # FreeType's classic TrueType interpreter (35) for every program on the desktop
@@ -11,7 +14,15 @@ export FREETYPE_PROPERTIES=${FREETYPE_PROPERTIES:-truetype:interpreter-version=3
 if [ "$(id -u)" = 0 ] && [ "${HOME:-/}" = / ] && [ -d /root ]; then export HOME=/root; fi
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
-Xkestrel :0 "$@" &
+XORG_CONF=/etc/X11/kestrel-xorg.conf
+if [ "${KESTREL_X:-}" != xkestrel ] && [ -e /dev/dri/card0 ] && [ -f "$XORG_CONF" ] &&
+   command -v Xorg >/dev/null 2>&1; then
+    # on the terminal startx runs on; -nolock: /tmp has no hard links yet
+    vt=$(tty 2>/dev/null | sed -n 's|^/dev/tty\([0-9][0-9]*\)$|vt\1|p')
+    Xorg :0 ${vt:-vt1} -keeptty -config "$XORG_CONF" -nolisten tcp -nolock "$@" &
+else
+    Xkestrel :0 "$@" &
+fi
 xpid=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done

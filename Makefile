@@ -69,7 +69,7 @@ ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/trampoline.asm arch/x86_64/vdso_blob.asm
 C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c arch/x86_64/fpu.c \
-           drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
+           drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c drivers/evdev.c \
            drivers/font_8x16.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c drivers/virtio/virtio_blk.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
@@ -127,12 +127,14 @@ LKPI_CFLAGS := $(filter-out -I% -W% -MMD -MP,$(CFLAGS)) -nostdinc -D__KERNEL__ \
 # them and prints its first error, if any.
 # Linux reaches kernel.h, export.h and slab.h through its deep header graph;
 # the KPI's headers are shallower, so DRM files get them up front.
-LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c \
+LKPI_DRM_SRC := linuxkpi/src/drm.c linuxkpi/src/drm_kestrel.c linuxkpi/src/dma-buf.c linuxkpi/src/sync_file.c linuxkpi/src/drm_prime.c third_party/linux/lib/rbtree.c third_party/linux/lib/xarray.c \
                 third_party/linux/drivers/dma-buf/dma-resv.c \
                 third_party/linux/drivers/video/aperture.c third_party/linux/drivers/video/hdmi.c \
                 $(sort $(wildcard third_party/linux/drivers/gpu/drm/*.c)) \
                 $(sort $(wildcard third_party/linux/drivers/gpu/drm/ttm/*.c)) \
-                third_party/linux/drivers/gpu/drm/tiny/bochs.c
+                third_party/linux/drivers/gpu/drm/tiny/bochs.c \
+                linuxkpi/src/drm_gem_shmem.c linuxkpi/src/virtio.c \
+                $(sort $(wildcard third_party/linux/drivers/gpu/drm/virtio/*.c)) linuxkpi/virtio-gpu/kestrel.c
 LKPI_DRM_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_DRM_SRC))
 LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linux/include/uapi \
                    -include linux/kernel.h -include linux/export.h -include linux/module.h -include linux/slab.h -include linux/rbtree.h \
@@ -143,8 +145,12 @@ LKPI_DRM_CFLAGS := $(LKPI_CFLAGS) -Ithird_party/linux/include -Ithird_party/linu
 # the command line, since the force-included headers would define it first.
 lkpi_drm_prfmt = $(if $(filter %/ttm_device.c,$(1)),-D'pr_fmt(fmt)="[TTM DEVICE] " fmt',$(if \
                  $(filter %/ttm_bo.c %/ttm_tt.c %/ttm_bo_vm.c,$(1)),-D'pr_fmt(fmt)="[TTM] " fmt'))
-# KBUILD_MODNAME as Linux's modules: drm, ttm, bochs; the library files by name
-lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1)))))))
+# KBUILD_MODNAME as Linux's modules: drm, ttm, bochs, virtio_gpu; the library files by name
+lkpi_drm_modname = $(if $(findstring /gpu/drm/ttm/,$(1)),ttm,$(if $(findstring /tiny/,$(1)),$(basename $(notdir $(1))),$(if \
+                   $(findstring /virtio/,$(1))$(findstring /virtio-gpu/,$(1)),virtio_gpu,$(if \
+                   $(findstring /gpu/drm/,$(1)),drm,$(subst -,_,$(basename $(notdir $(1))))))))
+# virtio-gpu's files see the KPI's stand-ins for its GPL-2.0-only ones, and the KPI's for the driver's
+lkpi_drm_overlay = $(if $(findstring /virtio/,$(1))$(findstring /virtio-gpu/,$(1)),-iquote linuxkpi/virtio-gpu -iquote third_party/linux/drivers/gpu/drm/virtio)
 
 # Phase 2, nouveau: the driver as Linux's Kbuild builds it on x86 without
 # ACPI, debugfs, LEDs, backlight, SVM or the Tegra platform driver (the list
@@ -251,7 +257,7 @@ lkpi-nv-check:
 $(LKPI_DRM_OBJS): $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC [L]  $<"
-	@$(CC) $(LKPI_DRM_CFLAGS) $(call lkpi_drm_prfmt,$<) -DKBUILD_MODNAME='"$(call lkpi_drm_modname,$<)"' -c $< -o $@
+	@$(CC) $(LKPI_DRM_CFLAGS) $(call lkpi_drm_prfmt,$<) $(call lkpi_drm_overlay,$<) -DKBUILD_MODNAME='"$(call lkpi_drm_modname,$<)"' -c $< -o $@
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
@@ -308,7 +314,7 @@ $(BUILD)/nouveau.stamp: FORCE
 # ---- bootable ISO (BIOS El Torito + UEFI, whatever GRUB platforms are installed)
 $(BUILD)/cmdline.stamp: FORCE
 	@mkdir -p $(BUILD)
-	@echo '$(KERNEL_CMDLINE)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE)' > $@
+	@echo '$(KERNEL_CMDLINE) default=$(GRUB_DEFAULT)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE) default=$(GRUB_DEFAULT)' > $@
 
 $(BUILD)/rootbase.stamp: FORCE
 	@mkdir -p $(BUILD)
@@ -380,7 +386,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
@@ -507,9 +513,12 @@ USBIMG_FLAGS ?=
 # /bin/kestrel-bench (boot/grub/grub-bench.cfg). Use it with the Firefox
 # root (ROOTFS_BASE), which has Firefox and Xvfb.
 BENCH_LINUX ?=
+# GRUB_DEFAULT: the menu entry the stick boots by itself after 5 s, counting
+# from 0 (boot/grub/grub-usb.cfg); 4 is the GPU self-test.
+GRUB_DEFAULT ?= 0
 ESP_MB := $(if $(BENCH_LINUX),48,8)
 USBIMG_ROOT  := $(if $(MKE2FS),$(ROOTDISK))
-USBIMG_SIZE  ?= $(shell echo $$(($(if $(MKE2FS),$(ROOTDISK_MB),0) + 56 + $(ESP_MB))))
+USBIMG_SIZE  ?= $(shell echo $$(($(if $(MKE2FS),$(ROOTDISK_MB),0) + 96 + $(ESP_MB))))
 $(BUILD)/bench.stamp: FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(abspath $(BENCH_LINUX))' | cmp -s - $@ || echo '$(abspath $(BENCH_LINUX))' > $@
@@ -532,7 +541,7 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg boot/grub/grub-bench.cfg tools/mku
 	        MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BENCH_LINUX)/vmlinuz $(BENCH_LINUX)/initrd.gz ::/boot/linux/; fi; \
 	else test -z "$(BENCH_LINUX)" || { echo "error: BENCH_LINUX needs mtools and GRUB's x86_64-efi files"; exit 1; }; \
 	    cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf; fi; \
-	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
+	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e 's|@GRUB_DEFAULT@|$(GRUB_DEFAULT)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
 	    $(if $(BENCH_LINUX),-e '/@BENCH_ENTRIES@/r boot/grub/grub-bench.cfg') -e '/@BENCH_ENTRIES@/d' \
 	    boot/grub/grub-usb.cfg > $(BUILD)/usbdir/boot/grub/grub.cfg
 	@tar --format=ustar -C $(BUILD)/usbdir -cf $(BUILD)/usb-memdisk.tar boot

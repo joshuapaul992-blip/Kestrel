@@ -326,9 +326,23 @@ void     epoll_file_used(struct file *f);       /* I/O on it: re-arm edge-trigge
 
 /* fs/anonfd.c */
 int      eventfd_create(uint32_t initval, int flags, struct file **out);
+int      eventfd_fget(int fd, struct file **out);  /* the eventfd behind fd, with a reference */
+void     eventfd_file_signal(struct file *f);       /* add 1, from any context */
 int      timerfd_create_file(int clockid, int flags, struct file **out);
 int      timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], int64_t old[4]);
 int      timerfd_gettime_file(struct file *f, int64_t cur[4]);
 int      signalfd_file(struct file *f, uint64_t mask, int flags, struct file **out);
+
+/* kernel/syscall.c: the calling process's descriptors, for drivers that
+ * hand out files from inside an ioctl (the Linux KPI's dma-bufs, sync
+ * files and DRM sync objects). fd_reserve() holds the lowest free
+ * descriptor with a placeholder (-EMFILE if none), fd_fill() puts f there
+ * (the table takes the caller's reference; if the placeholder is gone, f
+ * is closed) and fd_unreserve() gives the descriptor back unused.
+ * fd_file() is the file behind fd with a reference (vfs_close), or NULL. */
+int           fd_reserve(bool cloexec);
+void          fd_fill(int fd, struct file *f);
+void          fd_unreserve(int fd);
+struct file  *fd_file(int fd);
 
 #endif
