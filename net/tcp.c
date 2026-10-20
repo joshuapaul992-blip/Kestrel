@@ -125,7 +125,7 @@ static bool tcbs_contains(struct tcpcb *x)
     for (struct tcpcb *t = tcbs; t; t = t->next) if (t == x) return true;
     return false;
 }
-static uint64_t st_active, st_passive, st_fails, st_resets, st_retrans, st_in, st_out, st_rst_out;
+static uint64_t st_active, st_passive, st_fails, st_resets, st_retrans, st_in, st_out, st_rst_out, st_csum;
 
 static void tcb_free(struct tcpcb *t);
 static void tcp_output(struct tcpcb *t);
@@ -563,7 +563,7 @@ void tcp_input(struct netif *nif, struct pkt *p, uint32_t src, uint32_t dst)
     struct tcp_hdr *h = (struct tcp_hdr *)pkt_data(p);
     unsigned hl = (h->off >> 4) * 4u;
     if (hl < 20 || hl > p->len) goto drop;
-    if (nif != netif_loopback() && inet_csum(h, p->len, inet_pseudo(src, dst, IPPROTO_TCP, p->len))) goto drop;
+    if (nif != netif_loopback() && inet_csum(h, p->len, inet_pseudo(src, dst, IPPROTO_TCP, p->len))) { st_csum++; goto drop; }
     const uint8_t *opt = (const uint8_t *)(h + 1);
     size_t optlen = hl - 20;
     uint32_t seq = be32(h->seq), ack = be32(h->ack);
@@ -792,6 +792,18 @@ void tcp_timer(uint64_t now)
         if (t->keep_at) net_set_timer(t->keep_at);
         if (t->tw_at) net_set_timer(t->tw_at);
     }
+}
+
+size_t tcp_snmp(char *buf, size_t cap)
+{
+    uint64_t estab = 0;
+    for (struct tcpcb *t = tcbs; t; t = t->next) if (t->state == ESTABLISHED || t->state == CLOSE_WAIT) estab++;
+    int n = snprintf(buf, cap, "Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets "
+                     "CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n"
+                     "Tcp: 1 %d %d -1 %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+                     RTO_MIN, RTO_MAX, st_active, st_passive, st_fails, st_resets, estab, st_in, st_out, st_retrans,
+                     st_csum, st_rst_out, st_csum);
+    return n < 0 ? 0 : (size_t)n < cap ? (size_t)n : cap;
 }
 
 /* ---- socket calls ------------------------------------------------------------------------ */

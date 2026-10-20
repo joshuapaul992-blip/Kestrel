@@ -94,6 +94,7 @@ struct netif {
     void    (*poll)(struct netif *nif);
     bool    (*pending)(struct netif *nif);
     bool    (*link_up)(struct netif *nif);
+    size_t  (*info)(struct netif *nif, char *buf, size_t cap);   /* /proc/net/nic: the driver's view; may be NULL */
     void     *priv;
     /* counters (/proc/net/dev) */
     uint64_t  rx_packets, rx_bytes, rx_dropped, rx_errors;
@@ -175,6 +176,7 @@ void dhcp_stop(struct netif *nif);       /* user space configures nif itself now
 
 void net_proc_init(void);
 size_t tcp_proc(char *buf, size_t cap);
+size_t tcp_snmp(char *buf, size_t cap);         /* the "Tcp:" lines of /proc/net/snmp */
 size_t udp_proc(char *buf, size_t cap);
 
 #endif

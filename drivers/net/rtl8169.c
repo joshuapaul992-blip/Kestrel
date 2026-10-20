@@ -20,8 +20,13 @@
  * The PHY is told what to advertise (10/100 half and full, 1000 full on
  * the gigabit parts, pause) before autonegotiation restarts: firmware and
  * other systems going to sleep with Wake-on-LAN often leave it advertising
- * 10 Mbit/s only, which the chip then keeps. The negotiated speed and
- * duplex are logged when the link comes up, and IFF_RUNNING follows it.
+ * 10 Mbit/s only, which the chip then keeps. Energy Efficient Ethernet is
+ * not advertised (8168G on), and PCIe power saving (ASPM L0s/L1 on the
+ * card's link, the chip's own ASPM and clock request) is turned off, as
+ * Linux does: both are known to make these chips drop frames. The
+ * negotiated speed and duplex are logged when the link comes up, and
+ * IFF_RUNNING follows it. /proc/net/nic shows the link, the PHY registers,
+ * the power-saving state and the chip's own counters.
  *
  * One receive and one transmit ring of 256 sixteen-byte descriptors with a
  * 2 KiB buffer each, 64-bit bus addresses: at a gigabit, 256 frames are
@@ -46,7 +51,11 @@ enum {
     INTRSTATUS = 0x3E, TXCONFIG = 0x40, RXCONFIG = 0x44, CFG9346 = 0x50, CONFIG1 = 0x52, PHYAR = 0x60,
     PHYSTATUS = 0x6C, PMCH = 0x6F, GPHY_OCP = 0xB8, RXMAXSIZE = 0xDA, CPLUSCMD = 0xE0,
     INTRMITIGATE = 0xE2, RDSAR = 0xE4, MAXTXPKT = 0xEC, MISC = 0xF0,
+    COUNTERS = 0x10, CONFIG2 = 0x53, CONFIG5 = 0x56,
 };
+#define CFG2_CLKREQ_EN  0x80
+#define CFG5_ASPM_EN    0x01
+#define COUNTER_DUMP    0x08
 #define CMD_RST     0x10
 #define CMD_RE      0x08
 #define CMD_TE      0x04
@@ -70,8 +79,11 @@ enum {
 #define I_EVENTS    (I_RXOK | I_RXERR | I_RDU | I_LINKCHG | I_FIFOOVER | I_SYSERR)
 /* MII registers */
 #define MII_BMCR    0x00
+#define MII_BMSR    0x01
 #define MII_ANAR    0x04
+#define MII_LPA     0x05
 #define MII_GBCR    0x09
+#define MII_GBSR    0x0a
 #define BMCR_ANENABLE   0x1000
 #define BMCR_ANRESTART  0x0200
 #define ANAR_CSMA       0x0001
@@ -121,7 +133,21 @@ struct r8169 {
     int msi;                            /* the vector, or -1: polled from the tick */
     uint16_t events;                    /* IntrStatus bits the interrupt saw, for poll */
     uint8_t link;                       /* PHYSTATUS when the link last changed */
+    struct pci_device *pci;
+    uint16_t aspm_found;                /* ASPM control bits (card, upstream port << 8) firmware had set */
+    volatile uint8_t *tally;            /* 64 bytes the chip dumps its counters into */
 };
+
+/* The chip's tally counters, as it writes them (little-endian) */
+struct tally {
+    uint64_t tx_packets, rx_packets, tx_errors;
+    uint32_t rx_errors;
+    uint16_t rx_missed, align_errors;
+    uint32_t tx_one_collision, tx_multi_collision;
+    uint64_t rx_unicast, rx_broadcast;
+    uint32_t rx_multicast;
+    uint16_t tx_aborted, tx_underrun;
+} __attribute__((packed));
 
 static uint8_t r8(struct r8169 *t, uint32_t o) { return *(volatile uint8_t *)(t->regs + o); }
 static uint16_t r16(struct r8169 *t, uint32_t o) { return *(volatile uint16_t *)(t->regs + o); }
@@ -235,7 +261,49 @@ static void power_up(struct r8169 *t)
         if (gbcr == 0xffff) gbcr = 0;
         phy_write(t, MII_GBCR, (uint16_t)((gbcr & ~(GBCR_1000HALF | GBCR_1000FULL)) | GBCR_1000FULL));
     }
+    if (t->ver >= 40) {                                         /* no EEE: the EEE advertisement, OCP 0xa5d0 (page 0x0a5d, register 16) */
+        w32(t, GPHY_OCP, 0x80000000u | 0xa5d0u << 15 | 0);
+        for (int i = 0; i < 100 && (r32(t, GPHY_OCP) & 0x80000000u); i++) udelay(25);
+    }
     phy_write(t, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);     /* and not powered down or isolated */
+}
+
+/* ---- PCIe power saving ------------------------------------------------------------ */
+static uint8_t pcie_cap(struct pci_device *d)
+{
+    if (!(pci_read16(d->bus, d->device, d->function, 0x06) & 0x10)) return 0;   /* no capability list */
+    uint8_t p = pci_read8(d->bus, d->device, d->function, 0x34) & 0xfc;
+    for (int i = 0; p && i < 48; i++) {
+        if (pci_read8(d->bus, d->device, d->function, p) == 0x10) return p;
+        p = pci_read8(d->bus, d->device, d->function, (uint8_t)(p + 1)) & 0xfc;
+    }
+    return 0;
+}
+
+/* Clear ASPM control (L0s, L1) in a function's PCIe Link Control; the bits that were set */
+static uint8_t aspm_off(struct pci_device *d)
+{
+    uint8_t c = d ? pcie_cap(d) : 0;
+    if (!c) return 0;
+    uint8_t off = (uint8_t)(c + 0x10);
+    uint16_t lc = pci_read16(d->bus, d->device, d->function, off);
+    if (lc & 3) pci_write16(d->bus, d->device, d->function, off, (uint16_t)(lc & ~3u));
+    return lc & 3;
+}
+
+/* Linux turns L1 off on the link (its comment: random device stops and
+ * hangs), and the chip's ASPM and clock request with it. Both ends of the
+ * link are cleared: L1 is entered only when both allow it, but the port
+ * may still go to L0s on its own side. */
+static void power_saving_off(struct r8169 *t)
+{
+    t->aspm_found = (uint16_t)(aspm_off(t->pci) | aspm_off(t->pci->parent) << 8);
+    if (t->ver >= 32) {
+        w8(t, CFG9346, CFG_UNLOCK);
+        w8(t, CONFIG2, r8(t, CONFIG2) & (uint8_t)~CFG2_CLKREQ_EN);
+        w8(t, CONFIG5, r8(t, CONFIG5) & (uint8_t)~CFG5_ASPM_EN);
+        w8(t, CFG9346, CFG_LOCK);
+    }
 }
 
 /* 10/100 parts (Linux's RTL8101/8102/8103/8105/8106/8402 versions): no 1000BASE-T */
@@ -353,6 +421,50 @@ static bool r8169_link(struct netif *nif)
     return (r8(t, PHYSTATUS) & LINK_STATUS) != 0;
 }
 
+/* /proc/net/nic */
+static size_t r8169_info(struct netif *nif, char *buf, size_t cap)
+{
+    struct r8169 *t = nif->priv;
+    uint8_t ps = r8(t, PHYSTATUS);
+    size_t n = 0;
+#define OUT(...) do { if (n < cap) n += (size_t)snprintf(buf + n, cap - n, __VA_ARGS__); } while (0)
+    OUT("  chip:      Realtek %s, version %d, %s, %d descriptors, %s\n", chip_name(t->ver), t->ver,
+        t->fast_only ? "10/100" : "10/100/1000", NDESC, t->msi >= 0 ? "MSI" : "polled");
+    if (ps & LINK_STATUS)
+        OUT("  link:      up, %s Mbit/s, %s duplex, flow control rx %s tx %s\n",
+            ps & PS_1000 ? "1000" : ps & PS_100 ? "100" : ps & PS_10 ? "10" : "?", ps & PS_FULL ? "full" : "half",
+            ps & PS_RXFLOW ? "on" : "off", ps & PS_TXFLOW ? "on" : "off");
+    else OUT("  link:      down\n");
+    OUT("  phy:       BMCR %04x BMSR %04x ANAR %04x LPA %04x GBCR %04x GBSR %04x (PHYSTATUS %02x)\n",
+        phy_read(t, MII_BMCR), phy_read(t, MII_BMSR), phy_read(t, MII_ANAR), phy_read(t, MII_LPA),
+        t->fast_only ? 0 : phy_read(t, MII_GBCR), t->fast_only ? 0 : phy_read(t, MII_GBSR), ps);
+    OUT("  aspm:      firmware had card %s, upstream port %s; now off. Config2 %02x Config5 %02x\n",
+        (t->aspm_found & 3) == 3 ? "L0s+L1" : (t->aspm_found & 3) == 2 ? "L1" : (t->aspm_found & 3) == 1 ? "L0s" : "none",
+        (t->aspm_found >> 8 & 3) == 3 ? "L0s+L1" : (t->aspm_found >> 8 & 3) == 2 ? "L1" : (t->aspm_found >> 8 & 3) == 1 ? "L0s" : "none",
+        r8(t, CONFIG2), r8(t, CONFIG5));
+    OUT("  rings:     rx next %u, tx next %u, tx clean %u; IntrMask %04x IntrStatus %04x\n",
+        t->rx_next, t->tx_next, t->tx_clean, r16(t, INTRMASK), r16(t, INTRSTATUS));
+    if (t->tally) {
+        uint64_t a = nic_bus(t->tally);
+        w32(t, COUNTERS + 4, (uint32_t)(a >> 32));
+        w32(t, COUNTERS, (uint32_t)a);
+        w32(t, COUNTERS, (uint32_t)a | COUNTER_DUMP);
+        int i;
+        for (i = 0; i < 1000 && (r32(t, COUNTERS) & COUNTER_DUMP); i++) udelay(10);
+        if (i < 1000) {
+            nic_fence();
+            struct tally c;
+            memcpy(&c, (const void *)t->tally, sizeof c);
+            OUT("  counters:  rx %lu (unicast %lu broadcast %lu multicast %u), rx errors %u, missed %u, alignment %u\n",
+                c.rx_packets, c.rx_unicast, c.rx_broadcast, c.rx_multicast, c.rx_errors, c.rx_missed, c.align_errors);
+            OUT("             tx %lu, tx errors %lu, collisions %u single %u multiple, aborted %u, underrun %u\n",
+                c.tx_packets, c.tx_errors, c.tx_one_collision, c.tx_multi_collision, c.tx_aborted, c.tx_underrun);
+        } else OUT("  counters:  the chip did not dump them\n");
+    }
+#undef OUT
+    return n < cap ? n : cap;
+}
+
 static bool r8169_init(struct pci_device *d)
 {
     struct r8169 *t = kzalloc(sizeof *t);
@@ -372,11 +484,13 @@ static bool r8169_init(struct pci_device *d)
         if ((xid & xids[i].mask) == xids[i].val) { t->ver = xids[i].ver; break; }
     t->fast_only = is_fast_only(t->ver) || d->device_id == 0x8136;
     t->msi = -1;
+    t->pci = d;
 
     w16(t, INTRMASK, 0);
     w16(t, INTRSTATUS, 0xffff);
     if (t->ver >= 40) w32(t, MISC, r32(t, MISC) | RXDV_GATED_EN);   /* quiesce the receive path before the reset */
     if (!reset(t)) { kprintf("r8169: %s does not come out of reset\n", chip_name(t->ver)); kfree(t); return false; }
+    power_saving_off(t);
     power_up(t);
 
     struct netif *n = &t->nif;
@@ -398,6 +512,7 @@ static bool r8169_init(struct pci_device *d)
     t->rxbuf = nic_dma((size_t)NDESC * BUF_SIZE, dma32);
     t->txbuf = nic_dma((size_t)NDESC * BUF_SIZE, dma32);
     if (!t->rx || !t->tx || !t->rxbuf || !t->txbuf) { kprintf("r8169: out of memory\n"); return false; }
+    t->tally = nic_dma(sizeof(struct tally), dma32);
     for (uint32_t i = 0; i < NDESC; i++) {
         t->rx[i].addr = nic_bus(t->rxbuf + (size_t)i * BUF_SIZE);
         t->rx[i].opts1 = D_OWN | (i == NDESC - 1 ? D_EOR : 0) | BUF_SIZE;
@@ -441,6 +556,7 @@ static bool r8169_init(struct pci_device *d)
     n->poll = r8169_poll;
     n->pending = r8169_pending;
     n->link_up = r8169_link;
+    n->info = r8169_info;
     n->priv = t;
     t->link = r8(t, PHYSTATUS) & ~LINK_STATUS;                  /* the first poll reports the link */
     netif_register(n);
@@ -450,6 +566,8 @@ static bool r8169_init(struct pci_device *d)
     kprintf("r8169: %s: Realtek %s (XID %03x, version %d) at %02x:%02x.%u, %s, %d descriptors, %s\n", n->name, chip_name(v),
             xid, v, d->bus, d->device, d->function, t->fast_only ? "10/100" : "10/100/1000", NDESC,
             t->msi >= 0 ? "MSI" : "polled");
+    if (t->aspm_found) kprintf("r8169: %s: PCIe ASPM was on (card %x, upstream port %x), turned off\n", n->name,
+                               t->aspm_found & 3, t->aspm_found >> 8);
     return true;
 }
 
