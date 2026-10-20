@@ -3,7 +3,8 @@
  *   /            ramfs   (read-write, in memory)
  *   /dev         devfs   (character devices: null zero random tty console fb0 kmsg ttyS0)
  *   /proc        procfs  (generated: version uptime meminfo cpuinfo mounts tasks ...)
- *   /sys         sysfs   (kernel objects: class/graphics/fb0, kernel, firmware, devices)
+ *   /sys         sysfs   (kernel objects: class/graphics/fb0, kernel, firmware, devices,
+ *                        PCI functions and DRM nodes as libdrm expects them)
  *   /tmp /etc /bin /home ...   plain ramfs directories
  *
  * Every filesystem shares one in-memory node structure (struct vnode).
@@ -28,6 +29,7 @@ enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK, VLNK };
 struct vnode;
 struct mount;
 struct file;
+struct vm_devmap;
 
 struct vnode_ops {
     ssize_t (*read)(struct vnode *vn, void *buf, size_t len, uint64_t off);
@@ -66,6 +68,10 @@ struct vnode_ops {
      * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
      * memfd). NULL: no shared mappings of this file. */
     struct vm_object *(*vmobject)(struct vnode *vn);
+    /* Optional, devices: MAP_SHARED of the open file. Fill in m->ops and
+     * m->ctx for the region m describes (vm.h: device mappings), or return
+     * -errno. Called with the address space locked. */
+    int     (*mmap)(struct file *f, struct vm_devmap *m);
     /* Optional, regular files of a disk file system: the page cache's
      * frame holding the file's bytes [idx * 4096, +4096), zero past the
      * end, with a reference for the caller (page_unref when done). With
@@ -293,6 +299,13 @@ struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx);
 void procfs_init(const char *mountpoint);
 void sysfs_init(const char *mountpoint);
+/* After boot, from drivers (fs/sysfs.c): a Linux driver bound to a PCI
+ * function; a character device of class `cls` named `name` (/dev/`devname`)
+ * registered for a PCI function, or for none (d NULL). */
+struct pci_device;
+void sysfs_pci_driver(const struct pci_device *d, const char *driver);
+void sysfs_class_dev(const struct pci_device *d, const char *cls, const char *name, const char *devname,
+                     unsigned major, unsigned minor);
 
 /* Pseudo-file helpers used by procfs/sysfs: content is produced on demand
  * by a generator writing into a buffer of `cap` bytes. */

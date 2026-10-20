@@ -60,6 +60,7 @@ struct address_space {
     gfp_t               gfp_mask;
     unsigned long       nrpages;
     void               *private_data;
+    struct list_head    i_mmap;         /* regions mapping it (src/mmap.c) */
 };
 
 struct inode {

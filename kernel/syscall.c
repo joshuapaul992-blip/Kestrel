@@ -971,6 +971,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
         r = sys_mmap(addr, len, prot, flags | MAP_ANONYMOUS, (uint64_t)-1, 0);
         goto out;
     }
+    if (vn->type == VCHR && vn->ops && vn->ops->mmap) {             /* a device's memory (/dev/dri) */
+        if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
+        r = vm_mmap_dev(mm, addr, len, (int)prot, (int)flags, f, off);
+        goto out;
+    }
     if (vn->type != VREG) { r = -ENODEV; goto out; }
     struct vm_object *o = shared ? vfs_vmobject(vn) : NULL;
     if (shared && o) {

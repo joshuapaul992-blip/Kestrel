@@ -11,6 +11,14 @@
  *   shared              pages of a vm_object (MAP_SHARED of anonymous memory,
  *                       of a ramfs file or memfd): every mapping sees the
  *                       same frames
+ *   device              memory a driver hands out page by page as it is
+ *                       touched (a GPU's buffers, MAP_SHARED of /dev/dri):
+ *                       the driver's fault callback inserts the frames with
+ *                       vm_dev_insert() and takes them away again with
+ *                       vm_dev_zap() when it moves the memory. The frames
+ *                       are the driver's (not reference counted), they may
+ *                       be I/O memory with its own caching, and fork() does
+ *                       not copy them: the child faults them in again.
  *
  * Nothing is mapped until it is touched: vm_fault() resolves page faults
  * from user mode and from uaccess copies. fork() copies the regions and
@@ -71,18 +79,47 @@
 #define VMA_HEAP        0x4
 #define VMA_VVAR        0x8             /* the vDSO's pages (vdso.h): never writable */
 #define VMA_VDSO        0x10
+#define VMA_DEVICE      0x20            /* with VMA_SHARED: dops/dctx (above) */
 
 struct file;
 struct vm_object;
+struct mm;
+
+/* A device mapping's driver side. Each region has its own ctx: dup()
+ * makes one for a copy (fork, in the child's mm; or the upper part when a
+ * region is split, mm NULL, with resize() shrinking the original), close()
+ * ends it. fault() runs with
+ * the address space locked and may sleep; it maps at least `va` with
+ * vm_dev_insert(), or returns -EIO (SIGBUS), -ENOMEM or -EFAULT. Unless
+ * `nolock`, the callbacks run under the big kernel lock. */
+struct vm_devmap_ops {
+    int   (*fault)(void *ctx, uint64_t va, bool write);
+    void *(*dup)(void *ctx, struct mm *mm, uint64_t start, uint64_t end, uint64_t off);   /* NULL on OOM */
+    void  (*resize)(void *ctx, uint64_t start, uint64_t end, uint64_t off);
+    void  (*close)(void *ctx);
+    bool  nolock;
+};
+
+/* What vnode_ops.mmap gets: the region's place, and it fills in ops/ctx. */
+struct vm_devmap {
+    uint64_t start, end, off;
+    int      prot, flags;
+    struct mm *mm;
+    const struct vm_devmap_ops *ops;
+    void    *ctx;
+};
 
 struct vma {
     uint64_t start, end;        /* [start, end), page aligned               */
     uint32_t prot;              /* PROT_*                                    */
     uint32_t flags;             /* VMA_*                                     */
     struct vm_object *obj;      /* shared: the pages                         */
-    struct file *file;          /* private file: where the bytes come from   */
+    struct file *file;          /* private file: where the bytes come from;
+                                   device: the device file                  */
     uint64_t off;               /* object / file offset of `start` (bytes)   */
     uint64_t file_end;          /* private file: VA where the file data ends */
+    const struct vm_devmap_ops *dops;   /* device mappings */
+    void    *dctx;
     struct vma *next;
 };
 
@@ -115,6 +152,17 @@ struct mm *mm_fork(struct mm *src);         /* copy-on-write copy; NULL on OOM  
  * Returns the address or -errno. `file_end` limits private file data. */
 int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
                 struct file *file, struct vm_object *obj, uint64_t off, uint64_t file_end);
+/* mmap() of a device file whose vnode has an mmap callback (MAP_SHARED). */
+int64_t vm_mmap_dev(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off);
+/* From a device mapping's fault(): map `phys` at `va`, which must lie in a
+ * device region of mm (the faulting process's, already locked). `cache`
+ * holds the PTE's PWT/PCD/PAT bits (0x08 write-combining, 0x18 uncached).
+ * 0, -EFAULT or -ENOMEM. */
+int     vm_dev_insert(struct mm *mm, uint64_t va, uint64_t phys, uint64_t cache);
+/* The driver moved or freed the memory behind [start, end) of a device
+ * region: unmap it, so the next touch faults again. Callable without the
+ * address space's lock; the driver keeps its own faults out meanwhile. */
+void    vm_dev_zap(struct mm *mm, uint64_t start, uint64_t end);
 int     vm_munmap(struct mm *mm, uint64_t addr, uint64_t len);
 int     vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot);
 int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int flags, uint64_t naddr);

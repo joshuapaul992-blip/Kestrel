@@ -597,7 +597,8 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
               procfs.c       /proc: version uptime meminfo stat loadavg cpuinfo mounts filesystems tasks,
                              PID/{stat,status,cmdline,comm}, self/
                              interrupts cmdline kmsg syscalls
-              sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/
+              sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/,
+                             PCI functions and DRM nodes (devices/pci0000:00/, bus/pci/, class/drm/, dev/char/)
 net/          core.c         packets, interfaces, routes, loopback, the netd thread, boot options
               arp.c ipv4.c   Ethernet and ARP, IPv4 (fragments, reassembly), ICMP
               udp.c tcp.c    UDP, raw and ping sockets; TCP
@@ -666,8 +667,10 @@ linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see 
   src/lib.c selftest.c       strings, kstrto*, bitmaps; the linuxkpi.selftest=1 self-test
   src/ww_mutex.c dma-fence.c wound/wait mutexes and SRCU; DMA fences, fence arrays and chains
   src/sort.c                 sort, sort_r, list_sort
-  src/drm.c                  what DRM needs beyond its MIT files: drm_managed, sysfs and PRIME
-                             stubs, anonymous files, boot_cpu_data; the linuxkpi.drm switch
+  src/drm.c                  what DRM needs beyond its MIT files: drm_managed, the /dev/dri
+                             names, PRIME stubs, anonymous files, boot_cpu_data; linuxkpi.drm
+  src/mmap.c                 drivers' memory mapped into processes: vm_area_struct, faults,
+                             vmf_insert_pfn_prot, unmap_mapping_range
   src/drm_kestrel.c          drm_fbdev_ttm_setup(): Kestrel's terminals on DRM drivers
 third_party/linux/           unmodified Linux v6.12 code built through the KPI (pvpanic,
                              i6300esb; the DRM core, TTM and bochs), with their upstream
@@ -1304,7 +1307,7 @@ BARs are the ones the firmware assigned. *Stubs:* power states are recorded only
 
 The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNNING`), or whose limit is shorter than the timeout asked for. *Stubs:* there are no pretimeout governors and no sysfs attributes.
 
-**Not there at all.** Networking (`net_device`, NAPI, sk_buff), block devices and the block layer, input, DRM for user space (ioctls, PRIME, `mmap` of buffers), USB, ACPI and device tree, sysfs, debugfs, procfs entries, hrtimers, per-CPU variables, the full radix-tree IDR, `struct file` beyond the fields above, and `mmap` of device memory.
+**Not there at all.** Networking (`net_device`, NAPI, sk_buff), block devices and the block layer, input, PRIME, USB, ACPI and device tree, sysfs beyond the DRM nodes, debugfs, procfs entries, hrtimers, per-CPU variables, the full radix-tree IDR, and `struct file` beyond the fields above.
 
 ### Testing
 
@@ -1342,11 +1345,11 @@ The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNN
 - TTM and `drm_gem_vram_helper`, since bochs keeps its buffers in VRAM;
 - `dma-resv.c`, `lib/rbtree.c` and `lib/xarray.c`.
 
-What Linux keeps under GPL-2.0 is written in the KPI: `ww_mutex`, `dma-fence` (with arrays and chains), SRCU, `drm_managed`, `drm_device.h`, seqlocks, `iosys-map`, `sort`/`list_sort`, `kthread_worker`, and stubs for DRM's sysfs, PRIME and sync objects.
+What Linux keeps under GPL-2.0 is written in the KPI: `ww_mutex`, `dma-fence` (with arrays and chains), SRCU, `drm_managed`, `drm_device.h`, seqlocks, `iosys-map`, `sort`/`list_sort`, `kthread_worker`, and stubs for PRIME and sync objects.
 
 **Kestrel's display client** (`linuxkpi/src/drm_kestrel.c`) stands in for fbdev: drivers call `drm_fbdev_ttm_setup()`, which here is an in-kernel DRM client. It lights each connected monitor at its preferred mode, gives each CRTC an XRGB8888 frame buffer and hands it to Kestrel through `lkpi_display_add()`, which calls `display_register()`; `tty_add_monitor()` then gives the monitor a terminal and its `/dev/ttyN` and `/dev/fbN`. VRAM that scans out as it is written is drawn directly; other buffers get Kestrel's changed lines through `write_span()`, and a worker reports the damage to the driver. Each head also lists its connector's progressive modes; a mode switch (`KFB_SET_MODE`) creates a frame buffer of the new size, commits the new mode on it, moves the monitor over with `lkpi_display_update()` and frees the old buffer. A buffer that shares a 2 MiB page with the driver's uncached mappings gets its own 4 KiB pages made write-combining.
 
-**Who drives which adapter.** Linux DRM drivers bind by default. With `linuxkpi.drm=0` or Safe Mode (`display_linux_drm()`), `video_firmware_drivers_only()` is true, and bochs and nouveau decline every device. An adapter Kestrel itself programs (an NVIDIA card under `nvidia.modeset=`) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (…), not offered to …`. With `-vga std -device bochs-display`, monitor 2 comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under Kestrel's old native DISPI driver, and the same pixels on screen, which is why that driver was retired. User space gets no DRM ioctls yet.
+**Who drives which adapter.** Linux DRM drivers bind by default. With `linuxkpi.drm=0` or Safe Mode (`display_linux_drm()`), `video_firmware_drivers_only()` is true, and bochs and nouveau decline every device. An adapter Kestrel itself programs (an NVIDIA card under `nvidia.modeset=`) is never offered to a Linux driver: the PCI device carries `lkpi_native`, and the log says `Kestrel drives it (…), not offered to …`. With `-vga std -device bochs-display`, monitor 2 comes up with the same mode (1280x800 at 75 Hz), pitch, VRAM address and EDID name ("QEMU Monitor") as under Kestrel's old native DISPI driver, and the same pixels on screen, which is why that driver was retired. Programs reach the drivers through `/dev/dri` (step 3, below).
 
 **Taking over the boot display.** The boot frame buffer is only the firmware's mode, so the adapter behind it is offered to Linux drivers too: nouveau on a primary NVIDIA card, bochs on QEMU's `-vga std`. Before such a driver touches the card it calls `aperture_remove_conflicting_pci_devices()`, whose `sysfb_disable()` reaches `display_handover()`:
 - nothing writes to the old frame buffer from then on, because the driver reprograms the card and the old VRAM gets other uses; tty1 (the system console) and the panic screen keep drawing into RAM;
@@ -1361,10 +1364,15 @@ On QEMU (`-vga std -device bochs-display`, BIOS and OVMF) bochs takes monitor 0 
 **Step 2, nouveau (runs on a Quadro P2000).** `drivers/gpu/drm/nouveau` is MIT-licensed (Red Hat's terms), so it is vendored whole from v6.12, with what it needs: the DisplayPort and HDMI helpers, the GPU scheduler, `drm_exec`, `drm_gpuvm`, `drm_encoder_slave`, `i2c-algo-bit` and the maple tree (`third_party/linux/NOUVEAU.md` lists every file, its license and checksum). `make LKPI_NOUVEAU=1` compiles its 715 files and links them into the kernel; switching the variable relinks.
 - The build follows nouveau's Kbuild file (`linuxkpi/nouveau/files.mk`). `linuxkpi/nouveau/` holds 53 headers written in the KPI where the originals are GPL-2.0-only, and comes first on the include path.
 - Tracepoints are empty, and the I2C core (`linuxkpi/src/i2c.c`), PCI ROM access, `vmap()` of scattered pages (a window in the kernel map, `mm/vmm.c`) and the rest are in the KPI.
-- Sync objects and PRIME only serve user space, which has no DRM device files yet: their handles name nothing.
+- Sync objects and PRIME answer `EOPNOTSUPP` to programs until dma-buf and sync_file are written (step 3).
 - Kestrel's own VBIOS parser is named `kvbios_*`, so it no longer clashes with nouveau's `nvbios_*`.
 
 nouveau takes the boot display over like bochs does (above). Without firmware in `/lib/firmware/nvidia` nouveau runs display-only. `make usbimg NVIDIA_FW=<file>` adds NVIDIA's signed firmware for Maxwell 2 to Turing (`tools/nvfirmware.py`; the GSP images of later chips are left out), from Ubuntu's `linux-firmware-nvidia-graphics` .deb (`apt-get download linux-firmware-nvidia-graphics`) or a linux-firmware tree, with NVIDIA's license next to it. The files are NVIDIA's, redistributable unmodified for open-source systems, and never committed here. `nouveau.noaccel=1` keeps nouveau display-only even with the firmware present. QEMU can only show that nouveau registers and finds nothing; on a Quadro P2000 (Pascal) it drives two monitors, a 2560x1440 one included, as one X desktop. Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback, and its stage 1 still writes the card's report.
+
+**Step 3, DRM for programs (0.3.6, in progress).** Each DRM device has its nodes in `/dev/dri` (`card0`, 226:0, mode 0660; `renderD128` and up, 0666, for drivers that render), and the ioctls run through DRM's own `drm_ioctl()`: the version and capabilities, the KMS objects, setting modes, page flips with their events (`poll` and `read` on the node), dumb buffers and GEM.
+- **Mapped buffers.** `mmap()` of a DRM node reaches the driver's `f_op->mmap` with a `vm_area_struct` that lives as long as Kestrel's region (`linuxkpi/src/mmap.c`). Kestrel's device regions (`vm_mmap_dev()` in `mm/vm.c`) are shared, filled in page by page by the driver's fault handler (`vmf_insert_pfn_prot()`, write-combining or uncached as TTM asks), not copied by `fork()` (the child faults the pages in again), and split, shrunk and unmapped like other regions. When TTM moves a buffer, `unmap_mapping_range()` takes its pages out of every process that maps it, and the next touch faults in the new place.
+- **`/sys`.** libdrm, libpciaccess and Mesa find a GPU through sysfs, so `/sys` has Linux's layout for it: `devices/pci0000:00/<slot>` for every PCI function (vendor, device, class, revision, `config`, `resource`, `uevent` with `PCI_SLOT_NAME`, `boot_vga`), `bus/pci/devices` and `bus/pci/drivers/<driver>` links, each DRM node under its PCI function (`drm/card0` with `dev` and `uevent`), and `class/drm/card0` and `dev/char/226:0` links. libdrm's `drmdevice` finds bochs in QEMU, and its `modetest` lists the connector's modes and sets one.
+- **Test:** `drmtest` (in `/bin`) checks the sysfs entries the way libdrm reads them, the version and capabilities, the KMS objects, two dumb buffers drawn through their mappings and read back, `SETCRTC`, a page flip and its event, the mapping after `fork()` and a partial `munmap()`, the render node when there is one, and the terminal's frame buffer coming back after the last close. `drmtest -h N` keeps the colour bars up for N seconds.
 
 ## Memory map at boot
 

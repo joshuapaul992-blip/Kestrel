@@ -52,7 +52,7 @@ struct page *pfn_to_page(unsigned long pfn)
 struct page *alloc_pages(gfp_t gfp, unsigned int order)
 {
     if (order > MAX_PAGE_ORDER) return NULL;
-    unsigned long phys = lkpi_frames_alloc(1UL << order, !!(gfp & (__GFP_DMA | __GFP_DMA32)));
+    unsigned long phys = lkpi_frames_alloc_order(order, !!(gfp & (__GFP_DMA | __GFP_DMA32)));
     if (!phys) {
         if (!(gfp & __GFP_NOWARN))
             printk(KERN_WARNING "linuxkpi: page allocation failure: order %u\n", order);

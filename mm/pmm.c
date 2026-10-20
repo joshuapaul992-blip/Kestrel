@@ -194,15 +194,17 @@ void pmm_init(uintptr_t mbi)
             top > BOOT_MAP_END ? (top - BOOT_MAP_END) >> 20 : 0, _kernel_start, _kernel_end);
 }
 
-/* A run of n free frames in [lo, hi), starting at *hint and wrapping round
- * to lo. Whole words and bytes of the bitmap in use are skipped at once. */
-static uint64_t find_run(size_t n, uint64_t lo, uint64_t hi, uint64_t *hint)
+/* A run of n free frames in [lo, hi) that starts at a multiple of `align`
+ * frames (a power of two), searched from *hint and wrapping round to lo.
+ * Whole words and bytes of the bitmap in use are skipped at once. */
+static uint64_t find_run(size_t n, size_t align, uint64_t lo, uint64_t hi, uint64_t *hint)
 {
     uint64_t from = *hint >= lo && *hint < hi ? *hint : lo;
     for (int pass = 0; pass < 2; pass++) {
         uint64_t run = 0, start = pass ? lo : from, stop = pass ? from + n : hi;
         if (stop > hi) stop = hi;
         for (uint64_t f = start; f < stop; f++) {
+            if (!run && (f & (align - 1))) { f |= align - 1; continue; }   /* to the next start allowed */
             if (!(f & 63) && ((const uint64_t *)bitmap)[f >> 6] == ~0ull) { run = 0; f += 63; continue; }
             if (!(f & 7) && bitmap[f >> 3] == 0xFF) { run = 0; f += 7; continue; }
             if (is_used(f)) { run = 0; continue; }
@@ -219,25 +221,29 @@ static uint64_t find_run(size_t n, uint64_t lo, uint64_t hi, uint64_t *hint)
 }
 
 /* High memory first, so RAM below 4 GiB stays for devices that need it. */
-static uint64_t alloc_run(size_t n, bool dma32)
+static uint64_t alloc_run(size_t n, size_t align, bool dma32)
 {
     uint64_t top = highest / PAGE_SIZE, low_top = top < LOW_LIMIT ? top : LOW_LIMIT, first = 0;
     uint64_t flags = spin_lock_irqsave(&lock);
     /* a side without n free frames is not searched: once RAM above 4 GiB
      * is used up, each allocation would scan all of it in vain */
-    if (!dma32 && top > LOW_LIMIT && free_frames - free_low >= n) first = find_run(n, LOW_LIMIT, top, &hint_high);
-    if (!first && free_low >= n) first = find_run(n, FIRST_FRAME, low_top, &hint_low);
+    if (!dma32 && top > LOW_LIMIT && free_frames - free_low >= n) first = find_run(n, align, LOW_LIMIT, top, &hint_high);
+    if (!first && free_low >= n) first = find_run(n, align, FIRST_FRAME, low_top, &hint_low);
     spin_unlock_irqrestore(&lock, flags);
     if (!first) return 0;
     memset((void *)(first * PAGE_SIZE), 0, n * PAGE_SIZE);
     return first * PAGE_SIZE;
 }
 
-uint64_t pmm_alloc_contig(size_t n) { return alloc_run(n, false); }
-uint64_t pmm_alloc(void) { return alloc_run(1, false); }
+uint64_t pmm_alloc_contig(size_t n) { return alloc_run(n, 1, false); }
+uint64_t pmm_alloc(void) { return alloc_run(1, 1, false); }
 
 /* Below 4 GiB, for devices that take 32-bit bus addresses (RTL8139). */
-uint64_t pmm_alloc_dma32(size_t n) { return alloc_run(n, true); }
+uint64_t pmm_alloc_dma32(size_t n) { return alloc_run(n, 1, true); }
+
+/* 2^order frames starting at a multiple of their size, as Linux's buddy
+ * allocator hands them out. */
+uint64_t pmm_alloc_order(unsigned order, bool dma32) { return alloc_run((size_t)1 << order, (size_t)1 << order, dma32); }
 
 void pmm_free_contig(uint64_t phys, size_t n)
 {

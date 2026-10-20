@@ -98,7 +98,7 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
     if (!vn) return NULL;
     strlcpy(vn->name, name, sizeof vn->name);
     vn->type  = t;
-    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : S_IFREG);
+    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : t == VLNK ? S_IFLNK : S_IFREG);
     vn->ino   = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);
     vn->ops   = ops;
     vn->fs    = fs;

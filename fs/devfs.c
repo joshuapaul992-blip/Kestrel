@@ -313,18 +313,34 @@ void devfs_add_monitor(int i)
     devfs_register(name, 0660, MKDEV(29, (uint32_t)i), &fb_ops, tty_get(i));
 }
 
+/* `name` may have one directory in front ("dri/card0"), made on first use. */
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx)
 {
     if (!devfs_root) return NULL;
-    struct vnode *d = vfs_node_new(devfs_root->fs, name, VCHR, mode, ops);
+    const char *slash = strchr(name, '/');
+    struct vnode *d = vfs_node_new(devfs_root->fs, slash ? slash + 1 : name, VCHR, mode, ops);
     if (!d) return NULL;
     d->rdev = rdev;
     d->ctx = ctx;
     vfs_tree_lock(true);                                /* devices come and go after boot (USB) */
-    vfs_node_add(devfs_root, d);
+    struct vnode *dir = devfs_root;
+    if (slash) {
+        char dname[32];
+        size_t n = (size_t)(slash - name);
+        if (n >= sizeof dname) n = sizeof dname - 1;
+        memcpy(dname, name, n);
+        dname[n] = 0;
+        for (dir = devfs_root->children; dir; dir = dir->sibling)
+            if (dir->type == VDIR && !strcmp(dir->name, dname)) break;
+        if (!dir) {
+            dir = vfs_node_new(devfs_root->fs, dname, VDIR, 0755, NULL);
+            if (dir) vfs_node_add(devfs_root, dir);
+        }
+    }
+    if (dir) vfs_node_add(dir, d);
     vfs_tree_unlock();
-    return d;
+    return dir ? d : NULL;
 }
 
 void devfs_init(const char *mountpoint)

@@ -234,12 +234,16 @@ struct pci_scan_stats {
  * ============================================================================ */
 
 /* Raw configuration access (offset is byte-granular; 16/32-bit accesses
- * must be naturally aligned). Interrupts are disabled around each access. */
+ * must be naturally aligned). Each access runs with interrupts disabled
+ * under a lock, so any CPU may make one. */
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 uint8_t  pci_read8 (uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 void     pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v);
 void     pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint16_t v);
+/* Real 1-, 2- or 4-byte configuration cycles (not in test builds). */
+uint32_t pci_cfg_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, int size);
+void     pci_cfg_write(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, int size, uint32_t v);
 
 /* True if the platform answers Configuration Mechanism #1. */
 bool pci_mech1_present(void);

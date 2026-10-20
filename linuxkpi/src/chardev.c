@@ -376,9 +376,15 @@ static int node_poll(void *f, int events)
     return (int)(mask & ((__poll_t)events | POLLERR | POLLHUP));
 }
 
+static int node_mmap(void *f, struct lkpi_mmap *m)
+{
+    struct lkpi_file *lf = f;
+    return lkpi_file_mmap(&lf->file, m);
+}
+
 static const struct lkpi_cdev_ops node_ops = {
     .open = node_open, .release = node_release, .read = node_read, .write = node_write,
-    .ioctl = node_ioctl, .poll = node_poll,
+    .ioctl = node_ioctl, .poll = node_poll, .mmap = node_mmap,
 };
 
 void *lkpi_devnode_add(struct device *dev)
@@ -398,6 +404,9 @@ void *lkpi_devnode_add(struct device *dev)
     }
     dn->devt = dev->devt;
     dn->node = lkpi_cdev_add(name, mode ? mode : 0600, MAJOR(dev->devt), MINOR(dev->devt), &node_ops, dn);
+    if (dn->node && dev->class)
+        lkpi_sysfs_class_dev(lkpi_pci_handle_of(dev), dev->class->name, dev_name(dev), name,
+                             MAJOR(dev->devt), MINOR(dev->devt));
     kfree(tmp);
     if (!dn->node) {
         printk(KERN_WARNING "linuxkpi: cannot create /dev/%s\n", dev_name(dev));

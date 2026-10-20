@@ -51,7 +51,10 @@ unsigned long lkpi_totalram_pages(void);
 #define VM_WRITE                0x00000002
 #define VM_EXEC                 0x00000004
 #define VM_SHARED               0x00000008
+#define VM_MAYREAD              0x00000010
 #define VM_MAYWRITE             0x00000020
+#define VM_MAYEXEC              0x00000040
+#define VM_MAYSHARE             0x00000080
 #define VM_PFNMAP               0x00000400
 #define VM_IO                   0x00004000
 #define VM_DONTCOPY             0x00020000
@@ -83,18 +86,14 @@ static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags) 
 static inline void vm_flags_mod(struct vm_area_struct *vma, vm_flags_t set, vm_flags_t clear)
 { vma->vm_flags = (vma->vm_flags | set) & ~clear; }
 pgprot_t vm_get_page_prot(unsigned long vm_flags);
-/* inserting pages into a process: not available, every fault fails */
-static inline vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot)
-{ return VM_FAULT_SIGBUS; }
-static inline vm_fault_t vmf_insert_pfn(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
-{ return VM_FAULT_SIGBUS; }
-static inline vm_fault_t vmf_insert_page(struct vm_area_struct *vma, unsigned long addr, struct page *page)
-{ return VM_FAULT_SIGBUS; }
+/* inserting pages into a process from a fault (src/mmap.c) */
+vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot);
+vm_fault_t vmf_insert_pfn(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn);
+vm_fault_t vmf_insert_page(struct vm_area_struct *vma, unsigned long addr, struct page *page);
 static inline int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, unsigned long size,
                                   pgprot_t prot) { return -ENOSYS; }
 #define io_remap_pfn_range              remap_pfn_range
-static inline void unmap_mapping_range(struct address_space *mapping, loff_t const holebegin,
-                                       loff_t const holelen, int even_cows) { }
+void unmap_mapping_range(struct address_space *mapping, loff_t const holebegin, loff_t const holelen, int even_cows);
 static inline int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len,
                                     unsigned int gup_flags) { return -ENOSYS; }
 

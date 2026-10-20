@@ -208,6 +208,17 @@ static void drm_sysfs_release(struct device *dev)
     kfree(dev);
 }
 
+/* /dev/dri/card0, /dev/dri/renderD128, as Linux's drm_devnode() names them */
+static char *drm_devnode(const struct device *dev, umode_t *mode)
+{
+    const struct drm_minor *minor = dev_get_drvdata(dev);
+
+    if (mode) *mode = minor && minor->type == DRM_MINOR_RENDER ? 0666 : 0660;
+    return kasprintf(GFP_KERNEL, "dri/%s", dev_name(dev));
+}
+
+static const struct class drm_kpi_class = { .name = "drm", .devnode = drm_devnode };
+
 struct device *drm_sysfs_minor_alloc(struct drm_minor *minor)
 {
     const char *minor_str;
@@ -223,6 +234,7 @@ struct device *drm_sysfs_minor_alloc(struct drm_minor *minor)
         minor_str = minor->type == DRM_MINOR_RENDER ? "renderD%d" : "card%d";
     }
     kdev->devt = MKDEV(DRM_MAJOR, minor->index);
+    kdev->class = &drm_kpi_class;
     kdev->parent = minor->dev->dev;
     kdev->release = drm_sysfs_release;
     dev_set_drvdata(kdev, minor);

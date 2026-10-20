@@ -8,6 +8,7 @@
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/posix.h>
+#include <kernel/vm.h>
 #include "../include/lkpi/glue.h"
 
 struct cdev_node {
@@ -58,6 +59,73 @@ static int cdev_poll(struct file *f, int events)
     return o->node->ops->poll(o->file, events);
 }
 
+/* mmap: Kestrel's device-mapping callbacks forward to the Linux side's,
+ * through a small record per region. */
+struct dmap {
+    const struct lkpi_mmap_ops *ops;
+    void *ctx;
+};
+
+static int dmap_fault(void *c, uint64_t va, bool write)
+{
+    struct dmap *d = c;
+    return d->ops->fault(d->ctx, va, write);
+}
+
+static void *dmap_dup(void *c, struct mm *mm, uint64_t start, uint64_t end, uint64_t off)
+{
+    struct dmap *d = c, *n = kmalloc(sizeof *n);
+    if (!n) return NULL;
+    n->ops = d->ops;
+    n->ctx = d->ops->dup(d->ctx, mm, start, end, off);
+    if (!n->ctx) { kfree(n); return NULL; }
+    return n;
+}
+
+static void dmap_resize(void *c, uint64_t start, uint64_t end, uint64_t off)
+{
+    struct dmap *d = c;
+    d->ops->resize(d->ctx, start, end, off);
+}
+
+static void dmap_close(void *c)
+{
+    struct dmap *d = c;
+    d->ops->close(d->ctx);
+    kfree(d);
+}
+
+static const struct vm_devmap_ops dmap_ops = {
+    .fault = dmap_fault, .dup = dmap_dup, .resize = dmap_resize, .close = dmap_close,
+};
+
+static int cdev_mmap(struct file *f, struct vm_devmap *m)
+{
+    struct cdev_open *o = of(f);
+    if (!o->node->ops->mmap) return -ENODEV;
+    struct dmap *d = kmalloc(sizeof *d);
+    if (!d) return -ENOMEM;
+    struct lkpi_mmap lm = { .start = m->start, .end = m->end, .off = m->off, .prot = m->prot,
+                            .flags = m->flags, .mm = m->mm };
+    int r = o->node->ops->mmap(o->file, &lm);
+    if (r) { kfree(d); return r; }
+    d->ops = lm.ops;
+    d->ctx = lm.ctx;
+    m->ops = &dmap_ops;
+    m->ctx = d;
+    return 0;
+}
+
+int lkpi_vm_insert(void *mm, unsigned long va, unsigned long phys, unsigned long cache)
+{
+    return vm_dev_insert(mm, va, phys, cache);
+}
+
+void lkpi_vm_zap(void *mm, unsigned long start, unsigned long end)
+{
+    vm_dev_zap(mm, start, end);
+}
+
 static void cdev_release(struct file *f)
 {
     struct cdev_open *o = of(f);
@@ -67,7 +135,7 @@ static void cdev_release(struct file *f)
 
 static const struct vnode_ops open_ops = {
     .fread = cdev_fread, .fwrite = cdev_fwrite, .fioctl = cdev_fioctl,
-    .poll = cdev_poll, .release = cdev_release,
+    .poll = cdev_poll, .release = cdev_release, .mmap = cdev_mmap,
 };
 
 static int cdev_open(struct vnode *vn, int flags, struct file **out)
@@ -118,3 +186,11 @@ void lkpi_cdev_remove(void *node)
     struct cdev_node *n = node;
     if (n && n->vn) n->vn->ops = &gone_ops;
 }
+
+void lkpi_sysfs_class_dev(void *pci, const char *cls, const char *name, const char *devname,
+                          unsigned int major, unsigned int minor)
+{
+    sysfs_class_dev(pci, cls, name, devname, major, minor);
+}
+
+void lkpi_sysfs_pci_driver(void *pci, const char *driver) { sysfs_pci_driver(pci, driver); }
