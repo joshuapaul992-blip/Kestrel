@@ -138,7 +138,8 @@ static void console_key(const struct usb_key_event *ev)
 
 static void on_key(const struct usb_key_event *ev)
 {
-    if (kinput_grabbed()) { kinput_usb_key(ev->usage, ev->pressed, ev->repeat); return; }
+    kinput_usb_key(ev->usage, ev->pressed, ev->repeat);  /* display servers' queues */
+    if (kinput_grabbed()) return;
     pend(&(struct pending_ev){ .key = true, .k = *ev });
 }
 
@@ -146,10 +147,8 @@ static void on_key(const struct usb_key_event *ev)
 static void on_mouse(const struct usb_mouse_event *ev)
 {
     __atomic_add_fetch(&mouse_reports, 1, __ATOMIC_RELAXED);
-    if (kinput_grabbed()) {                     /* the display server draws its own cursor */
-        kinput_usb_mouse(ev->dx, ev->dy, ev->wheel, ev->buttons);
-        return;
-    }
+    kinput_usb_mouse(ev->dx, ev->dy, ev->wheel, ev->buttons);
+    if (kinput_grabbed()) return;               /* the display server draws its own cursor */
     pend(&(struct pending_ev){ .key = false, .m = *ev });
 }
 

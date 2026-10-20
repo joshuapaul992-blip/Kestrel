@@ -14,6 +14,8 @@
 #include <kernel/cpu.h>
 #include <kernel/mm.h>
 #include <kernel/tty.h>
+#include <kernel/kinput.h>
+#include <kernel/uaccess.h>
 
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 
@@ -48,6 +50,7 @@ static const struct vnode_ops random_ops = { .read = random_read, .write = sink_
  *   /dev/tty         the calling task's TTY (shell, its utilities)
  *   /dev/console     TTY 0, the system console
  *   /dev/tty1 ...    the TTY of monitor 0, 1, ... (Linux numbering: Ctrl+Alt+F1 = tty1)
+ *   /dev/tty0        the TTY with the keyboard focus (Linux: the foreground VT)
  *
  * The line discipline lives in tty.c and keeps its line in that TTY's own
  * input_buffer. Without any TTY (no usable frame buffer) the text console
@@ -127,7 +130,131 @@ static int devtty_ioctl(struct vnode *v, unsigned long req, void *arg)
     return -ENOTTY;
 }
 
-static const struct vnode_ops tty_ops     = { .read = devtty_read, .write = devtty_write, .ioctl = devtty_ioctl };
+/* ---- Linux's VT and KD ioctls, for X servers that take a terminal over ------
+ * Kestrel's VTs are its monitors' terminals, all on screen at once, and the
+ * "active" one is the one with the keyboard focus. What an X server asks:
+ *   KDSETMODE KD_GRAPHICS   the terminal stops drawing on its monitor
+ *   KDSKBMODE K_OFF/K_RAW   the terminals stop taking keys (X reads them
+ *                           from /dev/input), until K_XLATE/K_UNICODE
+ *   VT_GETSTATE, VT_OPENQRY the focused terminal; VT_ACTIVATE moves the focus
+ *   VT_SETMODE              kept and handed back; Kestrel never switches VTs
+ *                           under a program, so it sends no signals
+ * The file that changed the modes puts them back when it closes, so a
+ * crashed X server leaves a working console. Arguments are the caller's
+ * own pointers (none of these is in sys_ioctl's table). */
+#define KDGKBTYPE   0x4B33
+#define KDGETMODE   0x4B3B
+#define KDGKBMODE   0x4B44
+#define KDSKBMODE   0x4B45
+#define KDGETLED    0x4B31
+#define KDSETLED    0x4B32
+#define KDGKBLED    0x4B64
+#define KDSKBLED    0x4B65
+#define VT_OPENQRY  0x5600
+#define VT_GETMODE  0x5601
+#define VT_SETMODE  0x5602
+#define VT_GETSTATE 0x5603
+#define VT_RELDISP  0x5605
+#define VT_ACTIVATE 0x5606
+#define VT_WAITACTIVE 0x5607
+#define K_RAW       0
+#define K_MEDIUMRAW 2
+#define K_UNICODE   3
+#define K_OFF       4
+
+struct vt_mode { char mode, waitv; int16_t relsig, acqsig, frsig; };
+struct vt_stat { uint16_t v_active, v_signal, v_state; };
+
+static struct kmutex vt_lock;
+static struct file *vt_owner;           /* changed the KD modes: puts them back at close */
+static int  vt_graphics = -1;           /* the TTY in KD_GRAPHICS, or -1 */
+static int  vt_kbmode = K_UNICODE;
+static struct vt_mode vt_mode;
+
+static int put_int(void *uarg, int v) { return copy_to_user(uarg, &v, sizeof v) ? -EFAULT : 0; }
+
+static int vt_ioctl(struct file *f, int idx, unsigned long req, void *arg)
+{
+    int r = 0;
+    switch (req) {
+    case KDGKBTYPE: { char kb = 0x02; return copy_to_user(arg, &kb, 1) ? -EFAULT : 0; }    /* KB_101 */
+    case KDGETLED: case KDGKBLED: { char l = 0; return copy_to_user(arg, &l, 1) ? -EFAULT : 0; }
+    case KDSETLED: case KDSKBLED: return 0;
+    case KDGETMODE: return put_int(arg, vt_graphics == idx);
+    case KDGKBMODE: return put_int(arg, vt_kbmode);
+    case VT_OPENQRY: return put_int(arg, active_keyboard_tty + 1);
+    case VT_GETSTATE: {
+        struct vt_stat st = { (uint16_t)(active_keyboard_tty + 1), 0, 0 };
+        for (int i = 0; i < tty_count && i < 15; i++) st.v_state |= (uint16_t)(1u << (i + 1));
+        return copy_to_user(arg, &st, sizeof st) ? -EFAULT : 0;
+    }
+    case VT_GETMODE: return copy_to_user(arg, &vt_mode, sizeof vt_mode) ? -EFAULT : 0;
+    case VT_SETMODE: return copy_from_user(&vt_mode, arg, sizeof vt_mode) ? -EFAULT : 0;
+    case VT_RELDISP: case VT_WAITACTIVE: return 0;
+    case VT_ACTIVATE:
+        if ((uintptr_t)arg < 1 || (uintptr_t)arg > (uintptr_t)tty_count) return -ENXIO;
+        tty_set_focus((int)(uintptr_t)arg - 1);
+        return 0;
+    case KDSETMODE: case KDSKBMODE:
+        kmutex_lock(&vt_lock);
+        if (req == KDSETMODE) {
+            bool on = (uintptr_t)arg == 1;
+            if (on && vt_graphics < 0 && tty_set_graphics(idx, true) == 0) vt_graphics = idx;
+            else if (!on && vt_graphics == idx) { tty_set_graphics(idx, false); vt_graphics = -1; }
+        } else {
+            int m = (int)(uintptr_t)arg;
+            if (m < K_RAW || m > K_OFF) r = -EINVAL;
+            else { vt_kbmode = m; kinput_console_keys(m != K_OFF && m != K_RAW && m != K_MEDIUMRAW); }
+        }
+        if (!r) vt_owner = vt_graphics >= 0 || vt_kbmode != K_UNICODE ? f : NULL;
+        kmutex_unlock(&vt_lock);
+        return r;
+    }
+    return -ENOTTY;                     /* not one of these */
+}
+
+/* The same on a text terminal's console pty (fs/pty.c), whose slave /dev/ttyN is */
+int vt_console_ioctl(struct file *f, int idx, unsigned long req, void *arg) { return vt_ioctl(f, idx, req, arg); }
+
+static int vt_fioctl(struct file *f, unsigned long req, void *arg)
+{
+    struct kestrel_tty *t = vnode_tty(f->vn);
+    int r = vt_ioctl(f, t ? t->index : 0, req, arg);
+    return r == -ENOTTY ? devtty_ioctl(f->vn, req, arg) : r;
+}
+
+void vt_release(struct file *f)
+{
+    kmutex_lock(&vt_lock);
+    if (vt_owner == f) {
+        if (vt_graphics >= 0) tty_set_graphics(vt_graphics, false);
+        vt_graphics = -1;
+        vt_kbmode = K_UNICODE;
+        kinput_console_keys(true);
+        vt_mode = (struct vt_mode){ 0 };
+        vt_owner = NULL;
+    }
+    kmutex_unlock(&vt_lock);
+}
+
+static const struct vnode_ops tty_ops     = { .read = devtty_read, .write = devtty_write, .ioctl = devtty_ioctl,
+                                              .fioctl = vt_fioctl, .release = vt_release };
+
+/* /dev/tty0: the focused TTY */
+static ssize_t tty0_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
+{
+    (void)v; (void)o;
+    struct kestrel_tty *t = tty_get(active_keyboard_tty);
+    if (t) tty_write(t, buf, n);
+    return (ssize_t)n;
+}
+static int tty0_fioctl(struct file *f, unsigned long req, void *arg)
+{
+    int r = vt_ioctl(f, active_keyboard_tty, req, arg);
+    return r == -ENOTTY ? devtty_ioctl(f->vn, req, arg) : r;
+}
+static const struct vnode_ops tty0_ops    = { .read = null_read, .write = tty0_write, .fioctl = tty0_fioctl,
+                                              .release = vt_release };
 
 /* /dev/tty: the controlling terminal. A process in a pty session gets its
  * pty slave; everything else keeps Kestrel's own terminal (t->tty). */
@@ -355,6 +482,7 @@ void devfs_init(const char *mountpoint)
     add_dev(r, "kmsg",    0644, MKDEV(1, 11), &kmsg_ops);
     add_dev(r, "tty",     0666, MKDEV(5, 0),  &ctty_ops);
     add_tty(r, "console", 0600, MKDEV(5, 1),  &console_ops, tty_get(0));
+    add_tty(r, "tty0",    0620, MKDEV(4, 0),  &tty0_ops, NULL);
     for (int i = 0; i < tty_count; i++) {
         char name[8];
         snprintf(name, sizeof name, "tty%d", i + 1);

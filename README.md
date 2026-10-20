@@ -641,6 +641,7 @@ tools/mkusbimg.py            bootable USB stick image builder
 tools/mkbenchlinux.py        Ubuntu's kernel and an initramfs for the benchmark stick (benchlinux-init)
 ports/xlibre/                X server port: sysroot/server build scripts, hw-kestrel DDX, patches,
                              xdemo test client
+ports/xorg/                  XLibre's Xorg (glibc) with modesetting and evdev, for the Firefox root
 ports/icewm/                 IceWM build script and Kestrel configuration
 ports/lxpanel/               LXPanel rebuilt from Ubuntu's source with its panel-width patch (LXDE)
 ports/toolchain/             musl-g++ (C++ with libsupc++), pkg-config and CMake wrappers
@@ -1121,7 +1122,8 @@ Programs built for Ubuntu 24.04 run unmodified: the glibc dynamic loader, GLib a
 
 ```sh
 make lxpanel LXPANEL_SRC=lxpanel-0.10.1/            # apt-get source lxpanel; for LXDE's panel
-LOCAL_DEBS="build/lxpanel/lxpanel_0.10.1-4build5+kestrel1_amd64.deb" \
+ports/xorg/build.sh xserver/ xf86-input-evdev/ deps/ build   # optional: Xorg for DRM devices
+LOCAL_DEBS="build/lxpanel/lxpanel_0.10.1-4build5+kestrel1_amd64.deb" XORG_ROOT=build/xorg-root \
 tools/mkfirefoxroot.sh ffroot.tar firefox/          # Mozilla's tarball, unpacked
 make usbimg ROOTFS_BASE=ffroot.tar ROOTDISK_MB=2400
 ```
@@ -1372,7 +1374,10 @@ nouveau takes the boot display over like bochs does (above). Without firmware in
 **Step 3, DRM for programs (0.3.6, in progress).** Each DRM device has its nodes in `/dev/dri` (`card0`, 226:0, mode 0660; `renderD128` and up, 0666, for drivers that render), and the ioctls run through DRM's own `drm_ioctl()`: the version and capabilities, the KMS objects, setting modes, page flips with their events (`poll` and `read` on the node), dumb buffers and GEM.
 - **Mapped buffers.** `mmap()` of a DRM node reaches the driver's `f_op->mmap` with a `vm_area_struct` that lives as long as Kestrel's region (`linuxkpi/src/mmap.c`). Kestrel's device regions (`vm_mmap_dev()` in `mm/vm.c`) are shared, filled in page by page by the driver's fault handler (`vmf_insert_pfn_prot()`, write-combining or uncached as TTM asks), not copied by `fork()` (the child faults the pages in again), and split, shrunk and unmapped like other regions. When TTM moves a buffer, `unmap_mapping_range()` takes its pages out of every process that maps it, and the next touch faults in the new place.
 - **`/sys`.** libdrm, libpciaccess and Mesa find a GPU through sysfs, so `/sys` has Linux's layout for it: `devices/pci0000:00/<slot>` for every PCI function (vendor, device, class, revision, `config`, `resource`, `uevent` with `PCI_SLOT_NAME`, `boot_vga`), `bus/pci/devices` and `bus/pci/drivers/<driver>` links, each DRM node under its PCI function (`drm/card0` with `dev` and `uevent`), and `class/drm/card0` and `dev/char/226:0` links. libdrm's `drmdevice` finds bochs in QEMU, and its `modetest` lists the connector's modes and sets one.
-- **Test:** `drmtest` (in `/bin`) checks the sysfs entries the way libdrm reads them, the version and capabilities, the KMS objects, two dumb buffers drawn through their mappings and read back, `SETCRTC`, a page flip and its event, the mapping after `fork()` and a partial `munmap()`, the render node when there is one, and the terminal's frame buffer coming back after the last close. `drmtest -h N` keeps the colour bars up for N seconds.
+- **Keyboard and mouse as evdev devices.** `/dev/input/event0` (the keyboard, 13:64) and `event1` (the mouse, 13:65) give Linux's `struct input_event` records from the PS/2 and USB keyboards and mice, with the evdev ioctls X's evdev driver and libinput ask (version, ids, names, the event types and codes they send, key state, `EVIOCGRAB`, which takes the keys away from the text terminal). Both are in `/sys/class/input`.
+- **Terminals for X.** The VT and KD ioctls an X server makes on its terminal work on `/dev/tty1`..`ttyN` and `/dev/tty0` (the terminal in front): `VT_GETSTATE`, `VT_OPENQRY`, `VT_GETMODE`/`VT_SETMODE`, `VT_ACTIVATE`, `VT_WAITACTIVE`, `KDSETMODE` (`KD_GRAPHICS` stops the terminal drawing), `KDSKBMODE` (`K_OFF` stops it reading the keyboard) and the LED calls. Closing the terminal puts its modes back.
+- **Xorg.** On the Firefox image, `/bin/startx` runs XLibre's Xorg with its `modesetting` driver on `/dev/dri/card0` when there is one, with GLX and the evdev input driver (`/etc/X11/kestrel-xorg.conf`; Kestrel has no udev, so the devices are named there), and Xkestrel elsewhere (`KESTREL_X=xkestrel` asks for Xkestrel anyway). libpciaccess finds the GPU through `/sys`. `ports/xorg/build.sh` builds the server and the evdev driver on the Ubuntu host and `tools/mkfirefoxroot.sh` adds them, with the libraries they load, when `XORG_ROOT` names them. In QEMU (bochs) LXDE comes up on Xorg, `glxgears` runs on llvmpipe, and logging out gives the text terminal back.
+- **Test:** `evdevtest` (in `/bin`) checks the evdev ioctls, the grab, and the VT and KD ioctls; `evdevtest -w N` also waits N seconds for a key typed on the keyboard. `drmtest` (in `/bin`) checks the sysfs entries the way libdrm reads them, the version and capabilities, the KMS objects, two dumb buffers drawn through their mappings and read back, `SETCRTC`, a page flip and its event, the mapping after `fork()` and a partial `munmap()`, the render node when there is one, and the terminal's frame buffer coming back after the last close. `drmtest -h N` keeps the colour bars up for N seconds.
 
 ## Memory map at boot
 

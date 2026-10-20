@@ -38,8 +38,11 @@ struct kinput_event {
 
 #define KINPUT_GRAB     0x4b10  /* arg (int): 1 grab, 0 release */
 
-void kinput_init(void);                 /* registers /dev/kinput */
+void kinput_init(void);                 /* registers /dev/kinput and /dev/input/event* */
+/* True while the terminals must leave the keyboard and mouse alone: a display
+ * server holds /dev/kinput or an evdev device, or turned the console's keys off. */
 bool kinput_grabbed(void);
+void kinput_console_keys(bool on);      /* KDSKBMODE on a terminal: K_OFF/K_RAW off, else on */
 
 /* Producers (ISR context). */
 void kinput_ps2_byte(uint8_t scancode);                 /* raw set-1 byte */
