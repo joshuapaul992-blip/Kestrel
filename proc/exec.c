@@ -158,6 +158,12 @@ static int load_elf(struct mm *mm, const char *path, uint64_t bias_dyn, bool int
     if (!(ph = kmalloc(phbytes))) { rc = -ENOMEM; goto out; }
     if ((rc = read_exact(f, eh.e_phoff, ph, phbytes))) goto out;
 
+    /* A program linked at fixed low addresses gets the low window (uvm.h);
+     * this address space is still empty. Its interpreter must still be PIE. */
+    if (eh.e_type == ET_EXEC && interp && !mm->kpml4) {
+        if ((rc = mm_make_low(mm)) < 0) goto out;
+        task_use_mm(current_task(), mm);
+    }
     const uint64_t bias = eh.e_type == ET_DYN ? bias_dyn : 0;
     img->bias = bias;
     uint64_t last = 0, phdr_va = 0;
@@ -184,7 +190,7 @@ static int load_elf(struct mm *mm, const char *path, uint64_t bias_dyn, bool int
         if (!add_ok(p->p_offset, p->p_filesz, &fend) || fend > fsize) BAD("segment %d: outside the file", i);
         if (p->p_align > 1 && (p->p_align & (p->p_align - 1))) BAD("segment %d: alignment %lx", i, p->p_align);
         if ((p->p_vaddr - p->p_offset) & (UVM_PAGE - 1)) BAD("segment %d: address and offset not congruent", i);
-        if (!add_ok(bias, p->p_vaddr, &va) || !add_ok(va, p->p_memsz, &vend) || !uvm_range_ok(page_down(va), page_up(vend) - page_down(va)))
+        if (!add_ok(bias, p->p_vaddr, &va) || !add_ok(va, p->p_memsz, &vend) || !uvm_range_ok_mm(mm, page_down(va), page_up(vend) - page_down(va)))
             BAD("segment %d at %lx+%lx is outside the user half", i, va, p->p_memsz);
         if (any && va < last) BAD("segments not in ascending order");
         if ((p->p_flags & PF_W) && (p->p_flags & PF_X) && !allow_wx)
@@ -411,8 +417,7 @@ static int process_main(void *arg)
     uint64_t f = irq_save();
     t->mm = mm;
     t->user = false;                                    /* kernel thread until enter_user */
-    t->pml4 = t->cr3 = mm->pml4;
-    cpu_load_cr3(mm->pml4);
+    task_use_mm(t, mm);
     irq_restore(f);
 
     /* PATH as a Linux distribution sets it (Alpine keeps apk in /sbin and

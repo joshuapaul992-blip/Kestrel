@@ -28,6 +28,7 @@
 #include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/futex.h>
+#include <kernel/time.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
 
@@ -302,7 +303,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     files_put(ofiles); fs_put(ofs); sighand_put(osh);
     signal_put(unused);
     c->mm = mm;
-    c->pml4 = c->cr3 = mm->pml4;
+    task_use_mm(c, mm);
     c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);   /* each thread: its own TLS block */
     c->gs_base = rdmsr(0xC0000102);                     /* the parent's user GS (swapped out) */
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
@@ -422,13 +423,22 @@ static int de_thread(struct tcb *t)
 
 int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
 {
-    struct tcb *t = current_task();
-    struct int_frame *f = t->uframe;
-    if (!t->user || !f) return -EINVAL;
-
     int64_t rc = 0;
     char *path = ustrdup(upath, VFS_PATH_MAX, &rc);
     if (!path) return rc == -E2BIG ? -ENAMETOOLONG : rc;
+    return proc_execve_path(path, uargv, uenvp);
+}
+
+/* execve with the path already in the kernel (kmalloc'd; freed here):
+ * execveat builds it from its directory and name. */
+int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
+{
+    struct tcb *t = current_task();
+    struct int_frame *f = t->uframe;
+    if (!t->user || !f) { kfree(path); return -EINVAL; }
+
+    int64_t rc = 0;
+    char *abs = NULL;
     struct exec_args ea = { 0, 0, NULL, NULL };
     size_t bytes = 0;
     if ((rc = copy_vector(uargv, &ea.argv, &ea.argc, &bytes)) < 0 ||
@@ -438,6 +448,13 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     struct stat st;
     if ((rc = vfs_stat(path, &st)) < 0) goto out;
     if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111)) { rc = -EACCES; goto out; }
+    struct vnode *pv;
+    if ((rc = vfs_lookup(path, &pv)) < 0) goto out;
+    bool noexec = pv->fs && (pv->fs->flags & MNT_NOEXEC);
+    abs = kmalloc(VFS_PATH_MAX);                        /* /proc/PID/exe: the absolute path */
+    if (abs && vfs_path_of(pv, abs, VFS_PATH_MAX) < 0) { kfree(abs); abs = NULL; }
+    vfs_vnode_put(pv);
+    if (noexec) { rc = -EACCES; goto out; }             /* mounted noexec */
 
     /* Build the new image in a fresh address space; the old one stays
      * intact (and current again) if loading fails. */
@@ -445,8 +462,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     if (!nw) { rc = -ENOMEM; goto out; }
     uint64_t fl = spin_lock_irqsave(&proc_lock);        /* task_mm_get() */
     t->mm = nw;
-    t->pml4 = t->cr3 = nw->pml4;
-    cpu_load_cr3(nw->pml4);
+    task_use_mm(t, nw);
     spin_unlock_irqrestore(&proc_lock, fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
@@ -454,8 +470,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     if (rc < 0) {
         fl = spin_lock_irqsave(&proc_lock);
         t->mm = old;
-        t->pml4 = t->cr3 = old->pml4;
-        cpu_load_cr3(old->pml4);
+        task_use_mm(t, old);
         spin_unlock_irqrestore(&proc_lock, fl);
         mm_put(nw);
         goto out;
@@ -498,7 +513,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     t->alt_sp = t->alt_size = 0;
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe and comm */
-    strlcpy(t->exe, path, sizeof t->exe);
+    strlcpy(t->exe, abs ? abs : path, sizeof t->exe);
     strlcpy(t->name, base, sizeof t->name);
     spin_unlock_irqrestore(&proc_lock, fl);
     fl = irq_save();
@@ -524,6 +539,7 @@ out:
     free_strings(ea.argv, ea.argc);
     free_strings(ea.envp, ea.envc);
     kfree(path);
+    kfree(abs);
     return rc;
 }
 
@@ -765,6 +781,7 @@ static int send_info_locked(struct tcb *t, int sig, const struct ksig_info *info
         struct tcb *o = task_slot(i);
         if (thread_alive(o) && same_group(o, t) && !(blocked_of(o) & sigbit(sig))) w = o;
     }
+    g->shared_to[sig - 1] = w;
     if (w) task_interrupt(w);
     wakeup(&signal_wait_chan);
     return 0;
@@ -809,10 +826,28 @@ void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint6
 
 static uint64_t pending_of(const struct tcb *t) { return t->sig_pending | t->signal->shared_pending; }
 
+/* What this thread is to deliver: its own signals, and the process's that
+ * were not woken into another thread still able to take them. As on Linux,
+ * a thread that sends its process a signal leaves it to the one woken (the
+ * main thread when it can), so a main thread asleep in read() is the one
+ * that sees EINTR. */
+static uint64_t deliverable_of(const struct tcb *t)
+{
+    uint64_t own = t->sig_pending, shared = t->signal->shared_pending, out = 0;
+    while (shared) {
+        int sig = __builtin_ctzll(shared) + 1;
+        shared &= shared - 1;
+        const struct tcb *w = t->signal->shared_to[sig - 1];
+        if (!w || w == t || !thread_alive(w) || !same_group(w, t) || (blocked_of(w) & sigbit(sig)))
+            out |= sigbit(sig);
+    }
+    return (own | out) & ~blocked_of(t);
+}
+
 bool signal_pending(void)
 {
     struct tcb *t = current_task();
-    return t->user && (pending_of(t) & ~blocked_of(t));
+    return t->user && deliverable_of(t);
 }
 
 uint64_t signal_pending_mask(void)
@@ -822,15 +857,19 @@ uint64_t signal_pending_mask(void)
 }
 
 /* Sleep until a signal in mask is pending (signalfd), or one to deliver. */
-void signal_wait_mask(uint64_t mask)
+void signal_wait_mask(uint64_t mask) { signal_wait_mask_until(mask, 0); }
+
+/* The same, ending at deadline_ms of time_ms() as well (0: none). */
+void signal_wait_mask_until(uint64_t mask, uint64_t deadline_ms)
 {
     struct tcb *t = current_task();
     if (!t->user) return;
     uint64_t fl = spin_lock_irqsave(&proc_lock);        /* senders set pending, and wake, under it */
-    while (!(pending_of(t) & mask & ~UNBLOCKABLE) && !signal_pending())
-        sleep_on_locked(&signal_wait_chan, &proc_lock);
+    while (!(pending_of(t) & mask & ~UNBLOCKABLE) && !signal_pending() && (!deadline_ms || time_ms() < deadline_ms))
+        sleep_on_until_locked(&signal_wait_chan, deadline_ms, &proc_lock);
     spin_unlock_irqrestore(&proc_lock, fl);
 }
+
 
 int signal_dequeue(uint64_t mask, struct ksig_info *info)
 {
@@ -912,6 +951,19 @@ _Static_assert(sizeof(struct sigctx) == 256, "sigcontext layout");
 _Static_assert(sizeof(struct kucontext) == 304, "ucontext layout");
 _Static_assert(sizeof(struct ksiginfo) == 128, "siginfo layout");
 
+/* siginfo_t as Linux lays it out, for sig with the details in i
+ * (rt_sigtimedwait; signal frames build theirs the same way). */
+void signal_user_info(int sig, const struct ksig_info *i, void *out128)
+{
+    struct ksiginfo u;
+    memset(&u, 0, sizeof u);
+    u.si_signo = sig;
+    u.si_code = i->code;
+    if (fault_signal(sig) && i->trapno) u.u.fault.addr = i->addr;
+    else { u.u.kill.pid = i->pid; u.u.kill.uid = i->uid; u.u.kill.status = i->status; }
+    memcpy(out128, &u, sizeof u);
+}
+
 static bool user_code(uint64_t a) { return uvm_range_ok(a, 1); }
 
 #define FP_XSTATE_MAGIC1    0x46505853u         /* "FPXS", in the frame's sw_reserved bytes */
@@ -950,14 +1002,13 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, const struc
                         const struct ksig_info *si)
 {
     if (!(k->flags & SA_RESTORER) || !user_code(k->handler) || !user_code(k->restorer)) return false;
-    uint64_t sp = f->rsp - 128;                         /* skip the red zone */
+    uint64_t sp = f->rsp - 128, top = f->rsp;           /* skip the red zone */
     if ((k->flags & SA_ONSTACK) && t->alt_size && !sig_on_altstack(t, f->rsp))
-        sp = t->alt_sp + t->alt_size;                   /* sigaltstack(): a fresh stack */
-    uint64_t top = sp + 128 > f->rsp ? sp : f->rsp;
+        sp = top = t->alt_sp + t->alt_size;             /* sigaltstack(): a fresh stack */
     size_t fpu_bytes = fpu_xfeatures ? fpu_size + 4 : 512;  /* XSAVE: and FP_XSTATE_MAGIC2 */
     uint64_t fpu = (sp - fpu_bytes) & ~63ull;
     uint64_t frame = ((fpu - sizeof(struct rt_sigframe)) & ~15ull) - 8;   /* rsp+8 16-aligned */
-    if (frame < UVM_USER_START || top > UVM_USER_END || !user_range_ok(frame, top - frame)) return false;
+    if (top < frame || !user_range_ok(frame, top - frame)) return false;
 
     struct rt_sigframe fr;
     memset(&fr, 0, sizeof fr);
@@ -1072,7 +1123,7 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
     struct signal_struct *g = t->signal;
     for (;;) {
         uint64_t fl = spin_lock_irqsave(&proc_lock);    /* taken, with its action, in one go */
-        uint64_t ready = pending_of(t) & ~blocked_of(t);
+        uint64_t ready = deliverable_of(t);
         if (!ready) { spin_unlock_irqrestore(&proc_lock, fl); break; }
         int sig = (ready & sigbit(SIGKILL)) ? SIGKILL : __builtin_ctzll(ready) + 1;
         struct ksig_info info;

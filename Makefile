@@ -73,7 +73,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kerne
            drivers/font_8x16.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c drivers/virtio/virtio_blk.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
-           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
+           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/fuse.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c \
            kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/stopscreen.c kernel/vbe_emu.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
@@ -386,13 +386,19 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest
-USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest fusermount3
+USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS) nopietest))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
 	@mkdir -p $(dir $@)
 	@echo "  MUSLCC  $<"
 	@$(MUSL_CC) $(MUSL_CFLAGS) $< -o $@
+
+# Linked at a fixed low address (ET_EXEC): the kernel's low window (uvm.h).
+$(BUILD)/user/nopietest: user/nopietest.c
+	@mkdir -p $(dir $@)
+	@echo "  MUSLCC  $< (no PIE)"
+	@$(MUSL_CC) -std=gnu11 -O2 -g -Wall -Wextra -fno-pie -no-pie -static $< -o $@ -lpthread
 
 # Dynamically linked test program + shared library, and musl's dynamic loader
 # (libc.so doubles as /lib/ld-musl-x86_64.so.1) for the boot volume's /lib.
@@ -474,6 +480,8 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
 	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
+	@chmod 4755 $(ROOTFS_STAGE)/bin/fusermount3   # libfuse looks for a setuid one
+	@ln -sf fusermount3 $(ROOTFS_STAGE)/bin/fusermount
 	@if [ -n "$(DYN_FILES)" ]; then mkdir -p $(ROOTFS_STAGE)/lib && cp $(MUSL_LOADER) $(ROOTFS_STAGE)/lib/ld-musl-x86_64.so.1 && \
 	    cp $(BUILD)/user/libdyntest.so $(ROOTFS_STAGE)/lib/ && cp $(BUILD)/user/dyntest $(ROOTFS_STAGE)/bin/; fi
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi

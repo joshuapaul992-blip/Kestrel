@@ -2,6 +2,8 @@
 ;  arch/x86_64/switch.asm  --  kernel thread context switch + thread start
 ; =============================================================================
 
+%include "arch/x86_64/lowwin.inc"
+
 bits 64
 section .text
 
@@ -80,6 +82,7 @@ global user_return
 ; -----------------------------------------------------------------------------
 user_return:
     mov     rsp, rdi
+    EXIT_USER_CR3
     pop     r15
     pop     r14
     pop     r13
@@ -109,6 +112,7 @@ enter_user:
     push    0x202                       ; rflags: IF
     push    0x23                        ; cs: user code | RPL3
     push    rdi                         ; rip
+    EXIT_USER_CR3
     xor     eax, eax
     xor     ebx, ebx
     xor     ecx, ecx

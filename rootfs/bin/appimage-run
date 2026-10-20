@@ -1,0 +1,37 @@
+#!/bin/sh
+# /boot/bin/appimage-run -- start an AppImage
+#
+#   appimage-run [--extract] FILE [ARGS...]
+#
+# An AppImage is a runtime with a file system image appended. With FUSE
+# (/dev/fuse and fusermount3) the runtime mounts that image and starts the
+# program inside it, so nothing is copied. Without FUSE, or with --extract
+# (or APPIMAGE_RUN_EXTRACT=1), the runtime unpacks the image to disk first:
+# APPIMAGE_EXTRACT_AND_RUN=1 asks the classic type-2 runtime and uruntime
+# alike, TMPDIR puts the copy in /var/cache/appimage rather than /tmp, and
+# NO_CLEANUP=1 keeps it there, so the next start reuses it.
+usage() {
+    echo "usage: appimage-run [--extract] FILE [ARGS...]" >&2
+    exit 2
+}
+extract=${APPIMAGE_RUN_EXTRACT:-0}
+case "$1" in
+    --extract) extract=1; shift ;;
+    -h|--help) usage ;;
+esac
+[ $# -ge 1 ] || usage
+app=$1; shift
+[ -f "$app" ] || { echo "appimage-run: $app: no such file" >&2; exit 1; }
+case "$app" in */*) ;; *) app=./$app ;; esac    # exec looks in PATH otherwise
+if [ ! -x "$app" ]; then
+    chmod +x "$app" 2>/dev/null || { echo "appimage-run: $app is not executable" >&2; exit 1; }
+fi
+if [ "$extract" != 1 ] && { [ ! -c /dev/fuse ] || ! command -v fusermount3 >/dev/null 2>&1; }; then
+    extract=1
+fi
+if [ "$extract" = 1 ]; then
+    cache=${APPIMAGE_CACHE:-/var/cache/appimage}
+    mkdir -p "$cache" || exit 1
+    export APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 TMPDIR="$cache"
+fi
+exec "$app" "$@"

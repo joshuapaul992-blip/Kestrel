@@ -20,6 +20,7 @@ static struct vnode *root;
 static struct mount *mounts;
 static uint64_t next_ino = 1;
 static uint32_t next_dev = 1;
+static int next_mnt_id = 1;                 /* under the tree's lock, exclusively */
 
 struct vnode *vfs_root(void) { return root; }
 struct mount *vfs_mounts(void) { return mounts; }
@@ -110,6 +111,22 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
  * boot, or (a directory's refresh, see vnode_ops) hold it shared and are the
  * only task adding to that directory: lookups on other CPUs may be walking
  * the list, so the new node is complete before it is linked in. */
+void vfs_load_done(struct vnode *dir, struct vnode *list)
+{
+    struct tcb *t = current_task();
+    bool held = t && t->vfs_depth;                      /* a load inside someone's hold */
+    if (!held) vfs_tree_lock(true);
+    bool add = !dir->loaded;
+    while (list) {
+        struct vnode *n = list;
+        list = n->sibling;
+        if (add) vfs_node_add(dir, n);
+        else { if (n->ops && n->ops->evict) n->ops->evict(n); kfree(n); }
+    }
+    __atomic_store_n(&dir->loaded, true, __ATOMIC_RELEASE);
+    if (!held) vfs_tree_unlock();
+}
+
 void vfs_node_add(struct vnode *dir, struct vnode *child)
 {
     child->parent = dir;
@@ -164,6 +181,7 @@ int vfs_mount(struct mount *m, const char *path)
         strlcpy(m->root->name, dir->name, sizeof m->root->name);
         strlcpy(m->path, path, sizeof m->path);
     }
+    m->id = next_mnt_id++;
     struct mount **pp = &mounts;
     while (*pp) pp = &(*pp)->next;
     *pp = m;
@@ -207,6 +225,7 @@ void vfs_set_cwd(struct vnode *vn)
 }
 
 #define TREE_RETRY (-4095)      /* a directory needs the exclusive lock to refresh */
+#define TREE_LOAD  (-4094)      /* a directory needs loading without the lock (vnode_ops.load) */
 
 /* Bring dir's children up to date (see vnode_ops.refresh). TREE_RETRY:
  * the caller holds the lock shared and must start over exclusively. A
@@ -226,6 +245,12 @@ static int refresh(struct vnode *dir)
  * root (cross), or as the covered directory itself. */
 static int find(struct vnode *dir, const char *name, bool cross, struct vnode **out)
 {
+    if (dir->ops && dir->ops->load && !__atomic_load_n(&dir->loaded, __ATOMIC_ACQUIRE)) {
+        struct tcb *t = current_task();
+        if (t && t->vfs_may_drop) { t->vfs_load = dir; return TREE_LOAD; }     /* walk_locked loads it */
+        int r = dir->ops->load(dir);                    /* inside someone's hold: under it */
+        if (r < 0) return r;
+    }
     int r = refresh(dir);
     if (r < 0) return r;
     for (struct vnode *c = first_child(dir); c; c = next_child(c))
@@ -306,6 +331,14 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
         }
         struct vnode *c;
         if ((r = find(vn, comp, true, &c)) < 0) goto out;
+        if (c->type == VLNK && c->ops && c->ops->follow && (!is_last || slash || (flags & WALK_FOLLOW))) {
+            if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
+            struct vnode *to = c->ops->follow(c);       /* a magic link: the node itself */
+            if (!to) { r = -ENOENT; goto out; }
+            vn = to;
+            p = e;
+            continue;
+        }
         if (c->type == VLNK && (!is_last || slash || (flags & WALK_FOLLOW))) {
             if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
             int tl = link_target(c, tmp, VFS_PATH_MAX);
@@ -333,9 +366,23 @@ out:
  * lock is held on return, whatever the result. */
 static int walk_locked(struct vnode *base, const char *path, int flags, struct vnode **out, char *last, bool excl)
 {
+    struct tcb *t = current_task();
     for (;;) {
         vfs_tree_lock(excl);
+        bool may_drop = t && t->vfs_depth == 1;         /* not inside a hold of our caller's */
+        if (may_drop) t->vfs_may_drop = true;
         int r = walk(base, path, flags, out, last);
+        if (may_drop) t->vfs_may_drop = false;
+        if (r == TREE_LOAD) {                           /* a directory to load: without the lock */
+            struct vnode *d = t->vfs_load;
+            t->vfs_load = NULL;
+            vfs_vnode_get(d);
+            vfs_tree_unlock();
+            r = d->ops->load(d);
+            vfs_vnode_put(d);
+            if (r < 0) { vfs_tree_lock(excl); return r; }
+            continue;                                   /* and walk again */
+        }
         if (r != TREE_RETRY) return r;
         vfs_tree_unlock();
         excl = true;
@@ -521,6 +568,17 @@ static void node_free(struct vnode *vn)
     vn->unlinked = true;
     vn->parent = NULL;
     if ((__atomic_fetch_or(&vn->refs, VN_GONE, __ATOMIC_ACQ_REL) & ~VN_GONE) == 0) node_destroy(vn);
+}
+
+void vfs_node_drop(struct vnode *dir, struct vnode *child)
+{
+    for (struct vnode **pp = &dir->children; *pp; pp = &(*pp)->sibling)
+        if (*pp == child) {
+            *pp = child->sibling;
+            child->sibling = NULL;
+            node_free(child);
+            return;
+        }
 }
 
 static int remove_node(struct vnode *dir, struct vnode *vn)
@@ -794,13 +852,29 @@ int vfs_getcwd(char *buf, size_t size)
     return r;
 }
 
+/* The magic numbers of Linux's file systems, which programs compare
+ * statfs' f_type with (Roblox refuses a /proc that isn't proc's). */
+int64_t vfs_fs_magic(const char *fstype)
+{
+    static const struct { const char *name; int64_t magic; } magic[] = {
+        { "proc", 0x9fa0 }, { "sysfs", 0x62656572 }, { "tmpfs", 0x01021994 },
+        { "devtmpfs", 0x01021994 }, { "devpts", 0x1cd1 }, { "ext2", 0xef53 },
+        { "fuse", 0x65735546 }, { "fuseblk", 0x65735546 },
+    };
+    for (size_t i = 0; i < sizeof magic / sizeof *magic; i++)
+        if (!strcmp(fstype, magic[i].name)) return magic[i].magic;
+    if (!strncmp(fstype, "fuse.", 5)) return 0x65735546;
+    return 0x858458f6;                                  /* RAMFS_MAGIC: ramfs, tarfs */
+}
+
 int vfs_statfs(struct vnode *vn, struct kstatfs *st)
 {
     memset(st, 0, sizeof *st);
     struct mount *m = vn->fs;
     st->f_bsize = st->f_frsize = 4096;
     st->f_namelen = VFS_NAME_MAX - 1;
-    st->f_type = 0x858458f6;                            /* RAMFS_MAGIC unless the fs says else */
+    st->f_type = m ? vfs_fs_magic(m->fstype) : 0x858458f6;
+    if (vn->type == VCHR && (vn->rdev >> 8) == 136) st->f_type = 0x1cd1;   /* a pty's slave lives on devpts */
     if (m) { st->f_fsid[0] = (int32_t)m->dev; if (m->flags & MNT_RDONLY) st->f_flags |= 1; }
     if (m && m->statfs) {
         bool bkl = vn->ops && !vn->ops->nolock && !bkl_depth();    /* statfs(2) by name */
@@ -1018,6 +1092,10 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
 {
     struct vnode *dir = f->vn;
     if (dir->type != VDIR) return -ENOTDIR;
+    if (dir->ops && dir->ops->load && !__atomic_load_n(&dir->loaded, __ATOMIC_ACQUIRE)) {
+        int r = dir->ops->load(dir);                    /* the open file holds it */
+        if (r < 0) return r;
+    }
     kmutex_lock(&f->pos_lock);
     for (bool excl = false;; excl = true) {
         vfs_tree_lock(excl);
@@ -1379,16 +1457,16 @@ struct vnode *pseudo_file_locked(struct vnode *parent, const char *name, vfs_gen
 /* Make directory `dst` show the contents of directory `src` (a bind mount,
  * e.g. /boot/bin on /bin). The source keeps its place in the tree, so ".."
  * inside the bound directory leads to the source's parent. */
-static int bind_locked(const char *src, const char *dst)
+static int bind_node_locked(struct vnode *s, struct vnode *d, const char *dst, const char *source)
 {
-    struct vnode *s, *d;
-    int r;
-    if ((r = walk(NULL, src, WALK_FOLLOW, &s, NULL)) < 0 || (r = walk(NULL, dst, WALK_FOLLOW, &d, NULL)) < 0) return r;
     if (s->type != VDIR || d->type != VDIR) return -ENOTDIR;
     if (d->mounted || s == d) return -EBUSY;
     struct mount *m = kzalloc(sizeof *m);
     if (!m) return -ENOMEM;
     strlcpy(m->fstype, "bind", sizeof m->fstype);
+    if (source) strlcpy(m->source, source, sizeof m->source);
+    m->of = s->fs && s->fs->of ? s->fs->of : s->fs;
+    m->id = next_mnt_id++;
     m->flags = s->fs ? s->fs->flags : 0;
     m->dev = s->fs ? s->fs->dev : 0;
     m->root = s;
@@ -1398,7 +1476,139 @@ static int bind_locked(const char *src, const char *dst)
     struct mount **pp = &mounts;
     while (*pp) pp = &(*pp)->next;
     *pp = m;
-    kprintf("vfs: bound %s on %s\n", src, dst);
+    kprintf("vfs: bound %s on %s\n", s->name[0] ? s->name : "/", dst);
+    return 0;
+}
+
+static int bind_locked(const char *src, const char *dst)
+{
+    struct vnode *s, *d;
+    int r;
+    if ((r = walk(NULL, src, WALK_FOLLOW, &s, NULL)) < 0 || (r = walk(NULL, dst, WALK_FOLLOW, &d, NULL)) < 0) return r;
+    return bind_node_locked(s, d, dst, NULL);
+}
+
+int vfs_bind_node(struct vnode *src, const char *dst, const char *source)
+{
+    vfs_tree_lock(true);
+    struct vnode *d;
+    int r = walk(NULL, dst, WALK_FOLLOW, &d, NULL);
+    if (r == 0) r = bind_node_locked(src, d, dst, source);
+    vfs_tree_unlock();
+    return r;
+}
+
+/* The mount whose root `vn` is, the topmost if several; NULL if none (the
+ * root file system counts only when `root_too`). */
+static struct mount *mount_of_root(struct vnode *vn, bool root_too)
+{
+    struct mount *found = NULL;
+    for (struct mount *m = mounts; m; m = m->next)
+        if (m->root == vn && (m->covered || root_too)) found = m;
+    return found;
+}
+
+struct mount *vfs_mount_at(const char *path)
+{
+    struct vnode *vn;
+    struct mount *m = NULL;
+    if (walk_locked(NULL, path, WALK_FOLLOW, &vn, NULL, false) == 0) m = mount_of_root(vn, true);
+    vfs_tree_unlock();
+    return m;
+}
+
+/* vn is root or below it (following parents, which skip mount points) */
+static bool in_subtree(struct vnode *vn, struct vnode *root)
+{
+    for (int depth = 0; vn && depth < 4096; depth++) {
+        if (vn == root) return true;
+        if (vn->parent == vn) return false;             /* "/" */
+        vn = vn->parent;
+    }
+    return false;
+}
+
+/* Anything in dir's subtree referenced: open, a working directory, a lookup. */
+static bool subtree_busy(struct vnode *dir)
+{
+    if (__atomic_load_n(&dir->refs, __ATOMIC_ACQUIRE) & ~VN_GONE) return true;
+    for (struct vnode *c = first_child(dir); c; c = next_child(c))
+        if (c->type == VDIR ? subtree_busy(c) : (__atomic_load_n(&c->refs, __ATOMIC_ACQUIRE) & ~VN_GONE) != 0)
+            return true;
+    return false;
+}
+
+/* Take dir's subtree out of the tree: each node goes when its last
+ * reference does (node_free). */
+static void free_subtree(struct vnode *dir)
+{
+    while (dir->children) {
+        struct vnode *c = dir->children;
+        dir->children = c->sibling;
+        if (c->type == VDIR) free_subtree(c);
+        node_free(c);
+    }
+}
+
+int vfs_umount(const char *path, int flags)
+{
+    vfs_tree_lock(true);
+    struct vnode *vn;
+    int r = walk(NULL, path, (flags & 8) ? 0 : WALK_FOLLOW, &vn, NULL);    /* UMOUNT_NOFOLLOW */
+    struct mount *m = r == 0 ? mount_of_root(vn, false) : NULL;
+    if (r == 0 && !m) r = -EINVAL;                      /* not a mount point (or "/") */
+    if (r == 0)
+        for (struct mount *o = mounts; o; o = o->next)  /* mounts inside it go first */
+            if (o != m && o->covered && in_subtree(o->covered, m->root)) { r = -EBUSY; break; }
+    if (r == 0 && !(flags & 2) && !m->of && subtree_busy(m->root)) r = -EBUSY;     /* MNT_DETACH */
+    if (r == 0 && (flags & 4) && !m->expired) {         /* MNT_EXPIRE: the first call only marks it */
+        m->expired = true;
+        r = -EAGAIN;
+    }
+    if (r < 0) { vfs_tree_unlock(); return r; }
+    for (struct mount **pp = &mounts; *pp; pp = &(*pp)->next)
+        if (*pp == m) { *pp = m->next; break; }
+    m->covered->mounted = NULL;
+    if (m->umount) m->umount(m);
+    if (!m->of) {                                       /* its own nodes: freed as they go */
+        free_subtree(m->root);
+        node_free(m->root);
+    }
+    vfs_tree_unlock();
+    kprintf("vfs: unmounted %s from %s\n", m->of ? "bind" : m->fstype, m->path);
+    /* The record stays: nodes still open point at it (vn->fs). */
+    return 0;
+}
+
+int vfs_move_mount(const char *from, const char *to)
+{
+    vfs_tree_lock(true);
+    struct vnode *s, *d;
+    int r = walk(NULL, from, WALK_FOLLOW, &s, NULL);
+    struct mount *m = r == 0 ? mount_of_root(s, false) : NULL;
+    if (r == 0 && !m) r = -EINVAL;
+    if (r == 0) r = walk(NULL, to, WALK_FOLLOW, &d, NULL);
+    if (r == 0 && d->type != VDIR) r = -ENOTDIR;
+    if (r == 0 && (d->mounted || in_subtree(d, m->root))) r = -EBUSY;
+    char *np = r == 0 ? kmalloc(VFS_PATH_MAX) : NULL;
+    if (r == 0 && !np) r = -ENOMEM;
+    if (r == 0) r = path_of(d, np, VFS_PATH_MAX);
+    if (r < 0) { kfree(np); vfs_tree_unlock(); return r; }
+    char old[VFS_PATH_MAX];
+    strlcpy(old, m->path, sizeof old);
+    m->covered->mounted = NULL;
+    d->mounted = m->root;
+    m->covered = d;
+    if (!m->of) { m->root->parent = d->parent; strlcpy(m->root->name, d->name, sizeof m->root->name); }
+    size_t ol = strlen(old);
+    for (struct mount *o = mounts; o; o = o->next) {     /* m and the mounts inside it */
+        if (o != m && (strncmp(o->path, old, ol) || o->path[ol] != '/')) continue;
+        char tail[VFS_PATH_MAX];
+        strlcpy(tail, o->path + ol, sizeof tail);
+        snprintf(o->path, sizeof o->path, "%s%s", np, tail);
+    }
+    kfree(np);
+    vfs_tree_unlock();
     return 0;
 }
 

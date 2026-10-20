@@ -76,9 +76,9 @@ void vm_init(void)
 }
 
 /* ---- page tables ------------------------------------------------------------ */
-static uint64_t *pte_walk(uint64_t pml4, uint64_t va, bool alloc)
+static uint64_t *pte_walk(struct mm *mm, uint64_t va, bool alloc)
 {
-    uint64_t *t = (uint64_t *)pml4;
+    uint64_t *t = (uint64_t *)mm->pml4;
     static const int shift[3] = { 39, 30, 21 };
     for (int l = 0; l < 3; l++) {
         uint64_t *e = &t[(va >> shift[l]) & 511];
@@ -87,6 +87,10 @@ static uint64_t *pte_walk(uint64_t pml4, uint64_t va, bool alloc)
             uint64_t n = pmm_alloc();                   /* zeroed table */
             if (!n) return NULL;
             *e = n | PTE_P | PTE_W | PTE_U;             /* rights are decided at the leaf */
+            if (l == 0 && mm->kpml4) {                  /* the kernel's root sees it too */
+                int i = (int)((va >> 39) & 511);
+                ((uint64_t *)mm->kpml4)[i ? i : UVM_LOW_SLOT] = *e;
+            }
         }
         if (*e & PTE_HUGE) return NULL;                 /* never in the user half */
         t = (uint64_t *)(*e & ADDR_MASK);
@@ -116,14 +120,14 @@ static void walk_range(uint64_t pml4, uint64_t start, uint64_t end, pte_fn fn, v
 static bool mm_active(const struct mm *mm)
 {
     for (int i = 0; i < MAX_CPUS; i++)
-        if (cpus[i].online && cpus[i].loaded_cr3 == mm->pml4) return true;
+        if (cpus[i].online && cpus[i].loaded_cr3 == mm_cr3(mm)) return true;
     return false;
 }
 
 /* Every CPU that has mm loaded drops these translations before we go on
  * (and before any frame they pointed to is freed or reused). */
-static void tlb_page(struct mm *mm, uint64_t va) { tlb_shootdown(mm->pml4, va, va + PAGE); }
-static void tlb_range(struct mm *mm, uint64_t start, uint64_t end) { tlb_shootdown(mm->pml4, start, end); }
+static void tlb_page(struct mm *mm, uint64_t va) { tlb_shootdown(mm_cr3(mm), va, va + PAGE); }
+static void tlb_range(struct mm *mm, uint64_t start, uint64_t end) { tlb_shootdown(mm_cr3(mm), start, end); }
 
 static uint64_t leaf_flags(const struct vma *v, bool writable)
 {
@@ -326,6 +330,19 @@ struct mm *mm_create(void)
     return mm;
 }
 
+int mm_make_low(struct mm *mm)
+{
+    if (mm->kpml4) return 0;
+    uint64_t u = uvm_create_low();
+    if (!u) return -ENOMEM;
+    uint64_t *old = (uint64_t *)mm->pml4;
+    for (int i = KERNEL_SLOTS; i < 256; i++)
+        if (old[i]) panic("mm_make_low: the address space is not empty");
+    mm->kpml4 = mm->pml4;                               /* identity map in PML4[0], as made */
+    mm->pml4 = u;
+    return 0;
+}
+
 void mm_get(struct mm *mm) { __atomic_add_fetch(&mm->users, 1, __ATOMIC_ACQ_REL); }
 
 /* Free the user half: frames (by reference) and page tables. */
@@ -349,6 +366,11 @@ void mm_put(struct mm *mm)
     if (mm_active(mm)) panic("mm_put: freeing the loaded address space");
     while (mm->vmas) { struct vma *v = mm->vmas; mm->vmas = v->next; vma_free(v); }
     free_tables((uint64_t *)mm->pml4, 4);
+    if (mm->kpml4) {                                    /* the window, and the kernel's root */
+        uint64_t *u = (uint64_t *)mm->pml4;
+        if (u[0] & PTE_P) { free_tables((uint64_t *)(u[0] & ADDR_MASK), 3); pmm_free(u[0] & ADDR_MASK); }
+        pmm_free(mm->kpml4);
+    }
     pmm_free(mm->pml4);
     if (mm->oom_victim) __atomic_sub_fetch(&oom_pending, 1, __ATOMIC_ACQ_REL);
     kfree(mm);
@@ -366,7 +388,7 @@ static void fork_fn(uint64_t *pte, uint64_t va, void *ctx)
         e = (e & ~PTE_W) | PTE_COW;
         *pte = e;
     }
-    uint64_t *d = pte_walk(c->dst->pml4, va, true);
+    uint64_t *d = pte_walk(c->dst, va, true);
     if (!d) { c->err = -ENOMEM; return; }
     *d = e;
     page_ref(e & ADDR_MASK);
@@ -377,9 +399,11 @@ struct mm *mm_fork(struct mm *src)
 {
     struct mm *dst = mm_create();
     if (!dst) return NULL;
+    if (src->kpml4 && mm_make_low(dst) < 0) { mm_put(dst); return NULL; }
     mm_lock(src);
     dst->brk_start = src->brk_start;
     dst->brk = src->brk;
+    dst->thp_disable = src->thp_disable;
     int err = 0;
     for (struct vma *v = src->vmas; v && !err; v = v->next) {
         struct vma *n = kmalloc(sizeof *n);
@@ -399,7 +423,7 @@ struct mm *mm_fork(struct mm *src)
         walk_range(src->pml4, v->start, v->end, fork_fn, &c);
         err = c.err;
     }
-    tlb_shootdown(src->pml4, 0, UVM_USER_END);          /* the parent lost write access to private pages */
+    tlb_shootdown(mm_cr3(src), 0, UVM_USER_END);          /* the parent lost write access to private pages */
     mm_unlock(src);
     if (err) { mm_put(dst); return NULL; }
     return dst;
@@ -449,7 +473,7 @@ static void fault_around(struct mm *mm, struct vma *v, uint64_t va, uint64_t fsi
     for (uint64_t a = lo; a < hi; a += PAGE) {
         uint64_t off = v->off + (a - v->start), p;
         if (a == va || off >= pgup(fsize)) continue;
-        uint64_t *pte = pte_walk(mm->pml4, a, false);
+        uint64_t *pte = pte_walk(mm, a, false);
         if (!pte || *pte) continue;
         if (getpage(v->file->vn, off / PAGE, false, &p) < 0 || !p) continue;
         *pte = cache_pte(v, p);
@@ -539,7 +563,7 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
         return -EACCES;
     if (v->dops) {                                      /* the driver maps it */
         if (fast) return -EAGAIN;
-        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        uint64_t *pte = pte_walk(mm, va, false);
         if (pte && (*pte & PTE_P)) { tlb_page(mm, va); return 0; }  /* stale translation: retry */
         current_task()->fault_kind = KF_SHARED;
         bool e = dev_enter(v->dops);
@@ -547,7 +571,7 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
         dev_exit(e);
         return r;
     }
-    uint64_t *pte = pte_walk(mm->pml4, va, true);
+    uint64_t *pte = pte_walk(mm, va, true);
     if (!pte) return -ENOMEM;
     uint64_t e = *pte;
     if (e & PTE_P) {
@@ -620,7 +644,7 @@ int vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write)
     mm_lock(mm);
     int r = 0;
     for (uint64_t va = pgdown(addr); va < addr + len && !r; va += PAGE) {
-        uint64_t *pte = pte_walk(mm->pml4, va, false);
+        uint64_t *pte = pte_walk(mm, va, false);
         if (pte && (*pte & PTE_P) && (!write || (*pte & PTE_W))) continue;
         struct vma *v = vma_find(mm, va);
         if (!v || v->prot == PROT_NONE) continue;
@@ -716,7 +740,7 @@ int vm_dev_insert(struct mm *mm, uint64_t va, uint64_t phys, uint64_t cache)
     va = pgdown(va);
     struct vma *v = vma_find(mm, va);
     if (!v || !v->dops) return -EFAULT;
-    uint64_t *pte = pte_walk(mm->pml4, va, true);
+    uint64_t *pte = pte_walk(mm, va, true);
     if (!pte) return -ENOMEM;
     if (*pte) return 0;                                 /* mapped already, as Linux's insert_pfn */
     *pte = (phys & ADDR_MASK) | leaf_flags(v, v->prot & PROT_WRITE) | (cache & PTE_CACHE) | PTE_PFN;
@@ -796,7 +820,7 @@ static void move_fn(uint64_t *pte, uint64_t va, void *ctx)
 {
     struct movectx *c = ctx;
     if (c->err) return;
-    uint64_t *d = pte_walk(c->mm->pml4, (uint64_t)((int64_t)va + c->delta), true);
+    uint64_t *d = pte_walk(c->mm, (uint64_t)((int64_t)va + c->delta), true);
     if (!d) { c->err = -ENOMEM; return; }
     *d = *pte;
     *pte = 0;
@@ -905,7 +929,7 @@ int vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec)
     for (uint64_t va = addr; va < addr + len; va += PAGE, i++) {
         struct vma *v = vma_find(mm, va);
         if (!v) { r = -ENOMEM; break; }
-        uint64_t *pte = pte_walk(mm->pml4, va, false), p;
+        uint64_t *pte = pte_walk(mm, va, false), p;
         vec[i] = pte && has_frame(*pte) ? 1 : 0;
         /* a private file page not mapped yet: resident if the page cache
          * holds it, as on Linux (fincore and programs that check before

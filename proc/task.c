@@ -226,6 +226,32 @@ void sched_init(void)
     kprintf("sched: pid 0 (swapper) adopted boot stack, quantum=%dms\n", SCHED_QUANTUM);
 }
 
+/* What the entry code needs of the task about to run on CPU c: its kernel
+ * stack, and with a low window (uvm.h) both roots, the stack then given by
+ * its direct address. */
+static void entry_state(struct percpu *c, struct tcb *t)
+{
+    bool low = t->pml4 && t->pml4 != t->cr3;
+    uint64_t ktop = ((uintptr_t)t->kstack + t->kstack_size) & ~0xFull;
+    if (low) ktop = uvm_direct(ktop);
+    c->user_cr3 = low ? t->pml4 : 0;
+    c->kern_cr3 = low ? t->cr3 : 0;
+    tss_set_kernel_stack(ktop);
+    c->kernel_rsp = ktop;
+}
+
+void task_use_mm(struct tcb *t, struct mm *mm)
+{
+    uint64_t f = irq_save();
+    t->pml4 = mm->pml4;
+    t->cr3 = mm_cr3(mm);
+    if (t == current_task()) {
+        cpu_load_cr3(t->cr3);
+        entry_state(this_cpu(), t);
+    }
+    irq_restore(f);
+}
+
 /* Kernel stacks: KSTACK_SIZE bytes, identity mapped (drivers may hand stack
  * buffers to DMA), with the page below made a guard page. Running off the
  * end of a stack faults on the guard instead of silently corrupting the
@@ -545,9 +571,7 @@ void schedule(void)
      * hold it queues for it in sched_switch_tail. */
     prev->bkl_depth = c->bkl_depth;
     if (c->bkl_depth && !next->bkl_depth) bkl_exit_switch();
-    uint64_t ktop = ((uintptr_t)next->kstack + next->kstack_size) & ~0xFull;
-    tss_set_kernel_stack(ktop);
-    c->kernel_rsp = ktop;
+    entry_state(c, next);
     /* user processes own FPU state (the kernel is built without SSE), a TLS
      * base (FS) and a GS base (in KERNEL_GS_BASE while in the kernel);
      * kernel threads never touch them */
@@ -967,8 +991,10 @@ void task_exit(int code)
     kprintf("sched: pid %d (%s) exited with status %d\n", cur->pid, cur->name, code);
     /* close now, not at reap time: pipe and socket peers must see EOF (the
      * table goes when the last thread sharing it is gone) */
+    uint64_t ff = spin_lock_irqsave(&proc_lock);       /* /proc/PID/fd takes it under the lock */
     struct files_struct *files = cur->files;
     cur->files = NULL;
+    spin_unlock_irqrestore(&proc_lock, ff);
     files_put(files);
     /* Give the address space back now, not when the parent reaps us: memory
      * comes back at once (the OOM killer relies on that). Run on the kernel
@@ -981,6 +1007,7 @@ void task_exit(int code)
         cur->pml4 = 0;
         cur->cr3 = uvm_kernel_pml4();
         cpu_load_cr3(cur->cr3);
+        entry_state(this_cpu(), cur);
         sti();
         mm_put(mm);
         cli();

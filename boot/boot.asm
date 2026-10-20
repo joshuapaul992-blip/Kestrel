@@ -105,10 +105,12 @@ _start:
     rep     stosd
     pop     edi
 
-    ; PML4[0] -> PDPT
+    ; PML4[0] -> PDPT, and PML4[256] -> the same PDPT: the second view of
+    ; the kernel half that the interrupt entry code runs on (uvm.h)
     mov     eax, boot_pdpt
     or      eax, 0x003                  ; present | writable
     mov     [boot_pml4], eax
+    mov     [boot_pml4 + 256 * 8], eax
 
     ; PDPT[0..3] -> PD0..PD3
     mov     eax, boot_pd
