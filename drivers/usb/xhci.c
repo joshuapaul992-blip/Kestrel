@@ -132,6 +132,35 @@ struct msc_if {
     uint64_t td_trb[XHCI_BULK_MAX / XHCI_TRB_MAX];  /* the current TD's TRBs      */
 };
 
+/* A network function: a CDC/RNDIS control interface and the bulk endpoints
+ * of its data interface. Receive transfers stay queued; their completions
+ * go into rx_fifo (written by the event handler under ev_lock, read by
+ * the class driver), and a buffer goes back on the ring when the class
+ * driver releases it. */
+struct net_fn {
+    bool     present;
+    uint8_t  proto;                             /* XHCI_NET_*                   */
+    uint8_t  ctrl_iface, data_iface, data_alt;
+    uint8_t  in_addr, out_addr, in_dci, out_dci;
+    uint16_t in_mps, out_mps;
+    uint8_t  in_burst, out_burst;
+    uint8_t  mac_string;
+    uint16_t max_segment;
+    struct xhci_ring in_ring, out_ring;
+    uint8_t *rxbuf; uint64_t rxbuf_phys;        /* XHCI_NET_RX_BUFS x XHCI_NET_RX_SIZE, 64 KiB aligned */
+    uint8_t *txbuf; uint64_t txbuf_phys;        /* XHCI_NET_TX_BUFS x XHCI_NET_TX_SIZE */
+    volatile bool running;                      /* transfers may be queued      */
+    volatile bool needs_reset;                  /* an endpoint halted: xhci_service() restarts */
+    uint8_t  rx_done[XHCI_NET_RX_BUFS];         /* 1: completed, not yet released (not on the ring) */
+    uint32_t rx_len[XHCI_NET_RX_BUFS];
+    uint8_t  rx_fifo[XHCI_NET_RX_BUFS];         /* completed buffers, oldest first */
+    volatile uint32_t rx_head, rx_tail;
+    volatile uint32_t tx_busy;                  /* bit n: buffer n in flight    */
+    uint8_t  tx_next;
+    uint32_t errors;
+    uint8_t  last_code;
+};
+
 struct usb_dev {
     struct usb_device_info info;
     bool     used;
@@ -145,10 +174,13 @@ struct usb_dev {
     struct hid_if hid[2];
     int      nhid;
     struct msc_if msc;
+    struct net_fn net;
     /* control-transfer completion, written by the event handler */
     volatile bool    xfer_done;
     volatile uint8_t xfer_code;
     uint64_t xfer_wait_trb;
+    uint64_t xfer_data_trb;                   /* its Data stage, for a short IN    */
+    volatile uint32_t xfer_residual;
 };
 
 static struct {
@@ -398,6 +430,47 @@ static void requeue_report(struct usb_dev *d, struct hid_if *h, unsigned buf_ind
     ring_doorbell(d->slot, h->dci);
 }
 
+/* Put receive buffer b on the network IN ring (ev_lock held). */
+static void net_queue_rx(struct usb_dev *d, unsigned b)
+{
+    struct net_fn *n = &d->net;
+    n->rx_done[b] = 0;
+    uint64_t trb = ring_put(&n->in_ring, n->rxbuf_phys + (uint64_t)b * XHCI_NET_RX_SIZE, XHCI_NET_RX_SIZE,
+                            TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP, false);
+    n->in_ring.tag[(trb - n->in_ring.phys) / sizeof(struct xhci_trb)] = (uint8_t)b;
+    ring_doorbell(d->slot, n->in_dci);
+}
+
+/* A network transfer completed (event ring, ev_lock held). */
+static void net_event(struct usb_dev *d, bool in, const struct xhci_trb *ev, uint8_t cc)
+{
+    struct net_fn *n = &d->net;
+    struct xhci_ring *r = in ? &n->in_ring : &n->out_ring;
+    unsigned idx = r->tag[(ev->param - r->phys) / sizeof(struct xhci_trb) % XHCI_EP_RING_TRBS];
+    if (cc == CC_STOPPED || cc == CC_STOPPED_LENGTH) return;   /* cancelled by a restart */
+    if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
+        if (!in) { n->tx_busy &= ~(1u << idx); return; }
+        if (idx >= XHCI_NET_RX_BUFS || n->rx_done[idx]) return;
+        uint32_t res = TRB_GET_LEN(ev->status);
+        n->rx_len[idx] = res <= XHCI_NET_RX_SIZE ? XHCI_NET_RX_SIZE - res : 0;
+        n->rx_done[idx] = 1;
+        n->rx_fifo[n->rx_head % XHCI_NET_RX_BUFS] = (uint8_t)idx;
+        __atomic_store_n(&n->rx_head, n->rx_head + 1, __ATOMIC_RELEASE);
+        if (X.plat.net_rx) X.plat.net_rx();
+        return;
+    }
+    /* stall, babble, transaction error: the endpoint is halted until a
+     * Reset Endpoint, which needs commands: xhci_service() does it */
+    n->errors++;
+    n->last_code = cc;
+    if (!in) n->tx_busy &= ~(1u << idx);
+    if (n->running) {
+        n->running = false;
+        n->needs_reset = true;
+        __atomic_store_n(&X.ep_pending, true, __ATOMIC_RELEASE);
+    }
+}
+
 static void handle_transfer_event(const struct xhci_trb *ev)
 {
     uint8_t slot = (uint8_t)TRB_GET_SLOT(ev->control), dci = (uint8_t)TRB_GET_EP(ev->control);
@@ -406,6 +479,7 @@ static void handle_transfer_event(const struct xhci_trb *ev)
     struct usb_dev *d = &X.devs[slot];
 
     if (dci == 1) {                             /* EP0: synchronous control transfer */
+        if (ev->param == d->xfer_data_trb && cc == CC_SHORT_PACKET) d->xfer_residual = TRB_GET_LEN(ev->status);
         if (ev->param == d->xfer_wait_trb || (cc != CC_SUCCESS && cc != CC_SHORT_PACKET)) {
             d->xfer_code = cc;
             d->xfer_done = true;
@@ -423,6 +497,10 @@ static void handle_transfer_event(const struct xhci_trb *ev)
             d->msc.done = true;
             wake(&d->msc.done);
         }
+        return;
+    }
+    if (d->net.present && (dci == d->net.in_dci || dci == d->net.out_dci)) {
+        net_event(d, dci == d->net.in_dci, ev, cc);
         return;
     }
     for (int i = 0; i < d->nhid; i++) {
@@ -543,13 +621,16 @@ static int endpoint_reset(struct usb_dev *d, uint8_t dci, struct xhci_ring *r)
     return command(TRB_TYPE(TRB_SET_TR_DEQUEUE) | TRB_SLOT(d->slot) | TRB_EP(dci), deq, NULL);
 }
 
-/* Synchronous control transfer on EP0: Setup, optional Data, Status stage. */
-static int control(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t value,
-                   uint16_t index, uint16_t length, void *data)
+/* Synchronous control transfer on EP0: Setup, optional Data, Status stage.
+ * *actual (may be NULL) gets the bytes a short IN data stage brought. */
+static int control_len(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t value,
+                       uint16_t index, uint16_t length, void *data, uint16_t *actual)
 {
+    if (actual) *actual = 0;
     if (length > 512) return XHCI_ERR_UNSUPPORTED;
     bool in = (reqtype & USB_DIR_IN) != 0;
     if (!in && length) mem_copy(d->ctrl_buf, data, length);
+    if (in && length) mem_zero(d->ctrl_buf, length);
 
     uint64_t setup = (uint64_t)reqtype | (uint64_t)request << 8 | (uint64_t)value << 16 |
                      (uint64_t)index << 32 | (uint64_t)length << 48;
@@ -557,9 +638,12 @@ static int control(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t
 
     d->xfer_done = false;
     d->xfer_wait_trb = 0;
+    d->xfer_data_trb = 0;
+    d->xfer_residual = 0;
     xhci_ring_enqueue(&d->ep0, setup, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | trt);
     if (length)
-        xhci_ring_enqueue(&d->ep0, d->ctrl_phys, length, TRB_TYPE(TRB_DATA) | (in ? TRB_DIR_IN : 0));
+        d->xfer_data_trb = xhci_ring_enqueue(&d->ep0, d->ctrl_phys, length,
+                                             TRB_TYPE(TRB_DATA) | (in ? TRB_DIR_IN | TRB_ISP : 0));
     /* status stage runs opposite to the data stage (IN when there is none) */
     uint32_t sdir = (length && in) ? 0 : TRB_DIR_IN;
     d->xfer_wait_trb = xhci_ring_enqueue(&d->ep0, 0, 0, TRB_TYPE(TRB_STATUS) | sdir | TRB_IOC);
@@ -585,7 +669,14 @@ static int control(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t
         return XHCI_ERR_XFER;
     }
     if (in && length) mem_copy(data, d->ctrl_buf, length);
+    if (actual) *actual = (uint16_t)(d->xfer_residual <= length ? length - d->xfer_residual : 0);
     return XHCI_OK;
+}
+
+static int control(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t value,
+                   uint16_t index, uint16_t length, void *data)
+{
+    return control_len(d, reqtype, request, value, index, length, data, NULL);
 }
 
 static int get_descriptor(struct usb_dev *d, uint8_t type, uint8_t index, uint16_t lang,
@@ -848,11 +939,28 @@ static bool alloc_device(struct usb_dev *d)
 
 /* Parse the configuration bundle for HID boot interfaces with an
  * interrupt-IN endpoint. */
+/* The network protocol a control interface announces, 0 if none:
+ * RNDIS as Windows (CDC ACM, vendor protocol), as Android (wireless
+ * controller) and as the misc class has it; CDC ECM and NCM. */
+static uint8_t net_proto_of(const struct usb_interface_descriptor *id)
+{
+    uint8_t c = id->bInterfaceClass, s = id->bInterfaceSubClass, p = id->bInterfaceProtocol;
+    if ((c == USB_CLASS_COMM && s == 0x02 && p == 0xFF) || (c == USB_CLASS_WIRELESS && s == 0x01 && p == 0x03) ||
+        (c == USB_CLASS_MISC && s == 0x04 && p == 0x01))
+        return XHCI_NET_RNDIS;
+    if (c == USB_CLASS_COMM && s == CDC_SUBCLASS_ECM) return XHCI_NET_ECM;
+    if (c == USB_CLASS_COMM && s == CDC_SUBCLASS_NCM) return XHCI_NET_NCM;
+    return 0;
+}
+
 static void parse_config(struct usb_dev *d, const uint8_t *buf, uint16_t total)
 {
     struct hid_if *cur = NULL;
     bool in_msc = false;
     int msc_last = 0;                               /* 1 = IN, 2 = OUT: for SS companions */
+    bool in_net_ctrl = false, in_net_data = false;
+    int net_last = 0;
+    struct net_fn *n = &d->net;
     d->nhid = 0;
     for (uint16_t off = 0; off + 2 <= total && buf[off] >= 2; off = (uint16_t)(off + buf[off])) {
         uint8_t type = buf[off + 1];
@@ -861,7 +969,25 @@ static void parse_config(struct usb_dev *d, const uint8_t *buf, uint16_t total)
             cur = NULL;
             in_msc = false;
             msc_last = 0;
+            in_net_ctrl = in_net_data = false;
+            net_last = 0;
+            if (!n->present && n->proto && id->bInterfaceClass == USB_CLASS_CDC_DATA && id->bNumEndpoints >= 2 &&
+                (n->data_iface == 0xFF || n->data_iface == id->bInterfaceNumber)) {
+                in_net_data = true;                     /* ECM and NCM: alternate setting 1 */
+                n->data_iface = id->bInterfaceNumber;
+                n->data_alt = id->bAlternateSetting;
+                n->in_addr = n->out_addr = 0;
+                continue;
+            }
             if (id->bAlternateSetting != 0) continue;
+            uint8_t np = net_proto_of(id);
+            if (np && !n->proto) {
+                in_net_ctrl = true;
+                n->proto = np;
+                n->ctrl_iface = id->bInterfaceNumber;
+                n->data_iface = 0xFF;                   /* the union descriptor says which, else the next one */
+                continue;
+            }
             if (id->bInterfaceClass == USB_CLASS_MASS_STORAGE) {
                 if (id->bInterfaceProtocol == 0x50 && !d->msc.present && !d->msc.in_addr) {   /* Bulk-Only */
                     in_msc = true;
@@ -901,6 +1027,28 @@ static void parse_config(struct usb_dev *d, const uint8_t *buf, uint16_t total)
                 d->msc.out_mps = ep->wMaxPacketSize & 0x7FF; msc_last = 2;
             }
             if (d->msc.in_addr && d->msc.out_addr) d->msc.present = true;
+        } else if (type == USB_DT_CS_INTERFACE && in_net_ctrl && off + 5 <= total) {
+            if (buf[off + 2] == CDC_FD_UNION) n->data_iface = buf[off + 4];        /* first subordinate */
+            else if (buf[off + 2] == CDC_FD_ETHERNET && off + 13 <= total) {
+                n->mac_string = buf[off + 3];
+                n->max_segment = (uint16_t)(buf[off + 8] | buf[off + 9] << 8);
+            }
+        } else if (type == USB_DT_ENDPOINT && in_net_data && off + sizeof(struct usb_endpoint_descriptor) <= total) {
+            const struct usb_endpoint_descriptor *ep = (const void *)(buf + off);
+            if ((ep->bmAttributes & USB_EP_XFER_MASK) != USB_EP_XFER_BULK) continue;
+            uint8_t dci = (uint8_t)((ep->bEndpointAddress & 0x0F) * 2 + ((ep->bEndpointAddress & USB_DIR_IN) ? 1 : 0));
+            if (ep->bEndpointAddress & USB_DIR_IN) {
+                if (n->in_addr) continue;
+                n->in_addr = ep->bEndpointAddress; n->in_dci = dci;
+                n->in_mps = ep->wMaxPacketSize & 0x7FF; net_last = 1;
+            } else {
+                if (n->out_addr) continue;
+                n->out_addr = ep->bEndpointAddress; n->out_dci = dci;
+                n->out_mps = ep->wMaxPacketSize & 0x7FF; net_last = 2;
+            }
+            if (n->in_addr && n->out_addr) n->present = true;
+        } else if (type == USB_DT_SS_EP_COMPANION && in_net_data && net_last && off + 3 <= total) {
+            if (net_last == 1) n->in_burst = buf[off + 2]; else n->out_burst = buf[off + 2];
         } else if (type == USB_DT_SS_EP_COMPANION && in_msc && msc_last && off + 3 <= total) {
             if (msc_last == 1) d->msc.in_burst = buf[off + 2]; else d->msc.out_burst = buf[off + 2];
         } else if (type == USB_DT_ENDPOINT && cur && !cur->ep_addr &&
@@ -918,8 +1066,8 @@ static void parse_config(struct usb_dev *d, const uint8_t *buf, uint16_t total)
     }
 }
 
-/* Add the interrupt-IN (HID) and bulk (mass storage) endpoints with one
- * Configure Endpoint command. */
+/* Add the interrupt-IN (HID) and bulk (mass storage, network) endpoints
+ * with one Configure Endpoint command. */
 static int configure_endpoints(struct usb_dev *d)
 {
     mem_zero(d->in_ctx, X.ctx_size * 33u);
@@ -961,6 +1109,28 @@ static int configure_endpoints(struct usb_dev *d)
             if (dci > max_dci) max_dci = dci;
         }
     }
+    if (d->net.present) {
+        struct net_fn *n = &d->net;
+        if (!xhci_ring_init(&n->in_ring, XHCI_EP_RING_TRBS) || !xhci_ring_init(&n->out_ring, XHCI_EP_RING_TRBS))
+            return XHCI_ERR_NOMEM;
+        /* 64 KiB-aligned, so no receive buffer crosses a 64 KiB boundary */
+        if (!n->rxbuf && !(n->rxbuf = dma(XHCI_NET_RX_BUFS * XHCI_NET_RX_SIZE, XHCI_TRB_MAX, &n->rxbuf_phys)))
+            return XHCI_ERR_NOMEM;
+        if (!n->txbuf && !(n->txbuf = dma(XHCI_NET_TX_BUFS * XHCI_NET_TX_SIZE, 4096, &n->txbuf_phys)))
+            return XHCI_ERR_NOMEM;
+        for (int dir = 0; dir < 2; dir++) {
+            uint8_t dci = dir ? n->in_dci : n->out_dci;
+            struct xhci_ep_ctx *ep = in_ep(d, dci);
+            ep->dw0 = 0;
+            ep->dw1 = (3u << 1) | ((uint32_t)(dir ? EP_TYPE_BULK_IN : EP_TYPE_BULK_OUT) << 3) |
+                      ((uint32_t)(dir ? n->in_burst : n->out_burst) << 8) |
+                      ((uint32_t)(dir ? n->in_mps : n->out_mps) << 16);
+            ep->deq = (dir ? n->in_ring.phys : n->out_ring.phys) | 1;
+            ep->dw4 = 1514;                                     /* average TRB length: a frame */
+            ic->add_flags |= 1u << dci;
+            if (dci > max_dci) max_dci = dci;
+        }
+    }
     sl->dw0 = (sl->dw0 & ~(0x1Fu << 27)) | (max_dci << 27);    /* context entries */
     return command(TRB_TYPE(TRB_CONFIGURE_EP) | TRB_SLOT(d->slot), d->in_phys, NULL);
 }
@@ -976,6 +1146,26 @@ static void start_reports(struct usb_dev *d, struct hid_if *h)
     ev_unlock(s);
 }
 
+/* Forget what a configuration's descriptors said (keeps the DMA memory). */
+static void clear_functions(struct usb_dev *d)
+{
+    d->nhid = 0;
+    struct msc_if *m = &d->msc;
+    m->present = false;
+    m->iface = m->subclass = m->protocol = 0;
+    m->in_addr = m->out_addr = m->in_dci = m->out_dci = 0;
+    m->in_mps = m->out_mps = 0;
+    m->in_burst = m->out_burst = 0;
+    struct net_fn *n = &d->net;
+    n->present = n->running = n->needs_reset = false;
+    n->proto = n->ctrl_iface = n->data_iface = n->data_alt = 0;
+    n->in_addr = n->out_addr = n->in_dci = n->out_dci = 0;
+    n->in_mps = n->out_mps = 0;
+    n->in_burst = n->out_burst = 0;
+    n->mac_string = 0;
+    n->max_segment = 0;
+}
+
 static int enumerate_port(uint32_t port)
 {
     int speed = port_reset(port);
@@ -987,8 +1177,10 @@ static int enumerate_port(uint32_t port)
         return XHCI_ERR_CMD;
     }
     struct usb_dev *d = &X.devs[slot];
-    struct usb_dev_mem { void *o, *i, *c; uint64_t op, ip, cp; struct xhci_ring e; struct hid_if h[2]; struct msc_if m; } keep =
-        { d->out_ctx, d->in_ctx, d->ctrl_buf, d->out_phys, d->in_phys, d->ctrl_phys, d->ep0, { d->hid[0], d->hid[1] }, d->msc };
+    struct usb_dev_mem { void *o, *i, *c; uint64_t op, ip, cp; struct xhci_ring e; struct hid_if h[2]; struct msc_if m;
+                         struct net_fn n; } keep =
+        { d->out_ctx, d->in_ctx, d->ctrl_buf, d->out_phys, d->in_phys, d->ctrl_phys, d->ep0, { d->hid[0], d->hid[1] }, d->msc,
+          d->net };
     mem_zero(d, sizeof *d);                         /* keep DMA memory from a previous user */
     d->out_ctx = keep.o; d->in_ctx = keep.i; d->ctrl_buf = keep.c;
     d->out_phys = keep.op; d->in_phys = keep.ip; d->ctrl_phys = keep.cp;
@@ -1000,6 +1192,10 @@ static int enumerate_port(uint32_t port)
     d->msc.in_ring.trbs = keep.m.in_ring.trbs;   d->msc.in_ring.phys = keep.m.in_ring.phys;
     d->msc.out_ring.trbs = keep.m.out_ring.trbs; d->msc.out_ring.phys = keep.m.out_ring.phys;
     d->msc.bounce = keep.m.bounce; d->msc.bounce_phys = keep.m.bounce_phys;
+    d->net.in_ring.trbs = keep.n.in_ring.trbs;   d->net.in_ring.phys = keep.n.in_ring.phys;
+    d->net.out_ring.trbs = keep.n.out_ring.trbs; d->net.out_ring.phys = keep.n.out_ring.phys;
+    d->net.rxbuf = keep.n.rxbuf; d->net.rxbuf_phys = keep.n.rxbuf_phys;
+    d->net.txbuf = keep.n.txbuf; d->net.txbuf_phys = keep.n.txbuf_phys;
     d->slot = slot; d->port = (uint8_t)port; d->speed = (uint8_t)speed;
     if (!alloc_device(d)) { out_s("usb: out of DMA memory\n"); goto fail_slot; }
     d->used = true;
@@ -1051,18 +1247,31 @@ static int enumerate_port(uint32_t port)
         return 0;
     }
 
-    /* Configuration bundle */
+    /* Configuration bundle: the first configuration, or the first later one
+     * with something we drive in it (USB Ethernet gadgets put CDC in one
+     * configuration and RNDIS in another) */
     uint8_t cfg[512];
-    if (get_descriptor(d, USB_DT_CONFIG, 0, 0, cfg, 9) != XHCI_OK) goto fail_dev;
-    const struct usb_config_descriptor *cd = (const void *)cfg;
-    uint16_t total = cd->wTotalLength > sizeof cfg ? sizeof cfg : cd->wTotalLength;
-    uint8_t config_value = cd->bConfigurationValue;
-    if (get_descriptor(d, USB_DT_CONFIG, 0, 0, cfg, total) != XHCI_OK) goto fail_dev;
-    parse_config(d, cfg, total);
-
+    uint8_t config_value = 0;
+    uint8_t ncfg = d->desc.bNumConfigurations ? d->desc.bNumConfigurations : 1;
+    for (uint8_t ci = 0; ci < ncfg && ci < 4; ci++) {
+        if (get_descriptor(d, USB_DT_CONFIG, ci, 0, cfg, 9) != XHCI_OK) { if (ci == 0) goto fail_dev; break; }
+        const struct usb_config_descriptor *cd = (const void *)cfg;
+        uint16_t total = cd->wTotalLength > sizeof cfg ? sizeof cfg : cd->wTotalLength;
+        uint8_t value = cd->bConfigurationValue;
+        if (get_descriptor(d, USB_DT_CONFIG, ci, 0, cfg, total) != XHCI_OK) { if (ci == 0) goto fail_dev; break; }
+        clear_functions(d);
+        parse_config(d, cfg, total);
+        if (ci == 0) config_value = value;
+        if (d->nhid || d->msc.present || d->net.present) { config_value = value; break; }
+    }
+    if (!d->nhid && !d->msc.present && !d->net.present) {
+        clear_functions(d);
+        control(d, USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE, USB_REQ_SET_CONFIGURATION, config_value, 0, 0, NULL);
+        out_s("usb:   no supported interface; device left configured but unused\n");
+        return 0;
+    }
     if (control(d, USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE, USB_REQ_SET_CONFIGURATION,
                 config_value, 0, 0, NULL) != XHCI_OK) goto fail_dev;
-    if (!d->nhid && !d->msc.present) { out_s("usb:   no supported interface; device left configured but unused\n"); return 0; }
 
     /* HID class setup: boot protocol, no idle repeats (we repeat ourselves) */
     for (int i = 0; i < d->nhid; i++) {
@@ -1092,9 +1301,17 @@ static int enumerate_port(uint32_t port)
         if (d->msc.in_burst) { out_s(", burst "); out_dec(d->msc.in_burst + 1u); }
         out_c('\n');
     }
-    info->kind = d->nhid ? d->hid[0].kind : USB_KIND_STORAGE;
+    if (d->net.present) {
+        static const char *const protos[] = { "?", "RNDIS", "CDC ECM", "CDC NCM" };
+        out_s("usb:   network ("); out_s(protos[d->net.proto <= 3 ? d->net.proto : 0]);
+        out_s(") on interfaces "); out_dec(d->net.ctrl_iface); out_c('/'); out_dec(d->net.data_iface);
+        if (d->net.data_alt) { out_s(" alt "); out_dec(d->net.data_alt); }
+        out_s(": bulk IN 0x"); out_hex(d->net.in_addr, 2); out_s(" / OUT 0x"); out_hex(d->net.out_addr, 2);
+        out_s(", "); out_dec(d->net.in_mps); out_s(" B packets\n");
+    }
+    info->kind = d->nhid ? d->hid[0].kind : d->msc.present ? USB_KIND_STORAGE : USB_KIND_NET;
     info->hid_count = (uint8_t)d->nhid;
-    return d->nhid + (d->msc.present ? 1 : 0);
+    return d->nhid + (d->msc.present ? 1 : 0) + (d->net.present ? 1 : 0);
 
 fail_dev:
     out_s("usb: port "); out_dec(port); out_s(": enumeration failed\n");
@@ -1116,6 +1333,7 @@ static void release_port(uint32_t port)
     for (int i = 0; i < d->nhid; i++) d->hid[i].active = false;
     d->msc.present = false;
     d->msc.in_addr = d->msc.out_addr = 0;
+    d->net.present = d->net.running = false;
     d->used = false;
     d->info.present = false;
     ev_unlock(s);
@@ -1199,6 +1417,40 @@ int xhci_settle_step(void)
     return pending;
 }
 
+static uint8_t ep_state(struct usb_dev *d, uint8_t dci);
+
+/* Stop both network endpoints, point them past what was queued, clear
+ * the device's halts, then queue the receive buffers that were on the ring
+ * again. Completed buffers the class driver has not released stay its. */
+static void net_restart_locked(struct usb_dev *d)
+{
+    struct net_fn *n = &d->net;
+    irqstate_t s = ev_lock();
+    n->running = false;
+    n->needs_reset = false;
+    ev_unlock(s);
+    for (int dir = 0; dir < 2; dir++) {
+        uint8_t dci = dir ? n->in_dci : n->out_dci;
+        struct xhci_ring *r = dir ? &n->in_ring : &n->out_ring;
+        uint8_t st = ep_state(d, dci);
+        if (st == 1) command(TRB_TYPE(TRB_STOP_EP) | TRB_SLOT(d->slot) | TRB_EP(dci), 0, NULL);
+        if (st == 2 || st == 4) endpoint_reset(d, dci, r);
+        else {
+            uint64_t deq = (r->phys + (uint64_t)r->enq * sizeof(struct xhci_trb)) | r->cycle;
+            command(TRB_TYPE(TRB_SET_TR_DEQUEUE) | TRB_SLOT(d->slot) | TRB_EP(dci), deq, NULL);
+        }
+        control(d, USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_ENDPOINT, USB_REQ_CLEAR_FEATURE,
+                0 /* ENDPOINT_HALT */, dir ? n->in_addr : n->out_addr, 0, NULL);
+    }
+    s = ev_lock();
+    n->tx_busy = 0;
+    if (d->net.present) {
+        n->running = true;
+        for (unsigned b = 0; b < XHCI_NET_RX_BUFS; b++) if (!n->rx_done[b]) net_queue_rx(d, b);
+    }
+    ev_unlock(s);
+}
+
 static void recover_endpoints_locked(void)
 {
     if (!__atomic_exchange_n(&X.ep_pending, false, __ATOMIC_ACQUIRE)) return;
@@ -1211,6 +1463,11 @@ static void recover_endpoints_locked(void)
             out_s("usb: slot "); out_dec(slot); out_s(" EP 0x"); out_hex(h->ep_addr, 2);
             out_s(" halted, resetting endpoint\n");
             if (endpoint_reset(d, h->dci, &h->ring) == XHCI_OK) start_reports(d, h);
+        }
+        if (d->net.present && d->net.needs_reset) {
+            out_s("usb: slot "); out_dec(slot); out_s(" network endpoint stopped ("); out_s(cc_name(d->net.last_code));
+            out_s("), restarting\n");
+            net_restart_locked(d);
         }
     }
 }
@@ -1273,9 +1530,16 @@ int xhci_msc_lookup(uint8_t slot, struct xhci_msc_info *out)
 int xhci_control_transfer(uint8_t slot, uint8_t reqtype, uint8_t request, uint16_t value,
                           uint16_t index, uint16_t length, void *data)
 {
+    return xhci_control_transfer_len(slot, reqtype, request, value, index, length, data, NULL);
+}
+
+int xhci_control_transfer_len(uint8_t slot, uint8_t reqtype, uint8_t request, uint16_t value,
+                              uint16_t index, uint16_t length, void *data, uint16_t *actual)
+{
+    if (actual) *actual = 0;
     if (!X.up || slot == 0 || slot > X.max_slots || !X.devs[slot].used) return XHCI_ERR_NODEV;
     if (!acquire(5000)) return XHCI_ERR_BUSY;
-    int rc = X.devs[slot].used ? control(&X.devs[slot], reqtype, request, value, index, length, data)
+    int rc = X.devs[slot].used ? control_len(&X.devs[slot], reqtype, request, value, index, length, data, actual)
                                : XHCI_ERR_NODEV;
     release();
     return rc;
@@ -1386,6 +1650,112 @@ int xhci_clear_halt(uint8_t slot, bool in)
 }
 
 /* ======================================================================== */
+/*  8b. class-driver interface (network functions)                             */
+/* ======================================================================== */
+static struct usb_dev *net_dev(uint8_t slot)
+{
+    if (!X.up || slot == 0 || slot > X.max_slots) return NULL;
+    struct usb_dev *d = &X.devs[slot];
+    return (d->used && d->net.present) ? d : NULL;
+}
+
+int xhci_net_get(int index, struct xhci_net_info *out)
+{
+    for (uint32_t s = 1; s <= X.max_slots; s++) {
+        struct usb_dev *d = net_dev((uint8_t)s);
+        if (!d || index-- != 0) continue;
+        const struct net_fn *n = &d->net;
+        out->slot = d->slot; out->port = d->port; out->speed = d->speed; out->proto = n->proto;
+        out->ctrl_iface = n->ctrl_iface; out->data_iface = n->data_iface; out->data_alt = n->data_alt;
+        out->mac_string = n->mac_string; out->max_segment = n->max_segment;
+        out->in_mps = n->in_mps; out->out_mps = n->out_mps;
+        out->generation = d->info.generation;
+        out->dev = &d->info;
+        return XHCI_OK;
+    }
+    return XHCI_ERR_NODEV;
+}
+
+bool xhci_net_alive(uint8_t slot, uint32_t generation)
+{
+    struct usb_dev *d = net_dev(slot);
+    return d && d->info.generation == generation;
+}
+
+int xhci_net_start(uint8_t slot)
+{
+    struct usb_dev *d = net_dev(slot);
+    if (!d) return XHCI_ERR_NODEV;
+    struct net_fn *n = &d->net;
+    irqstate_t s = ev_lock();
+    if (!n->running) {
+        n->rx_head = n->rx_tail = 0;
+        n->tx_busy = 0;
+        n->running = true;
+        for (unsigned b = 0; b < XHCI_NET_RX_BUFS; b++) net_queue_rx(d, b);
+    }
+    ev_unlock(s);
+    return XHCI_OK;
+}
+
+int xhci_net_rx(uint8_t slot, const uint8_t **data, uint32_t *len)
+{
+    struct usb_dev *d = net_dev(slot);
+    if (!d) return XHCI_ERR_NODEV;
+    struct net_fn *n = &d->net;
+    uint32_t head = __atomic_load_n(&n->rx_head, __ATOMIC_ACQUIRE);
+    if (head == n->rx_tail) return 0;
+    unsigned b = n->rx_fifo[n->rx_tail % XHCI_NET_RX_BUFS];
+    *data = n->rxbuf + (size_t)b * XHCI_NET_RX_SIZE;
+    *len = n->rx_len[b];
+    return 1;
+}
+
+void xhci_net_rx_release(uint8_t slot)
+{
+    struct usb_dev *d = net_dev(slot);
+    if (!d) return;
+    struct net_fn *n = &d->net;
+    irqstate_t s = ev_lock();
+    if (n->rx_head != n->rx_tail) {
+        unsigned b = n->rx_fifo[n->rx_tail % XHCI_NET_RX_BUFS];
+        n->rx_tail++;
+        if (n->running) net_queue_rx(d, b);
+        else n->rx_done[b] = 0;                 /* a restart queues it */
+    }
+    ev_unlock(s);
+}
+
+int xhci_net_tx(uint8_t slot, const void *buf, uint32_t len)
+{
+    if (!len || len >= XHCI_NET_TX_SIZE) return XHCI_ERR_UNSUPPORTED;
+    struct usb_dev *d = net_dev(slot);
+    if (!d) return XHCI_ERR_NODEV;
+    struct net_fn *n = &d->net;
+    irqstate_t s = ev_lock();
+    int rc = XHCI_ERR_BUSY;                     /* also while a restart is under way */
+    if (n->running) {
+        for (unsigned i = 0; i < XHCI_NET_TX_BUFS; i++) {
+            unsigned b = (n->tx_next + i) % XHCI_NET_TX_BUFS;
+            if (n->tx_busy & (1u << b)) continue;
+            uint8_t *p = n->txbuf + (size_t)b * XHCI_NET_TX_SIZE;
+            mem_copy(p, buf, len);
+            if (n->out_mps && len % n->out_mps == 0) p[len++] = 0;   /* end with a short packet */
+            n->tx_busy |= 1u << b;
+            n->tx_next = (uint8_t)((b + 1) % XHCI_NET_TX_BUFS);
+            uint64_t trb = ring_put(&n->out_ring, n->txbuf_phys + (uint64_t)b * XHCI_NET_TX_SIZE, len,
+                                    TRB_TYPE(TRB_NORMAL) | TRB_IOC, false);
+            n->out_ring.tag[(trb - n->out_ring.phys) / sizeof(struct xhci_trb)] = (uint8_t)b;
+            ring_doorbell(d->slot, n->out_dci);
+            rc = XHCI_OK;
+            break;
+        }
+    }
+    ev_unlock(s);
+    return rc;
+}
+
+/* ======================================================================== */
 /*  9. diagnostics                                                             */
 /* ======================================================================== */
 static const char *pls_name(uint32_t pls)
@@ -1444,6 +1814,7 @@ void xhci_dump_state(void (*putc_fn)(char c))
             const struct usb_dev *d = &X.devs[X.port_slot[p]];
             out_s(" slot "); out_dec(X.port_slot[p]); out_s(" \""); out_s(d->info.product_name); out_c('"');
             if (d->msc.present) out_s(" (mass storage)");
+            if (d->net.present) { out_s(" (network"); if (d->net.errors) { out_s(", "); out_dec(d->net.errors); out_s(" errors"); } out_c(')'); }
         }
         out_c('\n');
     }

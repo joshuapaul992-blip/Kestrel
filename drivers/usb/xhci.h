@@ -227,7 +227,7 @@ enum xhci_completion {
     CC_SUCCESS = 1, CC_DATA_BUFFER = 2, CC_BABBLE = 3, CC_USB_TRANSACTION = 4,
     CC_TRB_ERROR = 5, CC_STALL = 6, CC_RESOURCE = 7, CC_BANDWIDTH = 8,
     CC_NO_SLOTS = 9, CC_SHORT_PACKET = 13, CC_CONTEXT_STATE = 19,
-    CC_PARAMETER = 17, CC_EVENT_RING_FULL = 21,
+    CC_PARAMETER = 17, CC_EVENT_RING_FULL = 21, CC_STOPPED = 26, CC_STOPPED_LENGTH = 27,
 };
 
 /* Event Ring Segment Table entry */
@@ -344,9 +344,12 @@ struct xhci_platform {
      * from xhci_poll() when a command or transfer completes. */
     void     (*pause)(void *chan, uint32_t us);
     void     (*wake)(void *chan);
+    /* Optional: a network function received a transfer (from xhci_poll(),
+     * possibly in interrupt context): the class driver should look. */
+    void     (*net_rx)(void);
 };
 
-enum usb_dev_kind { USB_KIND_OTHER = 0, USB_KIND_KEYBOARD, USB_KIND_MOUSE, USB_KIND_HUB, USB_KIND_STORAGE };
+enum usb_dev_kind { USB_KIND_OTHER = 0, USB_KIND_KEYBOARD, USB_KIND_MOUSE, USB_KIND_HUB, USB_KIND_STORAGE, USB_KIND_NET };
 
 struct usb_device_info {
     bool     present;
@@ -365,6 +368,26 @@ struct usb_device_info {
 struct xhci_msc_info {
     uint8_t  slot, port, speed, iface, subclass, protocol;
     uint8_t  in_ep, out_ep, in_burst, out_burst;
+    uint16_t in_mps, out_mps;
+    uint32_t generation;
+    const struct usb_device_info *dev;
+};
+
+/* Network function (phone tethering, USB Ethernet gadgets): the control
+ * interface says which protocol frames the bulk data interface carries */
+#define XHCI_NET_RNDIS      1       /* Microsoft RNDIS (Android tethering)        */
+#define XHCI_NET_ECM        2       /* CDC Ethernet Control Model: plain frames   */
+#define XHCI_NET_NCM        3       /* CDC Network Control Model: frames in NTBs  */
+#define XHCI_NET_RX_BUFS    16      /* receive transfers kept queued              */
+#define XHCI_NET_RX_SIZE    16384   /* bytes each (what a device may put in one)  */
+#define XHCI_NET_TX_BUFS    32      /* transmit transfers in flight at most       */
+#define XHCI_NET_TX_SIZE    2048    /* largest transmit transfer                  */
+
+struct xhci_net_info {
+    uint8_t  slot, port, speed, proto;
+    uint8_t  ctrl_iface, data_iface, data_alt;  /* alt: the data interface's setting with the endpoints */
+    uint8_t  mac_string;                        /* ECM/NCM: string index of the MAC address, 0 = none */
+    uint16_t max_segment;                       /* ECM/NCM wMaxSegmentSize, 0 = not given */
     uint16_t in_mps, out_mps;
     uint32_t generation;
     const struct usb_device_info *dev;
@@ -402,6 +425,9 @@ int  xhci_msc_get(int index, struct xhci_msc_info *out);       /* by index      
 int  xhci_msc_lookup(uint8_t slot, struct xhci_msc_info *out); /* still there?  */
 int  xhci_control_transfer(uint8_t slot, uint8_t reqtype, uint8_t request, uint16_t value,
                            uint16_t index, uint16_t length, void *data);
+/* The same, with the bytes an IN data stage actually brought (a short packet ends it early). */
+int  xhci_control_transfer_len(uint8_t slot, uint8_t reqtype, uint8_t request, uint16_t value,
+                               uint16_t index, uint16_t length, void *data, uint16_t *actual);
 /* One bulk transfer of up to XHCI_BULK_MAX bytes through the device's DMA
  * bounce buffer (`buf` may be any memory): one TD, a chain of Normal TRBs
  * of up to 64 KiB each, and one wait. On timeout the TD is cancelled
@@ -411,6 +437,26 @@ int  xhci_bulk_transfer(uint8_t slot, bool in, void *buf, uint32_t len,
                         uint32_t *actual, uint32_t timeout_ms);
 /* CLEAR_FEATURE(ENDPOINT_HALT) on the device + host endpoint reset. */
 int  xhci_clear_halt(uint8_t slot, bool in);
+
+/* Network functions (thread context unless noted). xhci_net_start() queues
+ * the receive transfers; after it, transfers complete asynchronously:
+ *   xhci_net_rx()      the oldest completed receive transfer (1), none (0),
+ *                      or XHCI_ERR_NODEV once the device is gone; the data
+ *                      stays valid until xhci_net_rx_release(), which gives
+ *                      the buffer back to the device
+ *   xhci_net_tx()      copies one transfer (at most XHCI_NET_TX_SIZE - 1
+ *                      bytes) and starts it; XHCI_ERR_BUSY when all
+ *                      buffers are in flight. A length that is a multiple of
+ *                      the packet size gets a zero byte more, so that the
+ *                      device sees a short packet end the transfer.
+ * These three never sleep (any context, interrupts on or off). A halted
+ * endpoint is reset by xhci_service(), which then starts receiving again. */
+int  xhci_net_get(int index, struct xhci_net_info *out);
+bool xhci_net_alive(uint8_t slot, uint32_t generation);
+int  xhci_net_start(uint8_t slot);
+int  xhci_net_rx(uint8_t slot, const uint8_t **data, uint32_t *len);
+void xhci_net_rx_release(uint8_t slot);
+int  xhci_net_tx(uint8_t slot, const void *buf, uint32_t len);
 
 /* Human-readable controller state: operational/runtime registers, the
  * firmware handoff result, every port's PORTSC decoded, slots and last

@@ -35,6 +35,7 @@
 #define USB_DT_ENDPOINT           0x05
 #define USB_DT_HID                0x21
 #define USB_DT_REPORT             0x22
+#define USB_DT_CS_INTERFACE       0x24      /* class-specific (CDC functional descriptors) */
 #define USB_DT_SS_EP_COMPANION    0x30
 
 /* device / interface classes */
@@ -42,6 +43,16 @@
 #define USB_CLASS_HID             0x03
 #define USB_CLASS_MASS_STORAGE    0x08
 #define USB_CLASS_HUB             0x09
+#define USB_CLASS_COMM            0x02      /* CDC communications (control interface) */
+#define USB_CLASS_CDC_DATA        0x0A
+#define USB_CLASS_WIRELESS        0xE0
+#define USB_CLASS_MISC            0xEF
+
+/* CDC 1.2 and its ECM/NCM subclasses */
+#define CDC_SUBCLASS_ECM          0x06
+#define CDC_SUBCLASS_NCM          0x0D
+#define CDC_FD_UNION              0x06      /* functional descriptor subtypes */
+#define CDC_FD_ETHERNET           0x0F
 
 /* HID (HID 1.11 section 7.2 and appendix B) */
 #define HID_REQ_GET_REPORT        0x01
