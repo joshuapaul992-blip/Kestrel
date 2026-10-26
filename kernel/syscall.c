@@ -512,7 +512,7 @@ static const struct { uint32_t req; uint16_t size; uint8_t dir; } ioctl_args[] =
     { TIOCGWINSZ, sizeof(struct kwinsize), IOC_OUT }, { TIOCSWINSZ, sizeof(struct kwinsize), IOC_IN },
     { TIOCGPGRP, 4, IOC_OUT }, { TIOCSPGRP, 4, IOC_IN }, { TIOCOUTQ, 4, IOC_OUT }, { FIONREAD_T, 4, IOC_OUT },
     { FIONBIO, 4, IOC_IN }, { TIOCGETD, 4, IOC_OUT }, { TIOCSETD, 4, IOC_IN }, { TIOCGSID, 4, IOC_OUT },
-    { TIOCGPTN, 4, IOC_OUT }, { TIOCSPTLCK, 4, IOC_IN },
+    { TIOCGPTN, 4, IOC_OUT }, { TIOCSPTLCK, 4, IOC_IN }, { TIOCPKT, 4, IOC_IN }, { TIOCGPKT, 4, IOC_OUT },
     { KFB_GET_INFO, sizeof(struct kfb_info), IOC_OUT }, { KFB_BLIT, sizeof(struct kfb_blit), IOC_IN },
     { KFB_GET_MODES, sizeof(struct kfb_modes), IOC_OUT }, { KFB_SET_MODE, sizeof(struct kfb_mode), IOC_IN },
     { FBIOGET_VSCREENINFO, sizeof(struct fb_var_screeninfo_lite), IOC_OUT },

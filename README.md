@@ -892,7 +892,8 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 - **Controlling terminal:** set with `TIOCSCTTY`, or when a session leader opens a slave. `/dev/tty` then opens it; `TIOCGPGRP`/`TIOCSPGRP` set the foreground process group.
 - **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group (SIGTSTP is ignored: no job control). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
 - **Hang-up:** after the slave side closes, master reads fail with EIO (as on Linux).
-- **Test:** `user/ptytest.c` checks all of this in 18 tests.
+- **Packet mode:** `TIOCPKT` on the master puts a status byte in front of every read, as on Linux: 0 (`TIOCPKT_DATA`) before the slave's output, or alone, `TIOCPKT_FLUSHREAD`/`TIOCPKT_FLUSHWRITE` after the slave side flushes its queues (`tcflush`, `TCSETSF`, Ctrl+C), which poll reports as `POLLPRI`. VTE turns it on before it starts the shell, and gives up without it, so LXTerminal needs it.
+- **Test:** `user/ptytest.c` checks all of this in 22 tests.
 
 **A shell** (`ports/busybox`): BusyBox 1.36 provides `/bin/sh` (ash) and about 400 tools in one 1.2 MB static-PIE musl binary. It is the login shell on every text terminal.
 - **Install:** every applet is a hard link to it. The boot volume keeps the links: tarfs supports hard links, and `make usbimg` preserves them. `/boot/bin` is bound on `/bin`, so `/bin/sh` is where scripts expect it.

@@ -83,6 +83,7 @@ struct kwinsize {
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
 #define FIONREAD_T  0x541B
+#define TIOCPKT     0x5420
 #define FIONBIO     0x5421
 #define TIOCNOTTY   0x5422
 #define TIOCGETD    0x5424
@@ -91,5 +92,11 @@ struct kwinsize {
 #define TIOCGSID    0x5429
 #define TIOCGPTN    0x80045430
 #define TIOCSPTLCK  0x40045431
+#define TIOCGPKT    0x80045438
+
+/* packet mode (TIOCPKT): the status byte in front of each master read */
+#define TIOCPKT_DATA        0x00
+#define TIOCPKT_FLUSHREAD   0x01
+#define TIOCPKT_FLUSHWRITE  0x02
 
 #endif

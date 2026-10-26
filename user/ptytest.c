@@ -3,7 +3,8 @@
  * posix_openpt/grantpt/unlockpt/ptsname, canonical editing and echo, output
  * processing, raw mode with VMIN/VTIME, EOF, window size, and a child in
  * its own session with the slave as controlling terminal: line I/O,
- * /dev/tty, Ctrl+C -> SIGINT, master close -> SIGHUP, slave close -> EIO.
+ * /dev/tty, Ctrl+C -> SIGINT, master close -> SIGHUP, slave close -> EIO;
+ * packet mode (TIOCPKT).
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -151,6 +152,27 @@ int main(int argc, char **argv)
     n = read(m, buf, sizeof buf);
     while (n > 0) n = read(m, buf, sizeof buf);
     CHECK(n == -1 && errno == EIO, "after the slave side closes, master read fails with EIO");
+    close(m);
+
+    /* packet mode (TIOCPKT), as VTE terminals (LXTerminal) use it */
+    m = posix_openpt(O_RDWR | O_NOCTTY);
+    grantpt(m); unlockpt(m);
+    s = open(ptsname(m), O_RDWR | O_NOCTTY);
+    int one = 1, zero = 0, pk = 0;
+    CHECK(ioctl(m, TIOCPKT, &one) == 0 && ioctl(m, TIOCGPKT, &pk) == 0 && pk == 1 &&
+          ioctl(s, TIOCPKT, &one) == -1 && errno == ENOTTY, "TIOCPKT on the master (not the slave), TIOCGPKT");
+    write(s, "pk\n", 3);
+    pm.fd = m; pm.events = POLLIN;
+    n = poll(&pm, 1, 1000) == 1 ? read(m, buf, sizeof buf) : -1;
+    CHECK(n == 5 && !memcmp(buf, "\0pk\r\n", 5), "packet mode: a 0 byte (TIOCPKT_DATA) before the data");
+    tcflush(s, TCIOFLUSH);
+    pm.events = POLLIN | POLLPRI;
+    CHECK(poll(&pm, 1, 1000) == 1 && (pm.revents & POLLPRI) && read(m, buf, sizeof buf) == 1 &&
+          buf[0] == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE), "tcflush on the slave: POLLPRI, then one status byte");
+    write(s, "x", 1);
+    CHECK(ioctl(m, TIOCPKT, &zero) == 0 && read(m, buf, sizeof buf) == 1 && buf[0] == 'x',
+          "TIOCPKT 0: plain reads again");
+    close(s);
     close(m);
 
     /* hang-up */
