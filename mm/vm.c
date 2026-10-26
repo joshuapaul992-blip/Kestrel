@@ -124,6 +124,18 @@ static bool mm_active(const struct mm *mm)
     return false;
 }
 
+/* Will some thread load it again? A thread's root has to belong to an
+ * address space it holds a reference to (or be the kernel's); this finds
+ * one that does not, before it runs on freed page tables. */
+static struct tcb *mm_holder(const struct mm *mm)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = task_slot(i);
+        if (t->state != TASK_UNUSED && (t->cr3 & ADDR_MASK) == mm_cr3(mm)) return t;
+    }
+    return NULL;
+}
+
 /* Every CPU that has mm loaded drops these translations before we go on
  * (and before any frame they pointed to is freed or reused). */
 static void tlb_page(struct mm *mm, uint64_t va) { tlb_shootdown(mm_cr3(mm), va, va + PAGE); }
@@ -364,6 +376,8 @@ void mm_put(struct mm *mm)
 {
     if (!mm || __atomic_sub_fetch(&mm->users, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (mm_active(mm)) panic("mm_put: freeing the loaded address space");
+    struct tcb *h = mm_holder(mm);
+    if (h) panic("mm_put: pid %d (%s) still runs on this address space", h->pid, h->name);
     while (mm->vmas) { struct vma *v = mm->vmas; mm->vmas = v->next; vma_free(v); }
     free_tables((uint64_t *)mm->pml4, 4);
     if (mm->kpml4) {                                    /* the window, and the kernel's root */
