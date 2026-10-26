@@ -17,8 +17,9 @@
  *     change; with MSI-X the configuration generation does.
  *   - Kestrel drives virtio-net and virtio-blk itself, so the PCI driver
  *     here takes only the device types that have a Linux driver: the GPU.
- *   - No shared memory regions are offered (virtio_get_shm_region() says
- *     none), so virtio-gpu runs without host-visible blob memory.
+ *   - Shared memory regions (virtio_get_shm_region()) are found in the
+ *     vendor capabilities: virtio-gpu's host-visible window, where Venus
+ *     maps the blobs the host allocates.
  *
  * The rings are the driver's to lock (virtio-gpu holds its queue's
  * spinlock around add, kick and get_buf), as on Linux. The interrupt runs
@@ -526,6 +527,7 @@ EXPORT_SYMBOL(virtio_dma_buf_get_uuid);
 #define VIRTIO_PCI_CAP_NOTIFY_CFG   2
 #define VIRTIO_PCI_CAP_ISR_CFG      3
 #define VIRTIO_PCI_CAP_DEVICE_CFG   4
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
 
 /* struct virtio_pci_cap: offsets in the vendor capability */
 #define CAP_CFG_TYPE    3
@@ -533,6 +535,9 @@ EXPORT_SYMBOL(virtio_dma_buf_get_uuid);
 #define CAP_OFFSET      8
 #define CAP_LENGTH      12
 #define CAP_NOTIFY_MULT 16
+#define CAP_ID          5               /* a shared memory region's id */
+#define CAP_OFFSET_HI   16              /* struct virtio_pci_cap64 */
+#define CAP_LENGTH_HI   20
 
 /* struct virtio_pci_common_cfg */
 #define CC_DFSELECT     0
@@ -791,9 +796,37 @@ fail:
     return err;
 }
 
+/* Shared memory region `id` (spec 4.1.4.7): a range of one of the device's
+ * memory BARs, given by a 64-bit offset and length. Its physical address
+ * goes to the driver, which maps what it needs of it. */
 static bool vp_get_shm_region(struct virtio_device *vdev, struct virtio_shm_region *region, u8 id)
 {
-    return false;                                       /* see the top of this file */
+    struct pci_dev *pdev = to_vp(vdev)->pci;
+    for (u8 pos = pci_find_capability(pdev, PCI_CAP_ID_VNDR); pos;
+         pos = pci_find_next_capability(pdev, pos, PCI_CAP_ID_VNDR)) {
+        u8 cfg_type, bar, cap_id;
+        u32 lo, hi;
+        u64 offset, length;
+        pci_read_config_byte(pdev, pos + CAP_CFG_TYPE, &cfg_type);
+        pci_read_config_byte(pdev, pos + CAP_BAR, &bar);
+        pci_read_config_byte(pdev, pos + CAP_ID, &cap_id);
+        if (cfg_type != VIRTIO_PCI_CAP_SHARED_MEMORY_CFG || cap_id != id) continue;
+        if (bar > 5 || !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM)) continue;
+        pci_read_config_dword(pdev, pos + CAP_OFFSET, &lo);
+        pci_read_config_dword(pdev, pos + CAP_OFFSET_HI, &hi);
+        offset = (u64)hi << 32 | lo;
+        pci_read_config_dword(pdev, pos + CAP_LENGTH, &lo);
+        pci_read_config_dword(pdev, pos + CAP_LENGTH_HI, &hi);
+        length = (u64)hi << 32 | lo;
+        if (!length || offset + length < offset || offset + length > pci_resource_len(pdev, bar)) {
+            dev_warn(&vdev->dev, "shared memory region %u does not fit BAR %u\n", id, bar);
+            return false;
+        }
+        region->addr = pci_resource_start(pdev, bar) + offset;
+        region->len = length;
+        return true;
+    }
+    return false;
 }
 
 static const struct virtio_config_ops vp_config_ops = {

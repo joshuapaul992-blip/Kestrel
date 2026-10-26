@@ -6,18 +6,19 @@
 #   RESULTS.TAR   selftest/: summary.txt (PASS/FAIL per check), the system
 #                 and GPU reports, the DRM state (/proc/dri) before and after
 #                 X, drmtest, the X server's log, xrandr, glxinfo, eglinfo,
-#                 glxgears' frame rate, screenshots (*.xwd.gz) and the
-#                 kernel log
+#                 glxgears' frame rate, vulkaninfo, vkcube's frame rate,
+#                 screenshots (*.xwd.gz) and the kernel log
 #   REPORT.TXT    the kernel log and the summary (/dev/report)
 #
 # Both are rewritten after every step, so a step that hangs the machine
 # still leaves the ones before it. The desktop stays up at the end.
 # Progress shows on the terminal (and the serial port). The X steps need the Firefox root
-# (Xorg, Mesa and the X client tools); without it they are skipped.
+# (Xorg, Mesa, its Vulkan drivers and the X client tools); without it they are skipped.
 export HOME=/root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export DISPLAY=:0
 D=/tmp/selftest
 GEARS_S=${GEARS_S:-30}
+CUBE_FRAMES=${CUBE_FRAMES:-600}
 mkdir -p $D
 
 say() { echo "selftest: $*"; }                  # the terminal, and the serial port with it
@@ -97,6 +98,42 @@ sleep $((GEARS_S / 2))
 pkill glxgears 2>/dev/null; sleep 1
 fps=$(sed -n 's/.* = \([0-9.]*\) FPS$/\1/p' $D/glxgears.txt | tail -1)
 [ -n "$fps" ] && check "glxgears" PASS "$fps FPS (vblank off)" || check "glxgears" FAIL "$(tail -1 $D/glxgears.txt)"
+save "glxgears"
+
+# 5. Vulkan: the devices the loader finds, then vkcube on the first GPU
+#    (lavapipe, Mesa's software driver, is always there; a GPU is NVK on
+#    nouveau, or Venus on virtio-gpu)
+if command -v vulkaninfo >/dev/null 2>&1; then
+    timeout 120 vulkaninfo --summary > $D/vulkaninfo.txt 2>&1
+    timeout 120 vulkaninfo > $D/vulkaninfo-full.txt 2>&1
+    # GPUn, deviceType and deviceName of each device, one line each
+    awk '/^GPU[0-9]+:/ { n = substr($1, 4) + 0 }
+         /deviceType/ { t[n] = $3 } /deviceName/ { sub(/.*= /, ""); d[n] = $0 }
+         END { for (i in t) print i, t[i], d[i] }' $D/vulkaninfo.txt | sort -n > $D/vulkan-devices.txt
+    gpu=$(grep -v PHYSICAL_DEVICE_TYPE_CPU $D/vulkan-devices.txt | head -1)
+    if [ ! -s $D/vulkan-devices.txt ]; then
+        check "Vulkan" FAIL "vulkaninfo: $(grep -m1 -i 'error' $D/vulkaninfo.txt)"
+    elif [ -n "$gpu" ]; then
+        check "Vulkan on the GPU" PASS "${gpu#* * }"
+    else
+        check "Vulkan on the GPU" FAIL "software only: $(cut -d' ' -f3- $D/vulkan-devices.txt | head -1)"
+    fi
+    save "vulkaninfo"
+    n=${gpu%% *}; n=${n:-0}
+    t0=$(date +%s%N)
+    timeout 300 vkcube --gpu_number $n --present_mode 0 --c $CUBE_FRAMES > $D/vkcube.txt 2>&1 &
+    cube=$!
+    sleep 5; shot vkcube
+    wait $cube; rc=$?
+    ms=$((($(date +%s%N) - t0) / 1000000))
+    if [ $rc = 0 ] && [ $ms -gt 0 ]; then
+        check "vkcube" PASS "$CUBE_FRAMES frames in $ms ms, $((CUBE_FRAMES * 1000 / ms)) FPS (vsync off), $(sed -n 's/^Selected GPU [0-9]*: //p' $D/vkcube.txt)"
+    else
+        check "vkcube" FAIL "exit $rc: $(grep -v '^Selected' $D/vkcube.txt | head -1)"
+    fi
+else
+    check "Vulkan" SKIP "this root has no Vulkan drivers"
+fi
 cat /proc/dri > $D/dri-state-end.txt 2>&1
 save "done"
 say "done: the results are in RESULTS.TAR and REPORT.TXT on the stick"

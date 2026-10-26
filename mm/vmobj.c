@@ -26,7 +26,10 @@ void vmobj_get(struct vm_object *o) { __atomic_add_fetch(&o->refs, 1, __ATOMIC_A
 
 void vmobj_put(struct vm_object *o)
 {
-    if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (!o) return;
+    int left = __atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL);
+    if (left == 1 && o->last_user) o->last_user(o);
+    if (left > 0) return;
     for (uint64_t i = 0; i < o->npages; i++) if (o->pages[i]) page_unref(o->pages[i]);
     kfree(o->pages);
     kfree(o);

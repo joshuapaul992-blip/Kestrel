@@ -22,6 +22,9 @@ struct vm_object {
     uint64_t  npages;           /* capacity of pages[]                        */
     uint64_t *pages;            /* physical addresses, 0 = not yet allocated  */
     uint32_t  seals;            /* memfd F_SEAL_*                              */
+    /* called when the drop of a reference leaves one: SysV shared memory
+     * (kernel/sysvshm.c) holds that one and frees a removed segment then */
+    void    (*last_user)(struct vm_object *o);
     struct spinlock lock;       /* pages[], npages and size                    */
     struct kmutex   wlock;      /* writers and truncates, one at a time        */
 };

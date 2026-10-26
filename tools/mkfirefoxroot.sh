@@ -23,8 +23,9 @@
 # - glibc, bash, coreutils and the usual tools;
 # - GTK 3, GLib, Pango, cairo, fontconfig with the DejaVu fonts (all of
 #   them: Sans, Serif and Mono, their Condensed and ExtraLight faces), Mesa (llvmpipe
-#   through EGL), the X client libraries and tools (xdpyinfo, xeyes,
-#   glxinfo/eglinfo), D-Bus, gtk3-demo, and Xvfb (for /bin/kestrel-bench,
+#   through EGL, and the Vulkan drivers with vulkaninfo and vkcube), the X
+#   client libraries and tools (xdpyinfo, xeyes, glxinfo/eglinfo), D-Bus,
+#   gtk3-demo, and Xvfb (for /bin/kestrel-bench,
 #   the same X server on Kestrel and on Linux);
 # - sound: ALSA with its OSS plugin and an asound.conf that sends ALSA
 #   programs to Kestrel's /dev/dsp and /dev/mixer, and PulseAudio with
@@ -51,7 +52,8 @@ trap 'rm -rf "${ROOT:?}"' EXIT
 
 PKGS="bash dash coreutils findutils grep sed gawk procps util-linux xz-utils zstd less
       libgtk-3-0t64 libgtk-3-bin gtk-3-examples libasound2t64 alsa-utils libdbus-1-3 dbus-daemon dbus-x11
-      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-utils x11-utils x11-apps x11-xserver-utils
+      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-utils mesa-vulkan-drivers vulkan-tools
+      x11-utils x11-apps x11-xserver-utils
       fonts-dejavu-core fonts-dejavu-extra fontconfig hicolor-icon-theme adwaita-icon-theme librsvg2-common shared-mime-info
       libpci3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxcursor1 libxi6 libxtst6 libxss1
       libdbus-glib-1-2 pulseaudio pulseaudio-utils libpulse0 libasound2-plugins xvfb"

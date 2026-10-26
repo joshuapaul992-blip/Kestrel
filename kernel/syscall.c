@@ -8,6 +8,7 @@
  * a user field twice (no time-of-check/time-of-use window). Open files are
  * looked up with a reference held (fget/fput), so a close() from another
  * thread cannot free one under a running call. */
+#include <kernel/sysvshm.h>
 #include <kernel/power.h>
 #include <kernel/block.h>
 #include <kernel/syscall.h>
@@ -1242,6 +1243,16 @@ static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uin
     else if (!(flags & MFD_ALLOW_SEALING)) o->seals = 0x0001;   /* F_SEAL_SEAL: no seals can be added */
     return install(f, flags & MFD_CLOEXEC);
 }
+
+/* System V shared memory (kernel/sysvshm.c) */
+static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sysv_shmget((int32_t)key, size, (int)flags); }
+static int64_t sys_shmat(uint64_t id, uint64_t addr, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sysv_shmat((int)id, addr, (int)flags); }
+static int64_t sys_shmdt(uint64_t addr, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sysv_shmdt(addr); }
+static int64_t sys_shmctl(uint64_t id, uint64_t cmd, uint64_t buf, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sysv_shmctl((int)id, (int)cmd, buf); }
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -3693,8 +3704,8 @@ void syscall_init(void)
     REG(SYS_rseq, sys_absent);         REG(SYS_pidfd_open, sys_absent);
     REG(SYS_quotactl, sys_absent);     REG(SYS_mbind, sys_absent);
     REG(SYS_set_mempolicy, sys_absent); REG(SYS_get_mempolicy, sys_absent);
-    REG(SYS_shmget, sys_absent);       REG(SYS_shmat, sys_absent);
-    REG(SYS_shmctl, sys_absent);       REG(SYS_shmdt, sys_absent);
+    REG(SYS_shmget, sys_shmget);       REG(SYS_shmat, sys_shmat);
+    REG(SYS_shmctl, sys_shmctl);       REG(SYS_shmdt, sys_shmdt);
 
     syscall_cpu_init();
     int n = 0;
