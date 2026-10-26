@@ -17,6 +17,11 @@
  * the keyboard signals (VINTR, VQUIT, VSUSP) for its foreground process
  * group, SIGWINCH on TIOCSWINSZ, and SIGHUP when the master closes.
  *
+ * Packet mode (TIOCPKT on the master, which VTE terminals such as
+ * LXTerminal turn on before they start a shell): each master read starts
+ * with a status byte, TIOCPKT_DATA (0) in front of the slave's output, or
+ * alone, the TIOCPKT_FLUSH* bits for queues the slave side flushed.
+ *
  * Console ptys (pty_console_*) are the text terminals' line discipline: the
  * kernel holds the master for good (kernel/vt.c feeds it keys and draws its
  * output) and the slave is /dev/ttyN itself. Its sessions end with
@@ -61,6 +66,8 @@ struct pty {
     int      masters, slaves;       /* open files on each side                */
     bool     slave_seen;            /* a slave was opened (master reads EIO after) */
     bool     console;               /* master held by the kernel (vt.c)        */
+    bool     pkt;                   /* packet mode (TIOCPKT)                   */
+    uint8_t  pkt_status;            /* packet mode: TIOCPKT_FLUSH* not read yet */
     struct vnode *slave_vn;         /* the slave's node: /dev/pts/N, or /dev/ttyN */
     struct ktermios tio;
     struct kwinsize ws;
@@ -135,6 +142,14 @@ static void flush_input(struct pty *p)
     p->line_len = 0;
 }
 
+/* The slave side's input queue is flushed: a master in packet mode hears
+ * of it (TIOCPKT_FLUSHREAD). The caller wakes the master's readers. */
+static void flush_slave_input(struct pty *p)
+{
+    flush_input(p);
+    if (p->pkt) p->pkt_status |= TIOCPKT_FLUSHREAD;
+}
+
 static void erase_one(struct pty *p)
 {
     if (!p->line_len) return;
@@ -171,7 +186,7 @@ static void input_char(struct pty *p, uint8_t c)
     if (t->c_lflag & TL_ISIG) {
         int sig = c == t->c_cc[VINTR] ? SIGINT : c == t->c_cc[VQUIT] ? SIGQUIT : c == t->c_cc[VSUSP] ? SIGTSTP : 0;
         if (sig && c) {
-            if (!(t->c_lflag & TL_NOFLSH)) flush_input(p);
+            if (!(t->c_lflag & TL_NOFLSH)) flush_slave_input(p);
             if (t->c_lflag & TL_ECHO) echo_char(p, c);
             p->sigs |= 1u << sig;                       /* sent once p->lock is let go */
             return;
@@ -374,7 +389,7 @@ static ssize_t out_read(struct pty *p, void *buf, size_t len, bool nonblock)
 {
     if (!len) return 0;
     uint64_t fl = spin_lock_irqsave(&p->lock);
-    while (!p->out_count) {
+    while (!p->out_count && !(p->pkt && p->pkt_status)) {
         ssize_t r = 0;
         if (!p->console && p->slave_seen && !p->slaves) r = -EIO;  /* slave side closed */
         else if (nonblock) r = -EAGAIN;
@@ -382,13 +397,24 @@ static ssize_t out_read(struct pty *p, void *buf, size_t len, bool nonblock)
         if (r) { spin_unlock_irqrestore(&p->lock, fl); return r; }
         sleep_on_locked(&p->out, &p->lock);
     }
-    size_t n = len < p->out_count ? len : p->out_count;
-    for (size_t i = 0; i < n; i++) ((uint8_t *)buf)[i] = p->out[(p->out_head + i) % OUT_BUF];
+    uint8_t *b = buf;
+    size_t hdr = 0;
+    if (p->pkt) {                                       /* a status byte first, as on Linux */
+        if (p->pkt_status) {                            /* alone, before any more data */
+            b[0] = p->pkt_status;
+            p->pkt_status = 0;
+            spin_unlock_irqrestore(&p->lock, fl);
+            return 1;
+        }
+        b[hdr++] = TIOCPKT_DATA;
+    }
+    size_t n = len - hdr < p->out_count ? len - hdr : p->out_count;
+    for (size_t i = 0; i < n; i++) b[hdr + i] = p->out[(p->out_head + i) % OUT_BUF];
     p->out_head = (p->out_head + n) % OUT_BUF;
     p->out_count -= n;
     wakeup(&p->out);                                    /* slave writers waiting for room */
     spin_unlock_irqrestore(&p->lock, fl);
-    return (ssize_t)n;
+    return (ssize_t)(hdr + n);
 }
 
 static ssize_t master_read(struct file *f, void *buf, size_t len)
@@ -440,6 +466,7 @@ static int master_poll(struct file *f, int events)
     poll_wait(&p->out);
     uint64_t fl = spin_lock_irqsave(&p->lock);
     if (p->out_count) r |= POLLIN;
+    if (p->pkt && p->pkt_status) r |= POLLIN | POLLPRI;
     if (p->slave_seen && !p->slaves) r |= POLLHUP | POLLIN;
     if (p->in_count < IN_BUF) r |= POLLOUT;
     spin_unlock_irqrestore(&p->lock, fl);
@@ -611,9 +638,10 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         if (!uptr(arg, sizeof(struct ktermios))) return -EFAULT;
         struct ktermios n = *(const struct ktermios *)arg;
         fl = spin_lock_irqsave(&p->lock);
-        if (req == TCSETSF) flush_input(p);
+        if (req == TCSETSF) { if (master) flush_input(p); else flush_slave_input(p); }
         set_termios(p, &n);
         wakeup(&p->in);
+        wakeup(&p->out);                                /* a packet-mode master: the flush */
         spin_unlock_irqrestore(&p->lock, fl);
         return 0;
     }
@@ -645,6 +673,20 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
         p->locked = *(const int32_t *)arg != 0;
         spin_unlock_irqrestore(&p->lock, fl);
         return 0;
+    case TIOCPKT:
+        if (!master) return -ENOTTY;
+        if (!uptr(arg, 4)) return -EFAULT;
+        fl = spin_lock_irqsave(&p->lock);
+        bool on = *(const int32_t *)arg != 0;
+        if (on && !p->pkt) p->pkt_status = 0;           /* nothing from before it was on */
+        p->pkt = on;
+        spin_unlock_irqrestore(&p->lock, fl);
+        return 0;
+    case TIOCGPKT:
+        if (!master) return -ENOTTY;
+        if (!uptr(arg, 4)) return -EFAULT;
+        *(int32_t *)arg = __atomic_load_n(&p->pkt, __ATOMIC_RELAXED);
+        return 0;
     case FIONREAD_T:
         if (!uptr(arg, 4)) return -EFAULT;
         fl = spin_lock_irqsave(&p->lock);
@@ -660,8 +702,11 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
     case TCFLSH: {
         long q = (long)arg;                             /* 0 input, 1 output, 2 both */
         fl = spin_lock_irqsave(&p->lock);
-        if (q == 0 || q == 2) flush_input(p);
-        if (q == 1 || q == 2) p->out_head = p->out_count = 0;
+        if (q == 0 || q == 2) { if (master) flush_input(p); else flush_slave_input(p); }
+        if (q == 1 || q == 2) {
+            p->out_head = p->out_count = 0;
+            if (!master && p->pkt) p->pkt_status |= TIOCPKT_FLUSHWRITE;
+        }
         wakeup(&p->in); wakeup(&p->out);
         spin_unlock_irqrestore(&p->lock, fl);
         return 0;
