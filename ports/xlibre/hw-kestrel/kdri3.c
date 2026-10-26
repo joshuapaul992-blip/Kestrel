@@ -14,9 +14,19 @@
  * DMA_BUF_IOCTL_SYNC waits for the fences attached to the buffer, which
  * is where Mesa leaves its rendering's fence at present time.
  *
- * DRI3Open gives the client the first render node (/dev/dri/renderD128
- * and on). With none, the screen has no DRI3, as before. The idle fences
- * Present signals are shared-memory futexes (miSyncShm, libxshmfence).
+ * The screen has DRI3 when the machine has a render node
+ * (/dev/dri/renderD128 and on). DRI3Open does not hand that node out,
+ * though: the screen is not on the GPU but in the CPU's memory, and
+ * DRI3Open is how a client learns which device the server shows its
+ * images on. Given the GPU it renders on, Mesa's Vulkan drivers present
+ * linear images in the GPU's own memory (VRAM), which the CPU reads across
+ * PCIe without a cache: on a Quadro P2000 a full-screen game and the whole
+ * desktop with it dropped to 2 frames per second. Given a
+ * descriptor that is no GPU (/dev/null), Mesa takes its path for a display
+ * on another device: it renders into the GPU's memory as usual, then has
+ * the GPU copy each frame into a linear buffer in system memory, which the
+ * server reads at memory speed. The idle fences Present signals are
+ * shared-memory futexes (miSyncShm, libxshmfence).
  *
  * Kestrel's own code: MIT licence.
  */
@@ -75,7 +85,7 @@ kdri3_buffer(PixmapPtr pixmap)
 static int
 kdri3_open_client(ClientPtr client, ScreenPtr screen, RRProviderPtr provider, int *fd)
 {
-    int f = open(kdri3_node, O_RDWR | O_CLOEXEC);
+    int f = open("/dev/null", O_RDWR | O_CLOEXEC);     /* not the GPU: see the top */
     if (f < 0)
         return BadAlloc;
     *fd = f;
@@ -249,7 +259,7 @@ found:
     dixScreenHookPixmapDestroy(screen, kdri3_pixmap_destroy);
     kdri3_source_validate = screen->SourceValidate;
     screen->SourceValidate = kdri3_source_validate_wrap;
-    LogMessage(X_INFO, "kestrel: DRI3 on %s (linear buffers)\n", kdri3_node);
+    LogMessage(X_INFO, "kestrel: DRI3 for %s (linear buffers in system memory)\n", kdri3_node);
     return TRUE;
 }
 #endif

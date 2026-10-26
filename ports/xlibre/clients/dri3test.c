@@ -4,7 +4,9 @@
  *  Makes a linear 32-bit buffer the way a GPU driver would hand one over: a
  *  dumb buffer on /dev/dri/card0 (or $DRI3TEST_CARD), exported as a dma-buf
  *  (PRIME). Then, against $DISPLAY:
- *    1. DRI3QueryVersion is 1.2 or later and DRI3Open gives a render node
+ *    1. DRI3QueryVersion is 1.2 or later and DRI3Open gives a descriptor
+ *       that is not a DRM device, so that Mesa copies frames into system
+ *       memory for the server (hw-kestrel/kdri3.c says why)
  *    2. DRI3GetSupportedModifiers offers DRM_FORMAT_MOD_LINEAR
  *    3. DRI3PixmapFromBuffers makes a pixmap of the buffer; a copy to a
  *       window shows what the CPU wrote into the buffer
@@ -132,8 +134,8 @@ int main(int argc, char **argv)
     xcb_dri3_open_reply_t *o = xcb_dri3_open_reply(c, xcb_dri3_open(c, s->root, 0), NULL);
     int rfd = o && o->nfd == 1 ? xcb_dri3_open_reply_fds(c, o)[0] : -1;
     struct stat st;
-    check(rfd >= 0 && fstat(rfd, &st) == 0 && S_ISCHR(st.st_mode) && minor(st.st_rdev) >= 128,
-          "DRI3Open gives a render node");
+    check(rfd >= 0 && fstat(rfd, &st) == 0 && major(st.st_rdev) != 226,
+          "DRI3Open gives a descriptor that is not a GPU");
     free(o);
     if (rfd >= 0) close(rfd);
 
