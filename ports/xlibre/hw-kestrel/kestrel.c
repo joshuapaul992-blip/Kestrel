@@ -68,6 +68,9 @@
 #include "xserver-properties.h"
 #include "exevents.h"
 #include "globals.h"
+#ifdef DRI3
+#include "kdri3.h"
+#endif
 
 /* ---- kernel interfaces (Kestrel include/kernel/kfb.h, kinput.h) ---------- */
 #define KFB_GET_INFO    0x4b00
@@ -145,6 +148,7 @@ typedef struct {
 static KMonitor kmon[KMAX_MONITORS];
 static int knum;
 static int kwant = KMAX_MONITORS;       /* -screens N */
+static Bool knodri3;                    /* -nodri3 */
 
 static struct {
     uint8_t    *bits;           /* the screen pixmap, 32 bpp */
@@ -667,6 +671,10 @@ kScreenInit(ScreenPtr pScreen, int argc, char **argv, void *closure)
         return FALSE;
     if (!kRandRInit(pScreen))
         return FALSE;
+#ifdef DRI3
+    if (!knodri3 && !kDri3Init(pScreen))
+        return FALSE;
+#endif
 
     for (int i = 0; i < knum; i++)
         if (ioctl(kmon[i].fd, KDSETMODE, KD_GRAPHICS) < 0)
@@ -737,6 +745,7 @@ void
 ddxUseMsg(void)
 {
     ErrorF("-screens N             use at most N monitors (default: all /dev/fbN)\n");
+    ErrorF("-nodri3                no DRI3, even with a render node\n");
 }
 
 int
@@ -748,6 +757,10 @@ ddxProcessArgument(int argc, char *argv[], int i)
         if (kwant < 1 || kwant > KMAX_MONITORS)
             UseMsg();
         return 2;
+    }
+    if (strcmp(argv[i], "-nodri3") == 0) {
+        knodri3 = TRUE;
+        return 1;
     }
     return 0;
 }

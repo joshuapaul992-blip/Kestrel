@@ -10,7 +10,8 @@ SRC=$(cd "$1" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$SRC/hw/kestrel"
-cp "$HERE/hw-kestrel/kestrel.c" "$HERE/hw-kestrel/meson.build" "$SRC/hw/kestrel/"
+cp "$HERE/hw-kestrel/kestrel.c" "$HERE/hw-kestrel/kdri3.c" "$HERE/hw-kestrel/kdri3.h" \
+   "$HERE/hw-kestrel/meson.build" "$SRC/hw/kestrel/"
 
 grep -q "option('kestrel'" "$SRC/meson_options.txt" || cat >> "$SRC/meson_options.txt" <<'OPT'
 option('kestrel', type: 'boolean', value: false,

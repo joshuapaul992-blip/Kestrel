@@ -21,6 +21,9 @@ if [ "${KESTREL_X:-}" != xkestrel ] && [ -e /dev/dri/card0 ] && [ -f "$XORG_CONF
     vt=$(tty 2>/dev/null | sed -n 's|^/dev/tty\([0-9][0-9]*\)$|vt\1|p')
     Xorg :0 ${vt:-vt1} -keeptty -config "$XORG_CONF" -nolisten tcp -nolock "$@" &
 else
+    # Xkestrel's DRI3 shows only buffers the CPU can read: OpenGL stays on
+    # llvmpipe (Vulkan on the GPU presents through it)
+    export LIBGL_DRI3_DISABLE=1
     Xkestrel :0 "$@" &
 fi
 xpid=$!

@@ -807,14 +807,14 @@ Not done yet: job control (stop/continue).
 
 ```sh
 make xlibre XLIBRE_SRC=<checkout of X11Libre/xserver> XLIBRE_DEPS=<library tarballs>
-make usbimg       # stages bin/Xkestrel, bin/xdemo, bin/xrandr and the keymap into /boot
+make usbimg       # stages bin/Xkestrel, bin/xdemo, bin/dri3test, bin/xrandr and the keymap into /boot
 ```
 
 `ports/xlibre/build.sh` does four things:
-1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more) and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
+1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more), libxshmfence (DRI3's fences) and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
 2. Applies `ports/xlibre/patches` and adds the `kestrel` meson option and `hw/kestrel`.
 3. Cross-builds the server with musl (`kestrel-cross.txt.in`).
-4. Builds the test client `xdemo` and `xrandr` (from Ubuntu's x11-xserver-utils), and precompiles the default keymap with the host's `xkbcomp`.
+4. Builds the test clients `xdemo` and `dri3test`, `xrandr` (from Ubuntu's x11-xserver-utils), and precompiles the default keymap with the host's `xkbcomp`.
 
 Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 
@@ -830,11 +830,13 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | `SIGALRM` smart scheduler, `link()` lock file | configured out (patch 0002); the scheduler falls back to time checks in the dispatch loop |
 | Fonts | the built-in `fixed` and `cursor` fonts |
 | MIT-SHM | on: System V segments (`ShmAttach`), or a memfd passed with `SCM_RIGHTS` (`ShmAttachFd`) |
-| GLX/DRI, XDMCP, udev, input thread | disabled |
+| DRI3 and Present | on when there is a render node (`hw-kestrel/kdri3.c`): linear GPU buffers handed over as dma-bufs become pixmaps over the buffer itself |
+| GLX, DRI1/DRI2, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
 - **Screens:** one X screen for all monitors (`-screens N` uses only the first N), a 24-bit TrueColor fb screen with RENDER and RandR. Each monitor is a RandR output with its own CRTC, named after its connector (`DP-1`, `HDMI-A-1`) or else `fbN`. The monitors start side by side, left to right in `/dev/fbN` order with their tops aligned, the first one primary, so they form one desktop. `xrandr` (in `/boot/bin`) can then move (`--pos`, `--left-of`, `--right-of`), mirror (`--same-as`), rotate and reflect (`--rotate`, `--reflect`), switch off (`--off`, `--auto`) and choose the primary (`--primary`); the screen grows and shrinks to fit. A monitor whose kernel driver can switch modes lists them all, and `--mode`/`--rate` switch it (`KFB_GET_MODES`, `KFB_SET_MODE`); the others list only their current mode. The server answers Xinerama queries from RandR, so Xinerama-only clients see the same monitors. A damage listener on the root pixmap collects changes, and a wrapped screen BlockHandler pushes each changed box to every monitor showing it before the server sleeps, after the software cursor has been drawn back; rotated and reflected monitors get the box turned in a scratch buffer first. `ports/xlibre/patches/0003` also fixes the order in which XLibre's own Xinerama (`+xinerama`, for several X screens) lists them.
 - **Input:** a read notification on `/dev/kinput` feeds keys, buttons, relative motion and the wheel (as buttons 4 and 5) into the dix event queue.
+- **DRI3** (`hw-kestrel/kdri3.c`), so that Vulkan on a GPU can show its frames: Mesa's Vulkan drivers for a GPU (NVK, for one) present on X11 only through DRI3 and Present, and closed the X connection on a server without them. When the machine has a render node, `DRI3Open` hands a client the first one (`/dev/dri/renderD128` on), and `DRI3GetSupportedModifiers` offers only `DRM_FORMAT_MOD_LINEAR` for 24- and 32-bit pixmaps, so the client renders into plain linear images. `DRI3PixmapFromBuffers` maps the dma-buf into the server and makes a pixmap whose pixels are the buffer itself; fb reads it like any other pixmap. Before each copy or composite from such a pixmap (the screen's `SourceValidate`), `DMA_BUF_IOCTL_SYNC` waits for the fences on the buffer, which is where Mesa puts its rendering's fence when it presents. Present's idle fences are shared-memory futexes (`miSyncShm`, libxshmfence, the same layout as Mesa's). Present has no vblank of its own here: it copies at a fake 60 Hz. `/bin/startx` sets `LIBGL_DRI3_DISABLE=1` for the Xkestrel session, so OpenGL keeps rendering with llvmpipe as before rather than on a GPU driver that would hand over buffers the CPU cannot read (virgl's live on the host). `dri3test` checks it with a dumb buffer exported as a dma-buf: the version and render node, the modifiers, a pixmap from the buffer copied to a window and read back, and 120 `PresentPixmap`s with an idle fence, each completing, going idle and triggering the fence.
 
 Exiting the server returns its monitors to their text terminals.
 
@@ -845,7 +847,7 @@ Exiting the server returns its monitors to their text terminals.
 
 As the X protocol requires, the pointer stays hidden until some client defines a cursor; normally that is the window manager's job, and xdemo does it for its test.
 
-**Not yet:** GLX in the server (OpenGL programs use EGL with Mesa's llvmpipe instead), keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+**Not yet:** GLX in the server (OpenGL programs use EGL with Mesa's llvmpipe instead), tiled or multi-plane DRI3 buffers, page flips, keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
 
 ## IceWM (`ports/icewm/`)
 
@@ -1425,7 +1427,7 @@ nouveau takes the boot display over like bochs does (above). Without firmware in
 
 **Step 4, Vulkan (0.3.8).** The Firefox root has the Vulkan loader, Mesa's Vulkan drivers (`mesa-vulkan-drivers`, Mesa 25.2 from noble-updates) and `vulkaninfo` and `vkcube` (`vulkan-tools`). Which driver a program gets depends on the GPU:
 - **lavapipe**, Mesa's software Vulkan driver, works on every machine with nothing new in the kernel: it renders with LLVM-compiled code on the CPU and hands its frames to the X server as System V shared memory (MIT-SHM) when the server has DRI3, or as plain images when it has not. Before 0.3.8 had System V shared memory, `vkcube` hung under an accelerated X server: the segments it could not create were never presented. In QEMU with no KVM, `vkcube` draws its cube on Xorg at about 26 frames per second.
-- **NVK on nouveau**, for NVIDIA cards such as the Quadro P2000 (Pascal). NVK submits through nouveau's newer interface, `VM_INIT`, `VM_BIND` and `EXEC` (`nouveau_uvmm.c`, `nouveau_exec.c`, `nouveau_sched.c`, vendored with the rest of nouveau, on `drm_gpuvm`, `drm_exec` and the GPU scheduler), with sync objects for its fences. It needs NVIDIA's firmware (`NVIDIA_FW=`) for the graphics engine. It has not run on a real card yet.
+- **NVK on nouveau**, for NVIDIA cards such as the Quadro P2000 (Pascal). NVK submits through nouveau's newer interface, `VM_INIT`, `VM_BIND` and `EXEC` (`nouveau_uvmm.c`, `nouveau_exec.c`, `nouveau_sched.c`, vendored with the rest of nouveau, on `drm_gpuvm`, `drm_exec` and the GPU scheduler), with sync objects for its fences. It needs NVIDIA's firmware (`NVIDIA_FW=`) for the graphics engine. On a Quadro P2000 it renders (Roblox through Mocktail); it shows its frames through DRI3, on Xorg or on Xkestrel (above). Before Xkestrel had DRI3, `MESA_VK_WSI_DEBUG=sw` was the way: Mesa copies each frame into memory and sends it as a plain image (about 30 frames per second in Roblox on the P2000).
 - **Venus on virtio-gpu.** In a virtual machine Venus passes Vulkan through to the host's driver. It allocates GPU memory as blobs that the host owns and maps into the guest through virtio-gpu's host-visible window. The KPI's virtio-pci transport finds that window, a shared memory region in the device's vendor capabilities (`vp_get_shm_region()`, `linuxkpi/src/virtio.c`). `linuxkpi/virtio-gpu/kestrel.c` gives each mappable blob a range of it, asks the host to map the blob there (`RESOURCE_MAP_BLOB`), and maps the range into a program with the caching the host asked for. It needs QEMU 9.2 or later (`-device virtio-vga-gl,hostmem=4G,blob=true,venus=true` with a GL display) and a host virglrenderer built with Venus and its render server. QEMU 8.2 has no Venus, so it has not run yet: only finding the window has been checked (`hostmem=` on QEMU 8.2).
 
 The GPU self-test (above) checks Vulkan after OpenGL. It saves `vulkaninfo`, passes "Vulkan on the GPU" when the loader finds a device that is not the CPU, and runs `vkcube` for 600 frames with vsync off on the first such device (lavapipe when there is none), giving its frame rate.
@@ -1455,7 +1457,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 | 0.3.6 | The GPU from user space: `/dev/dri`, the DRM ioctls, XLibre's `modesetting` driver, nouveau acceleration and Mesa |
 | 0.3.7 | AppImages and more programs: FUSE, `mount(2)`, the system calls newer glibc needs, non-PIE executables |
 | 0.3.8 | Vulkan: Mesa's Vulkan drivers (lavapipe in software, NVK on nouveau, Venus on virtio-gpu) and what the kernel needs for them |
-| 0.3.9 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes |
+| 0.3.9 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes; an installer that puts Kestrel on a hard drive or SSD; an updater that moves an installed system to the next release (0.3.9 to 0.3.10) |
 | 0.3.10 | Smaller gaps: IPv6, MSI for network cards, ext4 extents, job control, sound capture and mixing |
 | 0.3.11 | USB tethering: RNDIS, CDC ECM and CDC NCM network adapters (Android tethering and USB Ethernet adapters) |
 | 0.3.12 | A much more complete LXDE desktop |

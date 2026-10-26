@@ -6,6 +6,7 @@
 #
 #   bin/Xkestrel                         the X server (static-PIE, musl)
 #   bin/xdemo                            first test client (xcb)
+#   bin/dri3test                         checks DRI3 and Present with a dma-buf
 #   bin/xrandr                           monitor layout and modes (RandR)
 #   share/X11/xkb/compiled/kestrel-default.xkm   precompiled us/pc105 keymap
 #   share/X11/xkb/rules/evdev            rules file (names only; no xkbcomp)
@@ -42,6 +43,12 @@ echo "  MUSLCC  xdemo"
 musl-gcc -std=gnu11 -O2 -Wall -fPIE -static-pie -I"$SYSROOT/include" \
     "$HERE/clients/xdemo.c" -L"$SYSROOT/lib" -lxcb -lXau -lXdmcp -o "$ROOT/bin/xdemo"
 strip "$ROOT/bin/xdemo"
+
+echo "  MUSLCC  dri3test"
+musl-gcc -std=gnu11 -O2 -Wall -fPIE -static-pie -I"$SYSROOT/include" \
+    "$HERE/clients/dri3test.c" -L"$SYSROOT/lib" -lxcb-dri3 -lxcb-present -lxcb -lXau -lXdmcp \
+    -lxshmfence -o "$ROOT/bin/dri3test"
+strip "$ROOT/bin/dri3test"
 
 # xrandr 1.5.2, from Ubuntu's x11-xserver-utils (a bundle of small tools)
 echo "  MUSLCC  xrandr"
