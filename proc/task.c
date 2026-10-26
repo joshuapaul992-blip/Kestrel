@@ -469,7 +469,12 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
     t->ppid = cur ? cur->tgid : 0;
     t->pgid = t->sid = t->pid;
     strlcpy(t->name, name, sizeof t->name);
-    t->cr3 = read_cr3();
+    /* The kernel's page tables, not whichever are loaded: a thread made in a
+     * system call (a driver's workqueue, as nouveau makes one for each
+     * Vulkan VM_BIND) would otherwise keep running on the caller's address
+     * space, which it holds no reference to, after that process is gone.
+     * clone() gives a user thread its own with task_use_mm(). */
+    t->cr3 = uvm_kernel_pml4();
     t->quantum = SCHED_QUANTUM;
     t->start_tick = uptime_ms() * PIT_HZ / 1000;
     t->tty = cur ? cur->tty : 0;
