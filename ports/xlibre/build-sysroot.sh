@@ -7,7 +7,7 @@
 # `apt-get source --download-only xorgproto xtrans libxau libxdmcp xcb-proto
 # libxcb libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender
 # libxfixes libxdamage libxcomposite libxinerama libxrandr libxpm libpng1.6
-# libice libsm libxt libxmu libxaw ncurses x11-xserver-utils`;
+# libice libsm libxt libxmu libxaw ncurses x11-xserver-utils libxshmfence`;
 # x11-xserver-utils holds xrandr, which build.sh compiles). The current
 # XLibre server needs xorgproto 2024.1 or newer (presentproto 1.4); Ubuntu
 # 24.04 has 2023.2, so take xorgproto_2024.1.orig.tar.gz from a later
@@ -88,6 +88,14 @@ autotools  libxkbfile
 autotools  libfontenc
 autotools  libxfont --disable-devel-docs --disable-freetype --disable-bzip2
 mesonbuild pixman -Dgtk=disabled -Dlibpng=disabled -Dopenmp=disabled -Dtests=disabled
+# DRI3's fences: shared-memory futexes, the same layout Mesa's clients use.
+# musl-gcc sees no kernel headers; the two futex operations it needs:
+if [ ! -f "$SYSROOT/include/linux/futex.h" ]; then
+    mkdir -p "$SYSROOT/include/linux"
+    printf '#ifndef _LINUX_FUTEX_H\n#define _LINUX_FUTEX_H\n#define FUTEX_WAIT 0\n#define FUTEX_WAKE 1\n#endif\n' \
+        > "$SYSROOT/include/linux/futex.h"
+fi
+autotools  libxshmfence --enable-futex
 
 # client libraries for window managers and toolkits (IceWM)
 autotools  libxext --disable-specs --without-xmlto --without-fop

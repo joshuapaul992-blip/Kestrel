@@ -2,7 +2,7 @@
 # ports/xlibre/apply-patches.sh
 xkestrel_server = executable(
     'Xkestrel',
-    ['kestrel.c', '../../mi/miinitext.c', '../../mi/miinitext.h'],
+    ['kestrel.c', 'kdri3.c', '../../mi/miinitext.c', '../../mi/miinitext.h'],
     include_directories: inc,
     dependencies: common_dep,
     link_with: [
