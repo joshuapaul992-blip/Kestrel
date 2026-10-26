@@ -1,4 +1,5 @@
 /* fs/procfs.c -- /proc: process and kernel state, generated on every read */
+#include <kernel/sysvshm.h>
 #include <kernel/smp.h>
 #include <kernel/vfs.h>
 #include <kernel/fpu.h>
@@ -42,6 +43,8 @@ static size_t gen_uptime(char *buf, size_t cap, void *ctx)
     P("%lu.%02lu %lu.%02lu\n", ms / 1000, (ms % 1000) / 10, idle / 1000, (idle % 1000) / 10);
     return n;
 }
+
+static size_t gen_sysvipc_shm(char *buf, size_t cap, void *ctx) { (void)ctx; return sysv_shm_proc(buf, cap); }
 
 static size_t gen_meminfo(char *buf, size_t cap, void *ctx)
 {
@@ -806,6 +809,8 @@ void procfs_init(const char *mountpoint)
     pseudo_file(svm, "overcommit_memory", gen_sys_zero, NULL);
     pseudo_file(svm, "max_map_count", gen_sys_map_count, NULL);
     struct vnode *sfs = pseudo_dir(sys, "fs");
+    struct vnode *ipc = pseudo_dir(r, "sysvipc");
+    pseudo_file(ipc, "shm", gen_sysvipc_shm, NULL);
     pseudo_file(sfs, "file-max", gen_sys_file_max, NULL);
     struct vnode *ino = pseudo_dir(sfs, "inotify");
     pseudo_file(ino, "max_user_watches",   gen_sys_inotify_watches, NULL);

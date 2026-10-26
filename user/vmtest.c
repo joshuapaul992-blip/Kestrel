@@ -1,5 +1,6 @@
 /* user/vmtest.c -- virtual memory: demand paging, copy-on-write, NX,
- * mprotect, file and shared mappings, memfd, mremap, madvise, OOM.
+ * mprotect, file and shared mappings, memfd, mremap, madvise, System V
+ * shared memory, OOM.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -20,6 +21,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/statfs.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -134,6 +137,50 @@ static void pagecache_checks(void)
 }
 
 /* ---- vDSO (include/kernel/vdso.h) -------------------------------------------- */
+/* System V shared memory, as X clients use it for MIT-SHM: create, attach,
+ * remove at once, then another process attaches it by id. */
+static void sysv_shm_checks(void)
+{
+    const size_t sz = 3 * 4096 + 100;
+    int id = shmget(IPC_PRIVATE, sz, IPC_CREAT | 0600);
+    CHECK(id >= 0, "shmget: a private segment");
+    if (id < 0) return;
+    char *a = shmat(id, NULL, 0);
+    CHECK(a != (char *)-1, "shmat: attach it");
+    if (a == (char *)-1) { shmctl(id, IPC_RMID, NULL); return; }
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_segsz == sz && ds.shm_nattch == 1 && ds.shm_cpid == getpid(),
+          "IPC_STAT: its size, one attachment, its creator");
+    strcpy(a + 3 * 4096, "from the parent");
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0, "IPC_RMID while attached");
+    pid_t c = fork();
+    if (c == 0) {
+        char *b = shmat(id, NULL, SHM_RDONLY);  /* by id, after the removal, as the X server does */
+        char *w = shmat(id, NULL, 0);
+        int ok = b != (char *)-1 && w != (char *)-1 && !strcmp(b + 3 * 4096, "from the parent") &&
+                 a[3 * 4096] == 'f' && touch(b, 1) == SIGSEGV;
+        if (ok) strcpy(w + 10, "from the child");
+        _exit(ok && shmdt(b) == 0 && shmdt(w) == 0 && shmdt(w) == -1 ? 0 : 1);
+    }
+    int st;
+    waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0 && !strcmp(a + 10, "from the child"),
+          "...another process attaches the removed segment by id and shares its pages");
+    char *a2 = shmat(id, NULL, 0);
+    CHECK(a2 != (char *)-1 && a2 != a && !strcmp(a2 + 10, "from the child"), "...a second attachment in one process");
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2, "...counted: two attachments");
+    CHECK(shmdt(a) == 0 && shmdt(a2) == 0, "shmdt both");
+    CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL, "...and the removed segment is gone with them");
+
+    key_t key = 0x4b455354;                     /* "KEST" */
+    int k1 = shmget(key, 8192, IPC_CREAT | IPC_EXCL | 0600);
+    CHECK(k1 >= 0 && shmget(key, 4096, 0) == k1, "a segment by key: created, then found");
+    CHECK(shmget(key, 8192, IPC_CREAT | IPC_EXCL | 0600) == -1 && errno == EEXIST, "...IPC_EXCL refuses it again");
+    CHECK(shmget(key, 3 * 4096, 0) == -1 && errno == EINVAL, "...asking for more than it has fails");
+    CHECK(shmctl(k1, IPC_RMID, NULL) == 0 && shmget(key, 4096, 0) == -1 && errno == ENOENT,
+          "...IPC_RMID takes the key away");
+}
+
 static int64_t ts_ns(const struct timespec *t) { return (int64_t)t->tv_sec * 1000000000 + t->tv_nsec; }
 
 static void vdso_checks(void)
@@ -378,6 +425,7 @@ int main(void)
     CHECK(strstr(maps, "[stack]") && strstr(maps, "r-xp") && exe[0] && strstr(maps, exe), "/proc/self/maps lists the regions");
     vdso_checks();
     pagecache_checks();
+    sysv_shm_checks();
 
     /* ---- out of memory ----------------------------------------------------- */
     c = fork();

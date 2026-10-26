@@ -48,6 +48,7 @@ typedef uint32_t gid_t;
 #define EPROTONOSUPPORT 93
 #define ENOLCK       37
 #define ENODATA      61
+#define EIDRM        43
 #define EOPNOTSUPP   95
 #define EAFNOSUPPORT 97
 #define EADDRINUSE   98
