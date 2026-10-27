@@ -22,6 +22,7 @@
 #include <kernel/string.h>
 #include <kernel/bootinfo.h>
 #include <kernel/syscall.h>
+#include <kernel/pstate.h>
 
 struct percpu cpus[MAX_CPUS];
 int ncpus = 1;
@@ -313,6 +314,7 @@ __attribute__((noreturn)) static void ap_entry(struct percpu *c)
     syscall_cpu_init();
     lapic_init_cpu();
     lapic_timer_start();
+    pstate_init_cpu();
     c->loaded_cr3 = read_cr3() & ADDR_MASK;
     c->apic_id = lapic_id();
     __atomic_store_n(&warp_ready, true, __ATOMIC_RELEASE);

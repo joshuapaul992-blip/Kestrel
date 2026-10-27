@@ -12,6 +12,7 @@
 #include <kernel/smp.h>
 #include <kernel/uvm.h>
 #include <kernel/msi.h>
+#include <kernel/pstate.h>
 
 struct idt_gate {
     uint16_t offset_lo;
@@ -323,6 +324,7 @@ static bool lockless(struct int_frame *f)
         kstat_prof_tick(f->rip, (f->cs & 3) == 3);
         lapic_eoi();                                    /* first: we may switch away */
         this_cpu()->ticks++;
+        pstate_tick();
         if (this_cpu()->id == 0) {
             if (timer_tick_needs_lock()) bkl_defer(BKL_DEFER_TICK);     /* hooks, interval timers */
             timer_tick_fast();                          /* sleepers, netd's timer, the slice */
@@ -398,6 +400,7 @@ void isr_dispatch(struct int_frame *f)
     } else if (f->vector == VEC_LAPIC_TIMER) {
         lapic_eoi();
         this_cpu()->ticks++;
+        pstate_tick();
         timer_interrupt(this_cpu()->id == 0);
     } else {
         stray_vectors++;                                /* nothing installed there */

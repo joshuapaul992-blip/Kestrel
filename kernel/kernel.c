@@ -52,6 +52,7 @@
 #include <kernel/block.h>
 #include <kernel/kstat.h>
 #include <kernel/vdso.h>
+#include <kernel/pstate.h>
 
 #define KERNEL_HEAP_SIZE (8u << 20)
 #define WANT_WIDTH  1024
@@ -454,6 +455,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     uvm_init();                 /* shared kernel PDPTs, before any address space */
     vm_init();                  /* EFER.NXE: no-execute for data pages */
     vdso_init();                /* the clock pages every process maps */
+    pstate_init_cpu();          /* turbo; before the other CPUs, which follow its choice */
     sched_init();
     sti();
     kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);

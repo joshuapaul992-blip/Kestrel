@@ -23,6 +23,7 @@
 #include <kernel/time.h>
 #include <kernel/sound.h>
 #include <kernel/linuxkpi.h>
+#include <kernel/pstate.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -69,6 +70,7 @@ static size_t gen_cpuinfo(char *buf, size_t cap, void *ctx)
     for (int i = 0; i < ncpus; i++) {                   /* one block per online CPU, as on Linux */
         P("processor\t: %d\nvendor_id\t: %s\nmodel name\t: %s\napicid\t\t: %u\n", i, g_boot.cpu_vendor,
           g_boot.cpu_brand, cpus[i].apic_id);
+        if (pstate_mhz(i)) P("cpu MHz\t\t: %u.000\n", pstate_mhz(i));
         char fl[1024];
         cpu_flags(fl, sizeof fl);
         P("flags\t\t: %s\n", fl);
