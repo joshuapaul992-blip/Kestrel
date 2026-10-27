@@ -159,7 +159,7 @@ static size_t gen_filesystems(char *buf, size_t cap, void *ctx)
 static size_t gen_tasks(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
-    struct tcb *t = kmalloc(sizeof(struct tcb) * MAX_TASKS);
+    struct task_row *t = kmalloc(sizeof(struct task_row) * MAX_TASKS);
     if (!t) return 0;
     int cnt = task_snapshot(t, MAX_TASKS);
     P("  PID  PPID STATE      CPU(ms)  SWITCHES  NAME\n");

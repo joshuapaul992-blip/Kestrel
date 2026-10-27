@@ -9,7 +9,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/kmutex.h>
 
-#define MAX_TASKS       512             /* threads included */
+#define MAX_TASKS       2048            /* threads included: games size their pools by CPU */
 #define KSTACK_SIZE     (16 * 1024)
 #define TASK_NAME_LEN   24
 #define MAX_FDS         1024            /* per process (RLIMIT_NOFILE) */
@@ -258,7 +258,13 @@ void        poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt
 void        task_sleep_ms(uint64_t ms);
 int         task_wait(int pid);         /* exit status, or -ECHILD        */
 
-int         task_snapshot(struct tcb *out, int max);
+/* what /proc/tasks lists of each task */
+struct task_row {
+    int       pid, ppid, state;
+    uint64_t  cpu_ticks, switches;
+    char      name[TASK_NAME_LEN];
+};
+int         task_snapshot(struct task_row *out, int max);
 struct tcb *task_find(int pid);
 struct mm;
 /* t's CR3 (and, running, the CPU's) from now on are mm's. */

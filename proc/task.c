@@ -449,7 +449,11 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
         spin_unlock_irqrestore(&proc_lock, f);
         if (own) break;
     }
-    if (!t) return NULL;
+    if (!t) {
+        static bool told;
+        if (!told) { told = true; kprintf("task: all %d slots in use: a new thread was refused\n", MAX_TASKS); }
+        return NULL;
+    }
 
     t->kstack = kstack_alloc();
     if (!t->kstack) { t->state = TASK_UNUSED; return NULL; }
@@ -1101,12 +1105,18 @@ void sched_idle_loop(void)
     }
 }
 
-int task_snapshot(struct tcb *out, int max)
+int task_snapshot(struct task_row *out, int max)
 {
     int n = 0;
     uint64_t f = spin_lock_irqsave(&proc_lock);
-    for (int i = 0; i < MAX_TASKS && n < max; i++)
-        if (tasks[i].state != TASK_UNUSED) out[n++] = tasks[i];
+    for (int i = 0; i < MAX_TASKS && n < max; i++) {
+        struct tcb *t = &tasks[i];
+        if (t->state == TASK_UNUSED) continue;
+        out[n] = (struct task_row){ .pid = t->pid, .ppid = t->ppid, .state = t->state,
+                                    .cpu_ticks = t->cpu_ticks, .switches = t->switches };
+        memcpy(out[n].name, t->name, sizeof out[n].name);
+        n++;
+    }
     spin_unlock_irqrestore(&proc_lock, f);
     return n;
 }
