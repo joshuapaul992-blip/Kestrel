@@ -1463,7 +1463,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 | 0.3.8 | Vulkan: Mesa's Vulkan drivers (lavapipe in software, NVK on nouveau, Venus on virtio-gpu) and what the kernel needs for them |
 | 0.3.9 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes; an installer that puts Kestrel on a hard drive or SSD; an updater that moves an installed system to the next release (0.3.9 to 0.3.10) |
 | 0.3.10 | Smaller gaps: IPv6, MSI for network cards, ext4 extents, job control, sound capture and mixing |
-| 0.3.11 | USB tethering: RNDIS, CDC ECM and CDC NCM network adapters (Android tethering and USB Ethernet adapters) |
+| 0.3.11 | File systems: full read-write NTFS, FAT12, FAT16 and FAT32, and full read-write ext3 and ext4 (journal included); USB tethering: RNDIS, CDC ECM and CDC NCM network adapters (Android tethering and USB Ethernet adapters) |
 | 0.3.12 | A much more complete LXDE desktop |
 | 0.3.13 | Kept free for an emergency release |
 | 0.4.0 | The 0.4 release |
