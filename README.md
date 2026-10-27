@@ -538,6 +538,7 @@ arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order
               apic.c         ACPI MADT, local APIC (+ 1 kHz timer calibrated on the HPET/TSC),
                              IO APIC routing of ISA IRQs, IPIs, INIT/STARTUP
               smp.c          percpu blocks (GS base), big kernel lock, TLB shootdowns, AP start-up
+              pstate.c       the clock: Intel hardware P-states (turbo), APERF/MPERF for "cpu MHz"
               trampoline.asm real mode -> long mode start-up code of the other CPUs (at 0x8000)
               pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz (without an APIC)
               switch.asm     context_switch(), thread_trampoline, enter_user/user_return
@@ -927,6 +928,8 @@ make usbimg
 ## Multiprocessor support and robustness
 
 **Processors** (`arch/x86_64/apic.c`, `smp.c`, `trampoline.asm`). The ACPI MADT lists the CPUs and IO APICs. The 8259 PICs are masked; the PS/2 keyboard comes through the IO APIC (honouring the MADT's interrupt source overrides), the xHCI, AHCI and NVMe controllers interrupt by MSI-X or MSI to the boot CPU (vectors `0x50`–`0x6F`, listed in `/proc/interrupts`), and every CPU runs its own local APIC timer at 1 kHz, calibrated against the HPET/TSC clock. The other CPUs are started with INIT and STARTUP IPIs into a real-mode trampoline at `0x8000`, which switches to long mode on the kernel's page tables; each gets its GDT/TSS, IST stacks, SYSCALL MSRs, the boot CPU's CR0/CR4/PAT, and an idle thread. Up to 16 CPUs. Boot options: `kestrel.smp=0` (or `maxcpus=1`) keeps one CPU, `kestrel.noapic` stays on the PIC and PIT. Without an MADT the kernel does the same by itself.
+
+**The processor's clock** (`arch/x86_64/pstate.c`). Firmware starts an Intel processor at a fixed clock, usually its base frequency, and leaves the rest to the system. Where the processor has hardware P-states (HWP, Skylake and later), Kestrel turns them on and asks every CPU for its whole range, turbo included, with the energy-performance preference Linux's `intel_pstate` uses by default (`balance_performance`): the processor raises its clock under load and lowers it when idle. `kestrel.pstate=0` leaves the firmware's clock alone. Processors without HWP and AMD's, which boost by themselves, are left as they are, and so is any processor under a hypervisor. Once a second each CPU turns its APERF and MPERF counters into the average clock it ran at while busy, which `/proc/cpuinfo` shows as `cpu MHz`.
 
 **Per-CPU data.** In the kernel, the GS base points at the CPU's `struct percpu` (`include/kernel/smp.h`); entries from ring 3 run `SWAPGS`, and NMI, #DF and #MC (which can arrive between `SYSCALL` and its `SWAPGS`) decide from the GS base itself. The running task is read with a single GS-relative load, so a thread that is preempted and moved to another CPU never reads the wrong one.
 

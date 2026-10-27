@@ -76,6 +76,8 @@ struct percpu {
     void          *tss;                 /* arch/x86_64/gdt.c                   */
     uint8_t       *ist[3];              /* #DF, NMI, #MC stacks                */
     struct kstat_cpu ks;                /* performance counters (kstat.h)      */
+    uint64_t       aperf, mperf;        /* pstate.c: at the last second        */
+    uint32_t       mhz;                 /* pstate.c: clock while busy          */
 };
 
 _Static_assert(__builtin_offsetof(struct percpu, kernel_rsp) == 8, "gs:8");
