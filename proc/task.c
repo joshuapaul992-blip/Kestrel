@@ -85,6 +85,11 @@ static void set_state(struct tcb *t, enum task_state s)
             __atomic_and_fetch(&st_wait[i >> 6], ~bit, __ATOMIC_RELAXED);
         }
     }
+    if (s == TASK_READY && t->state != TASK_READY) t->ready_tsc = rdtsc();
+    if (s == TASK_RUNNING && t->state == TASK_READY && !t->idle_class && t->pid) {
+        uint64_t w = rdtsc() - t->ready_tsc;            /* ready, but no CPU took it */
+        if (kstat_stalled(w)) kstat_stall(STALL_RUNWAIT, w, 0, 0, t);
+    }
     __atomic_store_n(&t->state, s, __ATOMIC_RELEASE);
 }
 
@@ -611,7 +616,7 @@ void sched_switch_tail(void)
 {
     struct percpu *c = this_cpu();
     int d = c->current->bkl_depth;
-    if (d && !c->bkl_depth) bkl_enter();
+    if (d && !c->bkl_depth) bkl_enter_resume();
     c->bkl_depth = d;
     if (!d) bkl_run_deferred();                 /* interrupts deferred as the lock left the last task */
 }

@@ -52,6 +52,23 @@ struct kstat_cpu {                      /* one CPU */
     uint64_t fault_n[KF_KINDS], fault_cyc[KF_KINDS];
     uint64_t fault_fast_n;              /* of those, resolved without the big lock    */
     uint64_t io_n, io_bytes, io_cyc;
+    uint64_t tick_tsc;                  /* its last timer tick (kstat_tick)           */
+};
+
+/* Stalls: anything that held up a CPU or a thread for 4 ms or more (a
+ * quarter of a frame at 60 FPS). /proc/kstat counts them by kind and lists
+ * the latest, with where they happened, so a frame drop can be traced to
+ * its cause from a REPORT.TXT. */
+enum kstall {
+    STALL_IRQOFF,                       /* a CPU's timer tick came late: interrupts were off */
+    STALL_RUNWAIT,                      /* a thread was ready to run but waited for a CPU     */
+    STALL_SYSCALL,                      /* one system call, on the CPU                        */
+    STALL_FAULT,                        /* one page fault                                     */
+    STALL_MMWAIT,                       /* waiting for an address space's lock                */
+    STALL_BKLWAIT,                      /* waiting for the big kernel lock                    */
+    STALL_BKLHOLD,                      /* holding it                                         */
+    STALL_TLBWAIT,                      /* waiting for other CPUs to drop translations        */
+    STALL_KINDS
 };
 
 struct tcb;
@@ -75,6 +92,15 @@ size_t   kstat_gen_prof(char *buf, size_t cap);         /* /proc/kprof */
 void     kstat_lockwait(uint64_t caller, uint64_t cyc);  /* a contended big-lock acquisition
                                                           * (caller < 256: an interrupt vector) */
 size_t   kstat_gen_process(int tgid, char *buf, size_t cap);   /* /proc/PID/kstat */
+
+/* A stall of cyc cycles: where is a kernel address (or, by kind: the call
+ * number, the faulting address), arg says more (the ioctl request, the
+ * fault's kind, the CPU waited for); t is the thread held up (NULL: the
+ * current one). Callers test kstat_stalled() first: it is one compare. */
+extern uint64_t kstat_stall_cyc;
+static inline bool kstat_stalled(uint64_t cyc) { return cyc >= kstat_stall_cyc; }
+void     kstat_stall(int kind, uint64_t cyc, uint64_t where, uint64_t arg, struct tcb *t);
+void     kstat_tick(uint64_t rip);                      /* every CPU's timer tick, interrupts off */
 void     kstat_init(void);                              /* the REPORT.TXT section */
 
 #endif
