@@ -1,12 +1,17 @@
 /* net/tcp.c -- TCP (RFC 9293), with the parts real peers expect:
  *
- *   - MSS and window scaling options (RFC 7323); 128 KiB send and receive
- *     buffers per connection
+ *   - MSS and window scaling options (RFC 7323); send and receive buffers
+ *     that start at 128 KiB and double, up to 4 MiB, while a connection
+ *     moves more than half of one per round trip (a 128 KiB window allows
+ *     40 Mbit/s at a 26 ms round trip; 4 MiB allows 1.2 Gbit/s)
  *   - retransmission timeout from measured round trips (RFC 6298, Karn),
  *     exponential backoff, 15 retries (6 for a SYN), then ETIMEDOUT
  *   - Reno congestion control: slow start, congestion avoidance, fast
  *     retransmit and recovery after three duplicate ACKs (RFC 5681)
- *   - out-of-order segments kept and merged when the gap fills
+ *   - out-of-order segments kept and merged when the gap fills, and
+ *     reported in SACK blocks (RFC 2018), so a sender that loses several
+ *     segments of a large window resends just those; SACK blocks from the
+ *     peer are not used (recovery here is NewReno)
  *   - delayed ACKs (40 ms, or at once every second full segment), Nagle
  *     unless TCP_NODELAY, window updates that avoid silly windows
  *   - zero-window probes, keepalive (SO_KEEPALIVE), TIME_WAIT (60 s),
@@ -42,7 +47,8 @@
 #define TH_ACK  0x10
 #define TH_URG  0x20
 
-#define TCP_BUF         (128 * 1024)
+#define TCP_BUF         (128 * 1024)    /* each buffer to begin with */
+#define TCP_BUF_MAX     (4 * 1024 * 1024)       /* ... and at most */
 #define TCP_MSS_DEFAULT 536
 #define RTO_INIT        1000
 #define RTO_MIN         200
@@ -85,7 +91,7 @@ struct tcpcb {
     uint32_t iss, snd_una, snd_nxt, snd_wnd, snd_wl1, snd_wl2;
     uint32_t snd_max;                   /* highest sequence sent (snd_nxt goes back on a timeout) */
     uint8_t  snd_wscale, rcv_wscale;
-    bool     wscale_ok;
+    bool     wscale_ok, sack_ok;
     uint8_t *sbuf;
     uint32_t sbuf_head, sbuf_len, sbuf_size;
     bool     fin_queued, fin_sent, fin_acked;
@@ -93,13 +99,17 @@ struct tcpcb {
     uint32_t cwnd, ssthresh, recover;
     int      dupacks;
     bool     in_recovery;
+    bool     no_grow;                   /* the heap refused a bigger buffer */
     /* receive side */
     uint32_t irs, rcv_nxt, rcv_adv;     /* rcv_adv: right edge last advertised */
     uint8_t *rbuf;
     uint32_t rbuf_head, rbuf_len, rbuf_size;
     bool     fin_rcvd;
-    struct pkt *ooo;                    /* out-of-order segments, by sequence */
+    struct pkt *ooo, *ooo_last;         /* out-of-order segments, by sequence */
     int      nooo;
+    uint32_t sack_last;                 /* start of the latest out-of-order arrival */
+    uint64_t rcv_t0;                    /* receive autotuning: since when, */
+    uint32_t rcv_copied;                /* the reader took this much */
     uint32_t unacked_rx;                /* bytes received since our last ACK */
     bool     ack_now;
     /* timers (ms, 0 = off) */
@@ -160,6 +170,7 @@ static void enter_closed(struct tcpcb *t, int err)
     t->state = CLOSED;
     t->rto_at = t->delack_at = t->keep_at = t->tw_at = 0;
     while (t->ooo) { struct pkt *p = t->ooo; t->ooo = p->next; pkt_free(p); }
+    t->ooo_last = NULL;
     t->nooo = 0;
     wake(t);
     if (!t->sock && !t->listener) tcb_free(t);
@@ -175,7 +186,7 @@ static struct tcpcb *tcb_new(void)
     t->rbuf_size = t->sbuf_size = TCP_BUF;
     t->rto = RTO_INIT;
     t->mss = TCP_MSS_DEFAULT;
-    t->rcv_wscale = 2;                  /* 128 KiB / 4 fits in 16 bits */
+    t->rcv_wscale = 7;                  /* TCP_BUF_MAX / 128 fits in 16 bits */
     t->ttl = 64;
     t->next = tcbs;
     tcbs = t;
@@ -193,6 +204,23 @@ static void tcb_free(struct tcpcb *t)
     kfree(t);
 }
 
+/* Move a ring's bytes to the start of a buffer twice its size, while it is
+ * below TCP_BUF_MAX. Nothing points into the old one: segments are copies. */
+static bool ring_grow(struct tcpcb *t, uint8_t **buf, uint32_t *head, uint32_t len, uint32_t *size)
+{
+    if (*size >= TCP_BUF_MAX || t->no_grow) return false;
+    uint8_t *nb = kmalloc(*size * 2);
+    if (!nb) { t->no_grow = true; return false; }
+    uint32_t first = *size - *head < len ? *size - *head : len;
+    memcpy(nb, *buf + *head, first);
+    memcpy(nb + first, *buf, len - first);
+    kfree(*buf);
+    *buf = nb;
+    *head = 0;
+    *size *= 2;
+    return true;
+}
+
 /* ---- segments out ---------------------------------------------------------------- */
 static uint16_t adv_window(struct tcpcb *t)
 {
@@ -208,10 +236,37 @@ static uint16_t adv_window(struct tcpcb *t)
     return (uint16_t)v;
 }
 
+/* The out-of-order queue as SACK blocks, at most 4 (pairs of sequence
+ * numbers into b): the one holding the latest arrival first, as RFC 2018
+ * asks, then the highest others. */
+static int sack_blocks(struct tcpcb *t, uint32_t *b)
+{
+    uint32_t last[3][2], first[2];
+    int nlast = 0, n = 0;
+    bool have_first = false;
+    for (struct pkt *p = t->ooo; p; ) {
+        uint32_t l = p->seq, r = p->seq + p->len;
+        for (p = p->next; p && SEQ_LEQ(p->seq, r); p = p->next)
+            if (SEQ_GT(p->seq + p->len, r)) r = p->seq + p->len;
+        if (SEQ_GEQ(t->sack_last, l) && SEQ_LT(t->sack_last, r)) { first[0] = l; first[1] = r; have_first = true; }
+        else { last[nlast % 3][0] = l; last[nlast % 3][1] = r; nlast++; }
+    }
+    if (have_first) { b[0] = first[0]; b[1] = first[1]; n = 1; }
+    for (int i = 0; i < 3 && i < nlast; i++, n++) {
+        b[2 * n] = last[(nlast - 1 - i) % 3][0];
+        b[2 * n + 1] = last[(nlast - 1 - i) % 3][1];
+    }
+    return n;
+}
+
 /* Build and send one segment: `len` bytes of sbuf at sequence `seq`. */
 static void send_segment(struct tcpcb *t, uint32_t seq, uint32_t len, uint8_t flags)
 {
-    size_t optlen = (flags & TH_SYN) ? 8 : 0;          /* MSS + window scale (+NOP) */
+    uint32_t sack[8];
+    int nsack = !(flags & (TH_SYN | TH_RST)) && !len && t->sack_ok && t->ooo ? sack_blocks(t, sack) : 0;
+    bool sack_perm = (flags & TH_SYN) && (t->state == SYN_SENT || t->sack_ok);
+    size_t optlen = (flags & TH_SYN) ? (sack_perm ? 12 : 8) :   /* MSS + window scale (+NOP), SACK-permitted */
+                    nsack ? 4 + 8 * nsack : 0;                  /* NOP, NOP, SACK blocks */
     struct pkt *p = pkt_alloc_big(20 + optlen + len);
     if (!p) return;
     struct tcp_hdr *h = (struct tcp_hdr *)pkt_data(p);
@@ -230,10 +285,15 @@ static void send_segment(struct tcpcb *t, uint32_t seq, uint32_t len, uint8_t fl
         uint16_t ourmss = (uint16_t)(netif_mtu_for(t->raddr) - 40);
         o[0] = 2; o[1] = 4; o[2] = (uint8_t)(ourmss >> 8); o[3] = (uint8_t)ourmss;
         o[4] = 1; o[5] = 3; o[6] = 3; o[7] = t->rcv_wscale;   /* NOP, window scale */
+        if (sack_perm) { o[8] = 1; o[9] = 1; o[10] = 4; o[11] = 2; }
         h->win = be16((uint16_t)(rwnd_free(t) > 0xffff ? 0xffff : rwnd_free(t)));   /* unscaled in a SYN */
         t->rcv_adv = t->rcv_nxt + be16(h->win);
     } else {
         h->win = be16(adv_window(t));
+        if (nsack) {
+            o[0] = 1; o[1] = 1; o[2] = 5; o[3] = (uint8_t)(2 + 8 * nsack);
+            for (int i = 0; i < 2 * nsack; i++) { uint32_t v = be32(sack[i]); memcpy(o + 4 + 4 * i, &v, 4); }
+        }
     }
     if (len) {
         uint32_t off = seq - t->snd_una;
@@ -346,7 +406,7 @@ bool tcp_port_used(uint32_t addr, uint16_t port, struct isock *except, bool reus
 /* ---- options ---------------------------------------------------------------------- */
 static void parse_options(struct tcpcb *t, const uint8_t *o, size_t n, bool syn)
 {
-    bool ws = false;
+    bool ws = false, sack = false;
     while (n) {
         uint8_t k = o[0];
         if (k == 0) break;
@@ -360,6 +420,8 @@ static void parse_options(struct tcpcb *t, const uint8_t *o, size_t n, bool syn)
         } else if (syn && k == 3 && o[1] == 3) {
             ws = true;
             t->snd_wscale = o[2] > 14 ? 14 : o[2];
+        } else if (syn && k == 4 && o[1] == 2) {
+            sack = true;
         }
         n -= o[1];
         o += o[1];
@@ -367,6 +429,7 @@ static void parse_options(struct tcpcb *t, const uint8_t *o, size_t n, bool syn)
     if (syn) {
         t->wscale_ok = ws;
         if (!ws) t->snd_wscale = 0;
+        t->sack_ok = sack;
     }
 }
 
@@ -386,8 +449,10 @@ static uint32_t rbuf_put(struct tcpcb *t, const uint8_t *d, uint32_t len)
 /* Keep a copy of an out-of-order segment's data (seq in p->seq). */
 static void ooo_insert(struct tcpcb *t, uint32_t seq, const uint8_t *d, uint32_t len)
 {
-    if (t->nooo >= 64 || !len) return;
+    if (t->nooo >= (int)(t->rbuf_size / 512) || !len) return;
+    t->sack_last = seq;
     struct pkt **pp = &t->ooo;
+    if (t->ooo_last && SEQ_GT(seq, t->ooo_last->seq)) pp = &t->ooo_last->next;   /* after a loss: in order */
     while (*pp && SEQ_LT((*pp)->seq, seq)) pp = &(*pp)->next;
     if (*pp && (*pp)->seq == seq && (*pp)->len >= len) return;  /* have it */
     struct pkt *p = pkt_alloc_big(len);
@@ -397,6 +462,7 @@ static void ooo_insert(struct tcpcb *t, uint32_t seq, const uint8_t *d, uint32_t
     p->seq = seq;
     p->next = *pp;
     *pp = p;
+    if (!p->next) t->ooo_last = p;
     t->nooo++;
 }
 
@@ -405,6 +471,7 @@ static void ooo_drain(struct tcpcb *t)
     while (t->ooo && SEQ_LEQ(t->ooo->seq, t->rcv_nxt)) {
         struct pkt *p = t->ooo;
         t->ooo = p->next;
+        if (p == t->ooo_last) t->ooo_last = NULL;
         t->nooo--;
         uint32_t end = p->seq + p->len;
         if (SEQ_GT(end, t->rcv_nxt)) {
@@ -458,7 +525,7 @@ static void new_ack(struct tcpcb *t, uint32_t ack)
         else if (t->sbuf_len) send_segment(t, t->snd_una, t->sbuf_len < t->mss ? t->sbuf_len : t->mss, 0);   /* NewReno partial ACK */
     } else if (t->cwnd < t->ssthresh) t->cwnd += data < t->mss ? data : t->mss;
     else t->cwnd += (uint32_t)((uint64_t)t->mss * t->mss / t->cwnd) + 1;
-    if (t->cwnd > 4 * TCP_BUF) t->cwnd = 4 * TCP_BUF;
+    if (t->cwnd > 4 * TCP_BUF_MAX) t->cwnd = 4 * TCP_BUF_MAX;
     t->dupacks = 0;
     if (t->snd_una == t->snd_max && !(t->sbuf_len && !t->snd_wnd)) t->rto_at = 0;
     else arm_rto(t);
@@ -960,6 +1027,10 @@ long tcp_send(struct isock *s, struct file *f, const void *buf, size_t len, int 
             return t->ever_connected ? -EPIPE : -ENOTCONN;
         }
         uint32_t room = t->sbuf_size - t->sbuf_len;
+        /* full while the windows would let more be in flight: buffer more */
+        if (room < len - done && (t->snd_wnd < t->cwnd ? t->snd_wnd : t->cwnd) >= t->sbuf_size &&
+            ring_grow(t, &t->sbuf, &t->sbuf_head, t->sbuf_len, &t->sbuf_size))
+            room = t->sbuf_size - t->sbuf_len;
         if (room) {
             uint32_t n = len - done < room ? (uint32_t)(len - done) : room;
             uint32_t tail = (t->sbuf_head + t->sbuf_len) % t->sbuf_size;
@@ -977,6 +1048,23 @@ long tcp_send(struct isock *s, struct file *f, const void *buf, size_t len, int 
     }
     net_unlock(fl);
     return done ? (long)done : -EAGAIN;
+}
+
+/* Receive autotuning, as Linux does it: when the reader takes more than half
+ * the buffer per round trip, the window, not the reader, is the limit, so the
+ * buffer doubles. Without a round trip measured yet, 100 ms. */
+static void rcv_autotune(struct tcpcb *t, uint32_t n)
+{
+    uint64_t now = net_now();
+    if (!t->rcv_t0) t->rcv_t0 = now;
+    t->rcv_copied += n;
+    uint32_t rtt = !t->srtt ? 100 : t->srtt < 5 ? 5 : t->srtt;
+    uint64_t span = now - t->rcv_t0;
+    if (span < rtt) return;
+    if ((uint64_t)t->rcv_copied * rtt > span * (t->rbuf_size / 2))
+        ring_grow(t, &t->rbuf, &t->rbuf_head, t->rbuf_len, &t->rbuf_size);
+    t->rcv_t0 = now;
+    t->rcv_copied = 0;
 }
 
 /* After the reader made room: announce a window that grew enough to matter. */
@@ -1006,6 +1094,7 @@ long tcp_recv(struct isock *s, struct file *f, void *buf, size_t len, int flags)
             if (flags & MSG_PEEK) break;
             t->rbuf_head = (t->rbuf_head + n) % t->rbuf_size;
             t->rbuf_len -= n;
+            rcv_autotune(t, n);
             window_update(t);
             if (done == len || !(flags & MSG_WAITALL)) break;
             continue;
@@ -1111,6 +1200,7 @@ int tcp_poll(struct isock *s)
 
 uint32_t tcp_local_addr(struct isock *s) { return s->tcb->laddr; }
 int tcp_readable(struct isock *s) { return s->tcb ? (int)s->tcb->rbuf_len : 0; }
+int tcp_bufsize(struct isock *s, bool rcv) { return (int)(rcv ? s->tcb->rbuf_size : s->tcb->sbuf_size); }
 int tcp_info_state(struct isock *s) { return s->tcb ? linux_state[s->tcb->state] : 7; }
 
 int tcp_sock_error(struct isock *s, bool clear)

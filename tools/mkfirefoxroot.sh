@@ -165,6 +165,18 @@ ln -s /usr/share/fontconfig/conf.avail/10-hinting-full.conf "$ROOT/etc/fonts/con
 mkdir -p "$ROOT/etc/profile.d"
 echo 'export FREETYPE_PROPERTIES="truetype:interpreter-version=35"' > "$ROOT/etc/profile.d/freetype.sh"
 echo 'FREETYPE_PROPERTIES="truetype:interpreter-version=35"' >> "$ROOT/etc/environment"
+# DejaVu for the generic families (Sans, Serif, Monospace), which the
+# desktop, Openbox and most programs ask for: Noto, which some packages
+# pull in, would win otherwise and stays only for scripts DejaVu lacks.
+cat > "$ROOT/etc/fonts/local.conf" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <alias binding="strong"><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias binding="strong"><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>
+  <alias binding="strong"><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+</fontconfig>
+EOF
 chroot "$ROOT" /usr/bin/fc-cache -f
 chroot "$ROOT" /usr/lib/x86_64-linux-gnu/glib-2.0/glib-compile-schemas /usr/share/glib-2.0/schemas
 chroot "$ROOT" /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
@@ -260,6 +272,7 @@ EOF
 # starts that one when it is needed).
 printf '%s\n' '@lxpanel --profile LXDE' '@pcmanfm --desktop --profile LXDE' > "$ROOT/etc/xdg/lxsession/LXDE/autostart"
 sed -i 's/^sNet\/ThemeName=.*/sNet\/ThemeName=Clearlooks-Phenix/' "$ROOT/etc/xdg/lxsession/LXDE/desktop.conf"
+sed -i 's/^sGtk\/FontName=.*/sGtk\/FontName=DejaVu Sans 10/' "$ROOT/etc/xdg/lxsession/LXDE/desktop.conf"
 # lxsession starts lxpolkit unless told otherwise, and lxpolkit, finding
 # no polkit session, shows an error box (again whenever it is closed). A
 # name lxsession does not know makes it start no agent at all.

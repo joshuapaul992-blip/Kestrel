@@ -64,6 +64,7 @@ long tcp_recv(struct isock *s, struct file *f, void *buf, size_t len, int flags)
 int  tcp_shutdown(struct isock *s, int how);
 int  tcp_poll(struct isock *s);
 int  tcp_readable(struct isock *s);             /* FIONREAD */
+int  tcp_bufsize(struct isock *s, bool rcv);    /* SO_RCVBUF, SO_SNDBUF: as they are now */
 int  tcp_info_state(struct isock *s);
 bool tcp_port_used(uint32_t addr, uint16_t port, struct isock *except, bool reuse);
 void tcp_setopt_nodelay(struct isock *s);

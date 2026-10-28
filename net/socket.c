@@ -446,8 +446,8 @@ static int inet_getsockopt_(struct file *f, int level, int opt, void *val, uint3
         case SO_BROADCAST: v = s->broadcast; break;
         case SO_KEEPALIVE: v = s->keepalive; break;
         case SO_ACCEPTCONN: v = s->tcb && tcp_info_state(s) == 10; break;
-        case SO_RCVBUF:    v = s->tcb ? 131072 : (int)s->rcvbuf; break;
-        case SO_SNDBUF:    v = s->tcb ? 131072 : (int)s->sndbuf; break;
+        case SO_RCVBUF:    v = s->tcb ? tcp_bufsize(s, true) : (int)s->rcvbuf; break;
+        case SO_SNDBUF:    v = s->tcb ? tcp_bufsize(s, false) : (int)s->sndbuf; break;
         case SO_RCVTIMEO: case SO_SNDTIMEO: {
             uint32_t ms = opt == SO_RCVTIMEO ? s->rcvtimeo : s->sndtimeo;
             int64_t tv[2] = { ms / 1000, (int64_t)(ms % 1000) * 1000 };
