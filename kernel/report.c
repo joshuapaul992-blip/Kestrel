@@ -15,6 +15,7 @@
 #include <kernel/bootinfo.h>
 #include <kernel/posix.h>
 #include <kernel/time.h>
+#include <kernel/pstate.h>
 
 #define REPORT_LABEL    "KESTREL RPT"
 #define MAX_RUNS        32              /* extents per file (we create 1) */
@@ -229,10 +230,11 @@ static size_t header(char *buf, size_t cap, const char *reason)
         "uptime     %lu.%03lu s\n"
         "firmware   %s, loader %s\n"
         "cmdline    %s\n"
-        "cpu        %s / %s\n",
+        "cpu        %s / %s\n"
+        "clock      %s\n",
         reason, KESTREL_NAME, KESTREL_VERSION, KESTREL_MACHINE, ms / 1000, ms % 1000,
         g_boot.uefi ? "UEFI" : "BIOS", g_boot.loader, g_boot.cmdline[0] ? g_boot.cmdline : "(empty)",
-        g_boot.cpu_vendor, g_boot.cpu_brand);
+        g_boot.cpu_vendor, g_boot.cpu_brand, pstate_desc());
 }
 
 int report_save(const char *reason)
