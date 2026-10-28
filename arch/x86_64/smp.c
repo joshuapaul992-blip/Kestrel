@@ -54,14 +54,16 @@ bool percpu_is_kernel_gs(uint64_t base)
 /* ---- the big kernel lock -------------------------------------------------------- */
 static volatile uint32_t bkl_word;
 static volatile int bkl_owner = -1;
+static uint64_t bkl_from[MAX_CPUS];                     /* who took it, per CPU (kstat.h: bklhold) */
 
-void bkl_enter(void)
+/* from: where the lock was taken, for kstat (kprof's lockwait, stalls) */
+static void bkl_take(uint64_t from)
 {
     uint64_t f = irq_save();                            /* no migration, no nesting mid-acquire */
     struct percpu *c = this_cpu();
     if (c->bkl_depth == 0) {
 #ifdef LOCKCHECK
-        lockcheck_acquire((void *)&bkl_word, NULL, LC_BKL, false, (uint64_t)__builtin_return_address(0));
+        lockcheck_acquire((void *)&bkl_word, NULL, LC_BKL, false, from);
 #endif
         if (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) {
             uint64_t t0 = rdtsc();
@@ -73,14 +75,27 @@ void bkl_enter(void)
             c->ks.lock_spin_n++;
             c->ks.lock_spin_cyc += w;
             if (c->current) { c->current->ks.lock_n++; c->current->ks.lock_cyc += w; }
-            kstat_lockwait((uint64_t)__builtin_return_address(0), w);
+            kstat_lockwait(from, w);
+            if (kstat_stalled(w)) kstat_stall(STALL_BKLWAIT, w, from, 0, NULL);
         }
         bkl_owner = c->id;
+        bkl_from[c->id] = from;
+        if (c->current) c->current->bkl_from = from;
         c->ks.lock_acq++;
         c->ks.lock_since = rdtsc();
     }
     c->bkl_depth++;
     irq_restore(f);
+}
+
+void bkl_enter(void) { bkl_take((uint64_t)__builtin_return_address(0)); }
+
+/* A task that held the lock when it was switched out takes it back: its
+ * own acquisition is what kstat should name, not the switch. */
+void bkl_enter_resume(void)
+{
+    struct tcb *t = this_cpu()->current;
+    bkl_take(t && t->bkl_from ? t->bkl_from : (uint64_t)__builtin_return_address(0));
 }
 
 bool bkl_try_enter(void)
@@ -90,6 +105,7 @@ bool bkl_try_enter(void)
     if (c->bkl_depth == 0) {
         if (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) { irq_restore(f); return false; }
         bkl_owner = c->id;
+        bkl_from[c->id] = (uint64_t)__builtin_return_address(0);
         c->ks.lock_acq++;
         c->ks.lock_since = rdtsc();
     }
@@ -100,7 +116,9 @@ bool bkl_try_enter(void)
 
 static void bkl_release(struct percpu *c)
 {
-    c->ks.lock_hold_cyc += rdtsc() - c->ks.lock_since;
+    uint64_t held = rdtsc() - c->ks.lock_since;
+    c->ks.lock_hold_cyc += held;
+    if (kstat_stalled(held)) kstat_stall(STALL_BKLHOLD, held, bkl_from[c->id], 0, NULL);
     bkl_owner = -1;
     __atomic_store_n(&bkl_word, 0, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);            /* against bkl_defer()'s post, then try */
@@ -201,7 +219,7 @@ void tlb_service(void)
     __atomic_store_n(&c->tlb_pending, 0, __ATOMIC_RELEASE);
 }
 
-static void shootdown(uint64_t pml4, uint64_t start, uint64_t end)
+static void shootdown(uint64_t pml4, uint64_t start, uint64_t end, uint64_t caller)
 {
     uint64_t f = irq_save();                            /* stay on this CPU throughout */
     struct percpu *me = this_cpu();
@@ -225,13 +243,27 @@ static void shootdown(uint64_t pml4, uint64_t start, uint64_t end)
         c->ipis++;
         sent[i] = true;
     }
+    uint64_t t0 = rdtsc();
+    int last = -1;
     for (int i = 0; i < MAX_CPUS; i++)                  /* wait: the old frame may be freed next */
-        if (sent[i]) while (__atomic_load_n(&cpus[i].tlb_pending, __ATOMIC_ACQUIRE)) { tlb_service(); cpu_relax(); }
+        if (sent[i]) {
+            if (__atomic_load_n(&cpus[i].tlb_pending, __ATOMIC_ACQUIRE)) last = i;
+            while (__atomic_load_n(&cpus[i].tlb_pending, __ATOMIC_ACQUIRE)) { tlb_service(); cpu_relax(); }
+        }
+    uint64_t w = rdtsc() - t0;                          /* the slowest: the last one still busy */
+    if (kstat_stalled(w)) kstat_stall(STALL_TLBWAIT, w, caller, (uint64_t)last, NULL);
     irq_restore(f);
 }
 
-void tlb_shootdown(uint64_t pml4, uint64_t start, uint64_t end) { shootdown(pml4 & ADDR_MASK, start, end); }
-void tlb_shootdown_kernel(uint64_t start, uint64_t end) { shootdown(TLB_KERNEL, start, end); }
+void tlb_shootdown(uint64_t pml4, uint64_t start, uint64_t end)
+{
+    shootdown(pml4 & ADDR_MASK, start, end, (uint64_t)__builtin_return_address(0));
+}
+
+void tlb_shootdown_kernel(uint64_t start, uint64_t end)
+{
+    shootdown(TLB_KERNEL, start, end, (uint64_t)__builtin_return_address(0));
+}
 
 /* ---- scheduling help ----------------------------------------------------------- */
 void smp_kick_idle(void)

@@ -133,6 +133,7 @@ extern volatile bool smp_panicking;
 
 /* Big kernel lock */
 void bkl_enter(void);                   /* nest (take it if this CPU has not)  */
+void bkl_enter_resume(void);            /* sched_switch_tail: a holder returns */
 void bkl_exit(void);                    /* unnest (release at depth 0)         */
 bool bkl_try_enter(void);               /* nest, or take it only if it is free */
 void bkl_exit_switch(void);             /* schedule(): release, deferred work left */

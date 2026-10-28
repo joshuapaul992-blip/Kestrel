@@ -11,6 +11,7 @@
 #include <kernel/pagecache.h>
 #include <kernel/report.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -122,6 +123,10 @@ static int process_sum(int tgid, struct kstat_task *out, struct tcb **leader)
 
 static const char *const fault_names[KF_KINDS] = { "anon", "file", "shared", "cow", "other" };
 
+#define STALL_MS   4                                    /* what counts as a stall */
+#define STALL_KEEP 4                                    /* the latest ones listed, per kind */
+static size_t stall_gen(char *buf, size_t cap);
+
 size_t kstat_gen(char *buf, size_t cap)
 {
     size_t n = 0;
@@ -184,6 +189,7 @@ size_t kstat_gen(char *buf, size_t cap)
     pcache_stats(&pc);
     P("pagecache cached_files=%lu cached_pages=%lu hits=%lu misses=%lu readahead=%lu evicted=%lu\n",
       pc.files, pc.pages, pc.hits, pc.misses, pc.ahead, pc.evicted);
+    n += stall_gen(buf + n, n < cap ? cap - n : 0);
 
     /* system calls by on-CPU time */
     P("# system calls by time on the CPU (wall includes sleeping; max_cpu_us is the longest single call)\n");
@@ -258,7 +264,95 @@ static size_t report_section(char *buf, size_t cap) { return kstat_gen(buf, cap)
 
 void kstat_init(void)
 {
+    if (tsc_hz()) kstat_stall_cyc = tsc_hz() / 1000 * STALL_MS;
     report_add_section("Performance counters (/proc/kstat)", report_section);
+}
+
+/* ---- stalls (kstat.h) -------------------------------------------------------- */
+static const char *const stall_names[STALL_KINDS] = {
+    "irqoff", "runwait", "syscall", "fault", "mmwait", "bklwait", "bklhold", "tlbwait",
+};
+struct stall { uint64_t ms, cyc, where, arg; int cpu, pid; uint8_t kind; char name[16]; };
+static struct stall stall_ring[STALL_KINDS][STALL_KEEP];
+static uint64_t stall_seq[STALL_KINDS];                 /* recorded per kind: the next slot */
+static uint64_t stall_over[STALL_KINDS][3], stall_max[STALL_KINDS];
+static struct spinlock stall_lock;
+uint64_t kstat_stall_cyc = UINT64_MAX;                  /* until the TSC is known */
+
+void kstat_stall(int kind, uint64_t cyc, uint64_t where, uint64_t arg, struct tcb *t)
+{
+    if (kind < 0 || kind >= STALL_KINDS || !kstat_stalled(cyc)) return;
+    if (!t) t = current_task();
+    uint64_t ms = cyc / (kstat_stall_cyc / STALL_MS);
+    uint64_t f = spin_lock_irqsave(&stall_lock);
+    stall_over[kind][0]++;
+    if (ms >= 16) stall_over[kind][1]++;
+    if (ms >= 50) stall_over[kind][2]++;
+    if (cyc > stall_max[kind]) stall_max[kind] = cyc;
+    struct stall *e = &stall_ring[kind][stall_seq[kind]++ % STALL_KEEP];
+    e->ms = uptime_ms();
+    e->cyc = cyc;
+    e->where = where;
+    e->arg = arg;
+    e->cpu = this_cpu()->id;
+    e->kind = (uint8_t)kind;
+    e->pid = t ? t->pid : -1;
+    memset(e->name, 0, sizeof e->name);
+    if (t) memcpy(e->name, t->name, sizeof e->name - 1 < sizeof t->name ? sizeof e->name - 1 : sizeof t->name);
+    spin_unlock_irqrestore(&stall_lock, f);
+}
+
+/* A tick more than a period late means interrupts were off that long; the
+ * tick then interrupts the instruction that turned them back on. */
+void kstat_tick(uint64_t rip)
+{
+    struct kstat_cpu *k = &this_cpu()->ks;
+    uint64_t now = rdtsc(), last = k->tick_tsc, period = kstat_stall_cyc / STALL_MS;
+    k->tick_tsc = now;
+    if (last && now - last > period && kstat_stalled(now - last - period))
+        kstat_stall(STALL_IRQOFF, now - last - period, rip, 0, NULL);
+}
+
+static size_t stall_gen(char *buf, size_t cap)
+{
+    size_t n = 0;
+    P("# stalls of %d ms or more: interrupts off (irqoff), ready but not running (runwait), one system call\n"
+      "# or page fault, waiting for an address space (mmwait), waiting for or holding the big lock, waiting\n"
+      "# for other CPUs' TLBs (tlbwait)\n", STALL_MS);
+    for (int k = 0; k < STALL_KINDS; k++)
+        P("stall.%s over_%dms=%lu over_16ms=%lu over_50ms=%lu max_us=%lu\n", stall_names[k], STALL_MS,
+          stall_over[k][0], stall_over[k][1], stall_over[k][2], kstat_us(stall_max[k]));
+    struct stall ring[STALL_KINDS][STALL_KEEP];
+    uint64_t seq[STALL_KINDS];
+    uint64_t f = spin_lock_irqsave(&stall_lock);
+    memcpy(ring, stall_ring, sizeof ring);
+    memcpy(seq, stall_seq, sizeof seq);
+    spin_unlock_irqrestore(&stall_lock, f);
+    P("# the latest of each kind: uptime, kind, length, CPU, thread, where (addr2line -f -e kernel.elf)\n");
+    for (int k = 0; k < STALL_KINDS; k++)
+    for (uint64_t i = seq[k] > STALL_KEEP ? seq[k] - STALL_KEEP : 0; i < seq[k]; i++) {
+        const struct stall *e = &ring[k][i % STALL_KEEP];
+        uint64_t us = kstat_us(e->cyc);
+        P("#  %lu.%03lus %s %lu.%lums cpu%d %d/%s", e->ms / 1000, e->ms % 1000, stall_names[e->kind],
+          us / 1000, us % 1000 / 100, e->cpu, e->pid, e->name);
+        if (e->kind == STALL_SYSCALL) {
+            const char *nm = syscall_name((int)e->where);
+            if (nm) P(" %s", nm);
+            else P(" syscall %lu", e->where);
+            if (e->arg) P(" %lx", e->arg);
+        } else if (e->kind == STALL_FAULT) {
+            P(" %s at %lx", e->arg < KF_KINDS ? fault_names[e->arg] : "?", e->where);
+        } else if (e->kind == STALL_MMWAIT) {
+            P(" at %lx", e->where);
+            if (e->arg) P(" held by %lu", e->arg);
+        } else if (e->kind == STALL_TLBWAIT) {
+            P(" at %lx for cpu%lu", e->where, e->arg);
+        } else if (e->where) {
+            P(" at %lx", e->where);
+        }
+        P("\n");
+    }
+    return n;
 }
 
 /* ---- tick profile (kstat.h) ------------------------------------------------ */

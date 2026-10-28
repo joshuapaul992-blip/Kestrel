@@ -322,6 +322,7 @@ static bool lockless(struct int_frame *f)
         return true;
     case VEC_LAPIC_TIMER:                               /* every CPU: accounting, the slice */
         kstat_prof_tick(f->rip, (f->cs & 3) == 3);
+        kstat_tick(f->rip);
         lapic_eoi();                                    /* first: we may switch away */
         this_cpu()->ticks++;
         pstate_tick();
@@ -398,6 +399,7 @@ void isr_dispatch(struct int_frame *f)
             this_cpu()->ks.irq_cyc += rdtsc() - t0;
         }
     } else if (f->vector == VEC_LAPIC_TIMER) {
+        kstat_tick(f->rip);
         lapic_eoi();
         this_cpu()->ticks++;
         pstate_tick();
