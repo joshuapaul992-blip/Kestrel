@@ -53,6 +53,56 @@ static uint64_t nswitches;
 static struct spinlock sched_lock;
 struct spinlock proc_lock;                          /* task.h: the process tree */
 
+/* The task table is large (MAX_TASKS slots of a few KiB each), and most
+ * slots are empty or asleep: a walk over it touches a cache line, often a
+ * TLB entry, per slot. The scheduler's questions -- who is ready, who
+ * sleeps on this channel, is any timed sleep due -- are answered from these
+ * instead: bit i of st_ready is set while tasks[i] is TASK_READY, of
+ * st_wait while it is TASK_BLOCKED or TASK_SLEEPING, of st_idlecls when it
+ * is an idle-class thread; chan_of[i] is its wait channel while in
+ * st_wait. sleep_next is no later than the earliest wake_ms of a sleeping
+ * task (UINT64_MAX: none). All change with the state, under sched_lock
+ * (a new slot's under proc_lock), with atomics so lockless readers (the
+ * idle loop) see whole words. */
+#define ST_WORDS (MAX_TASKS / 64)
+static uint64_t st_ready[ST_WORDS], st_wait[ST_WORDS], st_idlecls[ST_WORDS];
+static void *chan_of[MAX_TASKS];
+static uint64_t sleep_next = UINT64_MAX;
+
+static void set_state(struct tcb *t, enum task_state s)
+{
+    if (t >= tasks && t < tasks + MAX_TASKS) {
+        int i = (int)(t - tasks);
+        uint64_t bit = 1ull << (i & 63);
+        if (s == TASK_READY) __atomic_or_fetch(&st_ready[i >> 6], bit, __ATOMIC_RELAXED);
+        else __atomic_and_fetch(&st_ready[i >> 6], ~bit, __ATOMIC_RELAXED);
+        if (s == TASK_BLOCKED || s == TASK_SLEEPING) {
+            chan_of[i] = t->wait_chan;
+            __atomic_or_fetch(&st_wait[i >> 6], bit, __ATOMIC_RELAXED);
+            if (s == TASK_SLEEPING && t->wake_ms < __atomic_load_n(&sleep_next, __ATOMIC_RELAXED))
+                __atomic_store_n(&sleep_next, t->wake_ms, __ATOMIC_RELAXED);
+        } else {
+            __atomic_and_fetch(&st_wait[i >> 6], ~bit, __ATOMIC_RELAXED);
+        }
+    }
+    __atomic_store_n(&t->state, s, __ATOMIC_RELEASE);
+}
+
+/* The first slot after `start` (going round, start itself last) whose bit
+ * is set in a & ~not (not may be NULL); -1 if none. */
+static int next_set(const uint64_t *a, const uint64_t *not, int start)
+{
+    for (int k = 0; k <= ST_WORDS; k++) {
+        int w = ((start + 1) / 64 + k) % ST_WORDS;
+        uint64_t v = __atomic_load_n(&a[w], __ATOMIC_RELAXED);
+        if (not) v &= ~__atomic_load_n(&not[w], __ATOMIC_RELAXED);
+        if (k == 0) v &= ~0ull << ((start + 1) % 64);                /* only after start in its word */
+        if (k == ST_WORDS) v &= (start + 1) % 64 ? ~(~0ull << ((start + 1) % 64)) : 0;   /* the rest of it */
+        if (v) return w * 64 + __builtin_ctzll(v);
+    }
+    return -1;
+}
+
 /* A sleeping t can run now (sched_lock held): mark it, and get an idle CPU
  * (if any) to look. A task woken before its own CPU has switched it out
  * simply stays on that CPU. */
@@ -60,8 +110,8 @@ static void make_ready_locked(struct tcb *t)
 {
     if (t->state != TASK_BLOCKED && t->state != TASK_SLEEPING) return;
     need_resched = true;                                /* this CPU's */
-    if (t->sched_cur) { t->state = TASK_RUNNING; return; }
-    t->state = TASK_READY;
+    if (t->sched_cur) { set_state(t, TASK_RUNNING); return; }
+    set_state(t, TASK_READY);
     smp_kick_idle();
 }
 
@@ -84,7 +134,7 @@ static void block_self(void *chan, uint64_t wake_ms)
     }
     cur->wait_chan = chan;
     cur->wake_ms = wake_ms;
-    cur->state = wake_ms ? TASK_SLEEPING : TASK_BLOCKED;
+    set_state(cur, wake_ms ? TASK_SLEEPING : TASK_BLOCKED);
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
@@ -302,7 +352,7 @@ static void reap_one(struct tcb *t)
     t->pml4 = 0;
     kstack_free(t->kstack);
     t->kstack = NULL;
-    __atomic_store_n(&t->state, TASK_UNUSED, __ATOMIC_RELEASE);
+    set_state(t, TASK_UNUSED);
 }
 
 /* Still on its stack: exiting on another CPU, or not yet switched out. */
@@ -442,7 +492,7 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
             if (tasks[i].state == TASK_UNUSED) t = &tasks[i];
         if (t) {
             memset(t, 0, sizeof *t);
-            t->state = TASK_BLOCKED;    /* not runnable until fully built */
+            set_state(t, TASK_BLOCKED); /* not runnable until fully built */
             t->paused = true;           /* not even by a signal: task_start() */
             t->pid = t->tgid = next_pid++;
         }
@@ -456,8 +506,8 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
     }
 
     t->kstack = kstack_alloc();
-    if (!t->kstack) { t->state = TASK_UNUSED; return NULL; }
-    if (!task_state_new(t, cur)) { kstack_free(t->kstack); t->kstack = NULL; t->state = TASK_UNUSED; return NULL; }
+    if (!t->kstack) { set_state(t, TASK_UNUSED); return NULL; }
+    if (!task_state_new(t, cur)) { kstack_free(t->kstack); t->kstack = NULL; set_state(t, TASK_UNUSED); return NULL; }
     t->kstack_size = KSTACK_SIZE;
 
     /* Fake context_switch frame: r15 r14 r13 r12 rbp rbx rflags rip */
@@ -491,7 +541,7 @@ void task_start(struct tcb *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
     t->paused = false;
-    t->state = TASK_READY;              /* no preemption of the creator: an idle CPU may take it */
+    set_state(t, TASK_READY);           /* no preemption of the creator: an idle CPU may take it */
     smp_kick_idle();
     spin_unlock_irqrestore(&sched_lock, f);
 }
@@ -503,12 +553,20 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     return t;
 }
 
-void task_set_idle_class(struct tcb *t) { t->idle_class = true; }
+void task_set_idle_class(struct tcb *t)
+{
+    t->idle_class = true;
+    if (t >= tasks && t < tasks + MAX_TASKS)
+        __atomic_or_fetch(&st_idlecls[(t - tasks) >> 6], 1ull << ((t - tasks) & 63), __ATOMIC_RELAXED);
+}
 
 static bool normal_ready(void)
 {
-    for (int i = 1; i < MAX_TASKS; i++)
-        if (tasks[i].state == TASK_READY && !tasks[i].idle_class) return true;
+    for (int w = 0; w < ST_WORDS; w++) {
+        uint64_t v = __atomic_load_n(&st_ready[w], __ATOMIC_RELAXED) & ~__atomic_load_n(&st_idlecls[w], __ATOMIC_RELAXED);
+        if (w == 0) v &= ~1ull;                                 /* not the boot thread */
+        if (v) return true;
+    }
     return false;
 }
 
@@ -525,10 +583,18 @@ static struct tcb *pick_next(void)
     static int rr;                                      /* idle threads are not in tasks[] */
     int start = (cur >= tasks && cur < tasks + MAX_TASKS) ? (int)(cur - tasks) : rr++ % MAX_TASKS;
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 1; i <= MAX_TASKS; i++) {
-            struct tcb *t = &tasks[(start + i) % MAX_TASKS];
-            bool eligible = t->pid != 0 || (boot_thread_busy && this_cpu()->id == 0);
-            if (eligible && t->state == TASK_READY && t->idle_class == (pass == 1)) return t;
+        /* the ready slots after start, round robin; the boot thread (slot 0)
+         * only while it is busy, and only on CPU 0 */
+        uint64_t only_idle[ST_WORDS];
+        if (pass == 1) for (int w = 0; w < ST_WORDS; w++) only_idle[w] = st_ready[w] & st_idlecls[w];
+        const uint64_t *set = pass ? only_idle : st_ready, *not = pass ? NULL : st_idlecls;
+        for (int i = start, n = 0; n < 2; n++) {
+            i = next_set(set, not, i);
+            if (i < 0) break;
+            struct tcb *t = &tasks[i];
+            if (i == 0 && !(boot_thread_busy && this_cpu()->id == 0)) continue;   /* look once more past it */
+            if (t->state == TASK_READY) return t;
+            break;
         }
         /* no other normal task: a normal current task keeps the CPU */
         if (pass == 0 && cur->state == TASK_RUNNING && !cur->idle_class && cur->pid != 0) return cur;
@@ -558,8 +624,8 @@ void schedule(void)
     uint64_t f = spin_lock_irqsave(&sched_lock);
     need_resched = false;
     struct tcb *next = pick_next();
-    if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
-    next->state = TASK_RUNNING;
+    if (prev->state == TASK_RUNNING) set_state(prev, TASK_READY);
+    set_state(next, TASK_RUNNING);
     next->quantum = SCHED_QUANTUM;
     if (next == prev) { spin_unlock_irqrestore(&sched_lock, f); return; }
     prev->sched_cur = false;
@@ -662,9 +728,17 @@ void itimer_real(struct signal_struct *g, bool set, uint64_t every, uint64_t at,
 static void wake_sleepers(void)
 {
     uint64_t now = uptime_ms();
+    if (now < __atomic_load_n(&sleep_next, __ATOMIC_RELAXED)) return;  /* none due */
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    for (int i = 1; i < MAX_TASKS; i++)
-        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_ms <= now) make_ready_locked(&tasks[i]);
+    uint64_t next = UINT64_MAX;
+    for (int w = 0; w < ST_WORDS; w++)
+        for (uint64_t v = st_wait[w]; v; v &= v - 1) {
+            struct tcb *t = &tasks[w * 64 + __builtin_ctzll(v)];
+            if (t->state != TASK_SLEEPING) continue;
+            if (t->wake_ms <= now) make_ready_locked(t);
+            else if (t->wake_ms < next) next = t->wake_ms;
+        }
+    __atomic_store_n(&sleep_next, next, __ATOMIC_RELAXED);
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
@@ -885,21 +959,23 @@ void wakeup(void *chan)
     __atomic_add_fetch(&poll_seq, 1, __ATOMIC_SEQ_CST);
     bool polls = __atomic_load_n(&pollers, __ATOMIC_SEQ_CST) > 0;
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    for (int i = 0; i < MAX_TASKS; i++) {
-        struct tcb *t = &tasks[i];
-        if (t->state != TASK_BLOCKED && t->state != TASK_SLEEPING) continue;
-        if (t->wait_chan == chan || (polls && t->wait_chan == &poll_seq && polls_for(t, chan))) make_ready_locked(t);
-    }
+    for (int w = 0; w < ST_WORDS; w++)
+        for (uint64_t v = st_wait[w]; v; v &= v - 1) {
+            int i = w * 64 + __builtin_ctzll(v);
+            if (chan_of[i] == chan || (polls && chan_of[i] == &poll_seq && polls_for(&tasks[i], chan)))
+                make_ready_locked(&tasks[i]);
+        }
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
 void wakeup_waiters(void *chan)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    for (int i = 0; i < MAX_TASKS; i++) {
-        struct tcb *t = &tasks[i];
-        if ((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && t->wait_chan == chan) make_ready_locked(t);
-    }
+    for (int w = 0; w < ST_WORDS; w++)
+        for (uint64_t v = st_wait[w]; v; v &= v - 1) {
+            int i = w * 64 + __builtin_ctzll(v);
+            if (chan_of[i] == chan) make_ready_locked(&tasks[i]);
+        }
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
@@ -959,7 +1035,7 @@ void poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt)
         if (sleep) {
             cur->wait_chan = &poll_seq;
             cur->wake_ms = wake ? wake : 1;
-            cur->state = TASK_SLEEPING;
+            set_state(cur, TASK_SLEEPING);
         }
         spin_unlock_keep_irqs(&sched_lock);
         if (sleep) schedule();
@@ -1024,7 +1100,7 @@ void task_exit(int code)
     process_exit(cur);                          /* thread group, parent, children, vfork */
     uint64_t pf = spin_lock_irqsave(&proc_lock);   /* task_wait() checks under it */
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    cur->state = TASK_ZOMBIE;
+    set_state(cur, TASK_ZOMBIE);
     spin_unlock_irqrestore(&sched_lock, f);
     spin_unlock_irqrestore(&proc_lock, pf);
     __atomic_add_fetch(&zombie_gen, 1, __ATOMIC_RELEASE);
@@ -1058,8 +1134,8 @@ int task_wait(int pid)
 
 static bool any_ready(void)
 {
-    for (int i = 1; i < MAX_TASKS; i++)
-        if (__atomic_load_n(&tasks[i].state, __ATOMIC_RELAXED) == TASK_READY) return true;
+    for (int w = 0; w < ST_WORDS; w++)
+        if (__atomic_load_n(&st_ready[w], __ATOMIC_RELAXED) & (w ? ~0ull : ~1ull)) return true;
     return false;
 }
 
