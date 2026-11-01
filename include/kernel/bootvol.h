@@ -21,7 +21,9 @@
  *   kestrel.root=usb    a volume on USB storage is REQUIRED: wait up to
  *                       rootwait for it, else recovery. A virtio disk
  *                       counts too: in a virtual machine that is where
- *                       the stick image goes
+ *                       the stick image goes. With none by then, the
+ *                       other disks are searched once: a stick copied
+ *                       onto a SATA/NVMe disk (/dev/install) boots so
  *   kestrel.root=any    same, any disk (USB, SATA, NVMe or virtio)
  *   kestrel.root=none   skip discovery
  *   kestrel.rootwait=MS settle/wait budget (default 3000, max 60000)
