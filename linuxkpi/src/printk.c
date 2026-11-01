@@ -3,7 +3,15 @@
  * Linux messages carry their level as a "\001<digit>" prefix; it is
  * stripped here and the text goes to Kestrel's log. KERN_DEBUG messages
  * are dropped unless linuxkpi.debug=1. A message that does not end in a
- * newline is finished by the next one unless that is a KERN_CONT. */
+ * newline is finished by the next one unless that is a KERN_CONT.
+ *
+ * Some messages come as fast as the hardware raises them (nouveau's GPU
+ * traps: several lines for each, many a second), and logging them costs
+ * the driver's interrupt handler its time. Each message (its format) may
+ * log RL_BURST lines every RL_WINDOW_MS; the rest are counted, and the
+ * count is logged when it may log again. Only errors and warnings are
+ * limited: critical ones always go, and so does information (a driver
+ * listing what it found). */
 #include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/device.h>
@@ -17,7 +25,44 @@ const char hex_asc_upper[] = "0123456789ABCDEF";
 
 static bool line_open;              /* the last message did not end in '\n' */
 
-int vprintk(const char *fmt, va_list args)
+#define RL_SITES     32
+#define RL_BURST     10
+#define RL_WINDOW_MS 5000
+static struct { const void *site; unsigned long long t0; unsigned int n, dropped; } rl[RL_SITES];
+static DEFINE_RAW_SPINLOCK(rl_lock);
+static bool dropping;               /* the last line was dropped: so are its KERN_CONT parts */
+
+/* May site log a line now? *dropped: lines it lost since it last could. */
+static bool rl_allow(const void *site, unsigned int *dropped)
+{
+    unsigned long long now = lkpi_time_ms();
+    unsigned long flags;
+    bool ok = true;
+    *dropped = 0;
+    raw_spin_lock_irqsave(&rl_lock, flags);
+    int i, oldest = 0;
+    for (i = 0; i < RL_SITES && rl[i].site != site; i++)
+        if (rl[i].t0 < rl[oldest].t0) oldest = i;
+    if (i == RL_SITES) {                    /* new: take the slot used longest ago */
+        i = oldest;
+        rl[i].site = site;
+        rl[i].t0 = now;
+        rl[i].n = rl[i].dropped = 0;
+    }
+    if (now - rl[i].t0 >= RL_WINDOW_MS) {
+        *dropped = rl[i].dropped;
+        rl[i].t0 = now;
+        rl[i].n = rl[i].dropped = 0;
+    }
+    if (rl[i].n >= RL_BURST) { rl[i].dropped++; ok = false; }
+    else rl[i].n++;
+    raw_spin_unlock_irqrestore(&rl_lock, flags);
+    return ok;
+}
+
+/* site: what identifies the message for rate limiting (its format; NULL:
+ * not limited, such as the lines of a hex dump) */
+static int vprintk_site(const void *site, const char *fmt, va_list args)
 {
     char buf[512];
     int level = 6;                  /* KERN_INFO when there is no prefix: Linux's default is 4, close enough */
@@ -29,6 +74,17 @@ int vprintk(const char *fmt, va_list args)
         fmt += 2;
     }
     if (level == 7 && !lkpi_debug_enabled()) return 0;
+    if (cont && dropping) return 0;
+    unsigned int dropped = 0;
+    if (!cont) {
+        dropping = site && (level == 3 || level == 4) && !rl_allow(site, &dropped);
+        if (dropping) return 0;
+    }
+    if (dropped) {
+        snprintf(buf, sizeof buf, "%slinuxkpi: %u more like the next line not logged\n", line_open ? "\n" : "", dropped);
+        line_open = false;
+        lkpi_log(buf);
+    }
 
     int n = 0;
     if (line_open && !cont) buf[n++] = '\n';
@@ -41,6 +97,8 @@ int vprintk(const char *fmt, va_list args)
     return len;
 }
 
+int vprintk(const char *fmt, va_list args) { return vprintk_site(fmt, fmt, args); }
+
 int printk(const char *fmt, ...)
 {
     va_list ap;
@@ -51,8 +109,9 @@ int printk(const char *fmt, ...)
 }
 
 /* printk with a KERN_<LEVEL> given apart from the format (a string such as
- * dev_printk's level argument): vprintk reads the level from the format */
-static __printf(2, 3) int level_printk(const char *level, const char *fmt, ...)
+ * dev_printk's level argument): vprintk reads the level from the format.
+ * site: the caller's own format, which names the message. */
+static __printf(3, 4) int level_printk(const void *site, const char *level, const char *fmt, ...)
 {
     char f[64];
     size_t l = level ? strnlen(level, 4) : 0;
@@ -60,7 +119,7 @@ static __printf(2, 3) int level_printk(const char *level, const char *fmt, ...)
     if (l) memcpy(f, level, l);
     strscpy(f + l, fmt, sizeof f - l);
     va_start(ap, fmt);
-    int r = vprintk(f, ap);
+    int r = vprintk_site(site, f, ap);
     va_end(ap);
     return r;
 }
@@ -82,8 +141,8 @@ void _dev_printk(const char *level, const struct device *dev, const char *fmt, .
     va_start(ap, fmt);
     vaf.fmt = fmt;
     vaf.va = &ap;
-    if (dev) level_printk(level, "%s %s: %pV", dev_driver_string(dev), dev_name(dev), &vaf);
-    else level_printk(level, "(NULL device *): %pV", &vaf);
+    if (dev) level_printk(fmt, level, "%s %s: %pV", dev_driver_string(dev), dev_name(dev), &vaf);
+    else level_printk(fmt, level, "(NULL device *): %pV", &vaf);
     va_end(ap);
 }
 
@@ -199,8 +258,8 @@ void print_hex_dump(const char *level, const char *prefix_str, int prefix_type, 
     for (size_t i = 0; i < len; i += rowsize) {
         size_t n = len - i < (size_t)rowsize ? len - i : (size_t)rowsize;
         hex_dump_to_buffer(p + i, n, rowsize, groupsize, line, sizeof line, ascii);
-        if (prefix_type == DUMP_PREFIX_ADDRESS) level_printk(level, "%s%p: %s\n", prefix_str, p + i, line);
-        else if (prefix_type == DUMP_PREFIX_OFFSET) level_printk(level, "%s%.8zx: %s\n", prefix_str, i, line);
-        else level_printk(level, "%s%s\n", prefix_str, line);
+        if (prefix_type == DUMP_PREFIX_ADDRESS) level_printk(NULL, level, "%s%p: %s\n", prefix_str, p + i, line);
+        else if (prefix_type == DUMP_PREFIX_OFFSET) level_printk(NULL, level, "%s%.8zx: %s\n", prefix_str, i, line);
+        else level_printk(NULL, level, "%s%s\n", prefix_str, line);
     }
 }

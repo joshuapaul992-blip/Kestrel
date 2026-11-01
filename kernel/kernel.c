@@ -458,6 +458,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     pstate_init_cpu();          /* turbo; before the other CPUs, which follow its choice */
     sched_init();
     sti();
+    serial_log_async();         /* the tick feeds the UART from here on */
     kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);
 
     /* ---------------- Phase 2: boot manager ---------------- */
