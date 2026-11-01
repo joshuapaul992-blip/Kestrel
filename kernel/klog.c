@@ -9,6 +9,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/tty.h>
 #include <kernel/stopscreen.h>
+#include <kernel/font.h>
 
 static char   log_buf[KLOG_SIZE];
 static size_t log_len;              /* total bytes ever written (wraps buffer) */
@@ -16,6 +17,40 @@ static bool   to_console;
 static struct spinlock log_lock;
 
 void klog_set_console(bool on) { to_console = on; }
+
+/* The boot trace: from the first lines until the boot manager, every log
+ * line is also drawn straight onto the firmware's frame buffer, so a PC
+ * that stops early (no serial port, no report yet) shows where. Lines
+ * wrap from the bottom back to the top, the next line blanked. */
+static bool trace_on;
+static int  trace_row;
+
+void klog_trace_screen(bool on) { trace_on = on && g_fb.ready; trace_row = 0; }
+
+static void trace_line(const char *s, size_t n)
+{
+    const struct font *f = &font_8x16;
+    int cols = (int)g_fb.width / f->width, rows = (int)g_fb.height / f->height;
+    if (cols <= 0 || rows <= 1) return;
+    for (size_t i = 0; i < n;) {
+        size_t e = i;
+        while (e < n && s[e] != '\n') e++;
+        int y = trace_row * f->height;
+        for (int c = 0; c < cols; c++) {
+            char ch = (size_t)c < e - i ? s[i + c] : ' ';
+            if (ch == '\033' || (unsigned char)ch < ' ') ch = ' ';
+            fb_draw_char(c * f->width, y, ch, 0xC0C0C0, 0x000000, f);
+        }
+        trace_row = (trace_row + 1) % rows;
+        for (int c = 0; c < cols; c++)                  /* the line after: where the next goes */
+            fb_draw_char(c * f->width, trace_row * f->height, ' ', 0, 0x000000, f);
+        if (g_fb.double_buffered) {
+            fb_flush_rect(0, y, (int)g_fb.width, f->height);
+            fb_flush_rect(0, trace_row * f->height, (int)g_fb.width, f->height);
+        }
+        i = e + 1;
+    }
+}
 
 void klog_putc(char c)
 {
@@ -66,6 +101,7 @@ void kprintf(const char *fmt, ...)
     serial_write(buf);
     if (lock) spin_unlock_irqrestore(&log_lock, f);
     else irq_restore(f);
+    if (trace_on && !to_console) trace_line(buf, (size_t)n);
     if (!to_console || !g_fb.ready) return;
     if (tty_ready()) tty_write(tty_get(0), buf, (size_t)n);     /* system console: monitor 0 */
     else con_write(&g_con, buf, (size_t)n);

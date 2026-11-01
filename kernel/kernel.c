@@ -135,6 +135,7 @@ static void video_init(struct mb2_tag_framebuffer *t)
     }
     fb_clear(COL_BLACK);
     fb_flush();
+    klog_trace_screen(true);                        /* on again, from the top of the cleared screen */
 }
 
 /* The PCI enumerator logs through klog_putc(): COM1 + the kernel log. */
@@ -420,6 +421,14 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     if (magic != MB2_BOOTLOADER_MAGIC) panic("bad Multiboot2 magic %x", magic);
     g_boot.mbi = mbi;
     struct mb2_tag_framebuffer *fbt = parse_multiboot(mbi);
+    /* The boot trace: the log on the firmware's frame buffer from here to
+     * the boot manager (klog.c), if the boot page tables already map it. */
+    if (fbt && (uint64_t)fbt->addr + (uint64_t)fbt->pitch * fbt->height <= BOOT_MAP_END && fb_init(fbt)) {
+        fb_clear(COL_BLACK);
+        klog_trace_screen(true);
+        kprintf("%s %s: boot trace (shown until the boot menu; a photo of it helps when the PC stops here)\n",
+                KESTREL_NAME, KESTREL_VERSION);
+    }
     detect_cpu();
     kprintf("boot: loader \"%s\", firmware %s, cmdline \"%s\"\n", g_boot.loader,
             g_boot.uefi ? "UEFI" : "BIOS", g_boot.cmdline);
@@ -461,6 +470,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);
 
     /* ---------------- Phase 2: boot manager ---------------- */
+    klog_trace_screen(false);
     struct boot_choice ch = bootmgr_run();
     g_boot.boot_entry = (uint32_t)ch.entry;
     g_boot.boot_flags = ch.flags;
