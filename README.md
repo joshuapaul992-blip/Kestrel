@@ -425,7 +425,7 @@ The path from "the firmware owns the USB controllers" to "the boot volume is mou
 - **Intel PCH xHCI** (7/8/9 series): `USB3_PSSEN`/`XUSB2PR` are written from their BIOS-provided mask registers, so shared ports switch to the xHCI.
 - **xHCI USBLEGSUP:** requested right before the controller reset, with the same wait-then-force logic. The outcome appears in the diagnostic trace.
 
-**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area), and the TSC is calibrated against PIT channel 2 by polling. An invariant TSC (CPUID `0x80000007`, every recent PC) becomes the clock, recalibrated against the HPET: it is read in a few cycles, by the vDSO too. Without one the HPET is the clock, and without an HPET the TSC as it is. `kestrel.clocksource=hpet` or `=tsc` overrides the choice. Each CPU that starts takes turns with the boot CPU reading the TSC under a lock; if either ever sees it go backwards, the counters are not in step and the clock goes back to the HPET. Every source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
+**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area), and the TSC's rate is measured against the HPET, else the ACPI PM timer, else PIT channel 2, all by polling, else read from CPUID `0x15`/`0x16`. Many UEFI PCs stop the PIT's clock when no legacy BIOS is loaded, and a timer that does not count (a rate outside 100 MHz to 20 GHz) is passed over within seconds instead of holding up the boot. An invariant TSC (CPUID `0x80000007`, every recent PC) becomes the clock: it is read in a few cycles, by the vDSO too. Without one the HPET is the clock, and without an HPET the TSC as it is. `kestrel.clocksource=hpet` or `=tsc` overrides the choice. Each CPU that starts takes turns with the boot CPU reading the TSC under a lock; if either ever sees it go backwards, the counters are not in step and the clock goes back to the HPET. Every source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
 
 **3. Non-blocking settling** (`xhci_settle_step()`). One call is one pass over every root port's `PORTSC`; it never depends on Port Status Change events alone.
 - A new connection is debounced for 100 ms, then enumerated.
@@ -635,7 +635,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               msi.c          MSI/MSI-X: vectors 0x50-0x6F for PCI devices, /proc/interrupts lines
               usbhost.c      PCI -> xHCI glue, key injection, mouse position, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
-              time.c         invariant TSC / HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
+              time.c         invariant TSC / HPET (ACPI) / calibrated TSC clock usable before interrupts
               vdso.c         the vDSO's pages, mapped into every process (clock reads without syscalls)
               kstat.c        performance counters: /proc/kstat, /proc/PID/kstat, a REPORT.TXT section
               block.c        block device registry, MBR/GPT partitions, /proc/partitions
