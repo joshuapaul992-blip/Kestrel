@@ -55,7 +55,7 @@ A host x86_64 `gcc` works because everything is compiled `-ffreestanding -nostdl
 
 On Fedora and Arch the GRUB tools are called `grub2-*`. The Makefile finds both names; override `GRUB_LIB` if `boot.img` lives somewhere unusual.
 
-The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`).
+The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`). Once interrupts are on, the log is queued and the timer tick feeds the UART, so a message never waits for the port: a real UART takes about 7 ms a line at 115200 baud, which kprintf used to spend with interrupts off. When the queue (64 KiB) is full, the port loses text (the kernel log and `REPORT.TXT` keep it) and says how much; a panic sends what is queued first.
 
 **Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer these entries for 5 seconds:
 - **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, then LXDE where the root file system has it (the Firefox image, see "glibc programs, GTK and Firefox"), otherwise IceWM and an xterm. Logout in the desktop's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
@@ -1272,7 +1272,7 @@ The lists below say what works and what is a stub.
 
 **Basics** (`types.h`, `compiler*.h`, `kernel.h`, `minmax.h`, `bits.h`, `bitops.h`, `bitmap.h`, `list.h`, `err.h`, `overflow.h`, `math64.h`, `string.h`, `ctype.h`, `kstrtox.h`, `sprintf.h`). Linux's types and compiler macros, `container_of`, `min`/`max`/`clamp`, the bit operations and bitmaps, lists and hlists, `ERR_PTR`, the overflow helpers, 64-bit division, and the string functions, including `strscpy`, `kstrdup`, `kasprintf` and `kstrto*`. `vsprintf.c` is a complete formatter with Linux's `%p` extensions: `%pe`, `%pV`, `%pM`, `%pI4`, `%pI6`, `%pa`, `%ph`, `%pR` and `%pS`. `sscanf` works too.
 
-**Logging** (`printk.h`, `dev_printk.h`). `printk` takes the usual `KERN_*` levels and `KERN_CONT`. Messages go to Kestrel's log without the level prefix, and `KERN_DEBUG` is dropped unless `linuxkpi.debug=1`. The `dev_*`, `pr_*`, `dev_err_probe`, `print_hex_dump`, `WARN*` and `BUG*` calls work. `BUG()` calls Kestrel's `panic()`.
+**Logging** (`printk.h`, `dev_printk.h`). `printk` takes the usual `KERN_*` levels and `KERN_CONT`. Messages go to Kestrel's log without the level prefix, and `KERN_DEBUG` is dropped unless `linuxkpi.debug=1`. Errors and warnings are limited to 10 lines per message every 5 seconds (a message is its format string); the rest are counted and the count is logged with the next one that goes through. nouveau's GPU traps log several lines for each, many a second, from its interrupt handler. The `dev_*`, `pr_*`, `dev_err_probe`, `print_hex_dump`, `WARN*` and `BUG*` calls work. `BUG()` calls Kestrel's `panic()`.
 
 **Memory** (`slab.h`, `gfp.h`, `mm.h`, `vmalloc.h`).
 - `kmalloc` and its family: `kzalloc`, `kcalloc`, `kmalloc_array`, `krealloc`, `ksize`, `kfree`, `kvmalloc`, `kfree_sensitive`.
