@@ -75,7 +75,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kerne
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/fuse.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c \
-           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/stopscreen.c kernel/vbe_emu.c \
+           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/installer.c kernel/stopscreen.c kernel/vbe_emu.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \

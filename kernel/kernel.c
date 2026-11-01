@@ -49,6 +49,7 @@
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
 #include <kernel/rootfs.h>
+#include <kernel/installer.h>
 #include <kernel/block.h>
 #include <kernel/kstat.h>
 #include <kernel/vdso.h>
@@ -503,6 +504,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     bootvol_mount_root();
     /* An ext2 volume labelled "kestrel-root" (any disk) becomes "/". */
     rootfs_mount();
+    /* /dev/install: copy the stick onto a SATA/NVMe disk (alpha, /boot/bin/kestrel-install) */
+    installer_init();
     /* Network cards, the IPv4 stack and its thread; DHCP runs in the background. */
     net_init();
     /* HD Audio: /dev/dsp and /dev/mixer */

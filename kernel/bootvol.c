@@ -233,10 +233,16 @@ static int try_disk(struct blkdev *disk)
 /* ======================================================================== */
 /*  the wait loop                                                              */
 /* ======================================================================== */
+/* kestrel.root=usb with no stick by the deadline: a stick copied onto a
+ * SATA or NVMe disk (kernel/installer.c) boots with the same command line,
+ * so the other disks are searched once too. */
+static bool usb_fallback;
+
 static bool wanted(const struct blkdev *b)
 {
     if (b->parent || b->removed) return false;
-    if (!strcmp(st.policy, "usb")) return b->kind == BLK_DISK_USB || b->kind == BLK_DISK_VIRTIO;   /* a VM's "stick" */
+    if (!strcmp(st.policy, "usb") && !usb_fallback)
+        return b->kind == BLK_DISK_USB || b->kind == BLK_DISK_VIRTIO;   /* a VM's "stick" */
     return true;                                    /* auto / any */
 }
 
@@ -274,6 +280,11 @@ static int discover(void)
 
         now = time_ms();
         bool busy = settling != 0 || usb_storage_pending() > 0;
+        if (now >= deadline && !io_err && !usb_fallback && !strcmp(st.policy, "usb")) {
+            kprintf("bootvol: no Kestrel stick on USB, searching the other disks (an installed copy)\n");
+            usb_fallback = true;
+            continue;                               /* one more pass: the deadline has passed */
+        }
         if (now >= deadline) break;
         if (!mandatory && !busy) break;             /* auto: nothing more is coming */
         if (now - last_note >= 1000) {
