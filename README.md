@@ -513,12 +513,22 @@ Tested in QEMU (q35, `qemu-xhci`, `usb-storage`) for each of these situations:
 | ISO + data stick under OVMF | mounted (`auto`) |
 | Option-B-only stick | mounted via the sector-0 signature |
 | Stick hot-added 3 s into `rootwait` | found at 3.9 s |
-| No stick with `kestrel.root=usb` | recovery after the budget; commands typed on the USB keyboard and over COM1; `continue` boots on |
+| No stick with `kestrel.root=usb` | the other disks are searched once, then recovery; commands typed on the USB keyboard and over COM1; `continue` boots on |
 | Corrupted payload | CRC mismatch on both candidates → recovery |
 | `blkdebug`-injected read errors | 4 retries per candidate with sense data → recovery |
 | Unplug after boot | removal detected; reads return *device removed*; the replugged stick appears as `usb1` with partitions, through the `usbd` thread |
 | EHCI with three UHCI companions (pc machine) | handoff logged |
 | Floppy and q35/AHCI | boots without regressions |
+
+### Installing onto a disk (alpha)
+
+`/boot/bin/kestrel-install` (run as root, best from the text console) copies the stick onto a SATA or NVMe disk of the PC. **Everything on that disk is erased.** It lists the disks that can take the copy, asks for the disk's name and then for the name again with "yes", and shows the progress. The copy itself is done by the kernel (`kernel/installer.c`, `/dev/install`): it syncs the root file system, zeroes the disk's last 33 sectors (an old backup GPT), then copies the stick from sector 0 to the end of its last partition (GRUB, the boot volume, the ext2 root, the EFI System Partition, the report volume) in 256 KiB requests, and flushes the disk.
+
+The copy boots like the stick, by BIOS and by UEFI: `kestrel.root=usb` searches the other disks once when no stick has appeared within `rootwait`, which adds about 3 s to each boot from the disk. The ext2 root on the boot volume's own disk is preferred, so a stick plugged into a PC with Kestrel installed still uses its own root.
+
+Alpha limits: only whole disks (no dual boot), 512-byte sectors, MBR sticks; the installed root keeps the stick's size; the disk with the mounted root and the stick itself are refused. Writing `install <disk>` to `/dev/install` starts a copy; reading it gives `state`, `source`, `progress` (MiB), `error` and one `disk` line per disk that can take the copy.
+
+Tested in QEMU (q35): installed from the stick onto a blank SATA disk, then booted that disk alone to the LXDE desktop under SeaBIOS and under OVMF; with the stick plugged in as well, the stick boots and keeps its own root.
 
 ## Source layout
 
@@ -617,6 +627,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               vbe_emu.c      VBE calls into the video BIOS through the x86emu emulator (no real mode)
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume, /dev/report
+              installer.c    /dev/install: copies the stick onto a SATA/NVMe disk (alpha)
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: the boot frame buffer, then the drivers' monitors
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
