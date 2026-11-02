@@ -36,8 +36,14 @@ static void trace_line(const char *s, size_t n)
         size_t e = i;
         while (e < n && s[e] != '\n') e++;
         int y = trace_row * f->height;
-        for (int c = 0; c < cols; c++) {
-            char ch = (size_t)c < e - i ? s[i + c] : ' ';
+        /* each line starts with the CPU's cycle count in billions (about
+         * seconds at 1 GHz): a slow step shows as a jump */
+        char stamp[16];
+        uint64_t gc = rdtsc() / 100000000ull;
+        int sl = snprintf(stamp, sizeof stamp, "%4lu.%lu ", (unsigned long)(gc / 10), (unsigned long)(gc % 10));
+        for (int c = 0; c < sl && c < cols; c++) fb_draw_char(c * f->width, y, stamp[c], 0x808080, 0x000000, f);
+        for (int c = sl; c < cols; c++) {
+            char ch = (size_t)(c - sl) < e - i ? s[i + c - sl] : ' ';
             if (ch == '\033' || (unsigned char)ch < ' ') ch = ' ';
             fb_draw_char(c * f->width, y, ch, 0xC0C0C0, 0x000000, f);
         }
