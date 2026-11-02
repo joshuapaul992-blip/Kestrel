@@ -108,6 +108,7 @@ static void acpi_init(uintptr_t mbi)
     const struct rsdp *r = find_rsdp(mbi);
     if (!r) { kprintf("acpi: no RSDP found\n"); return; }
     bool x = r->revision >= 2 && r->xsdt;
+    kprintf("acpi: RSDP rev %u, %s at 0x%lx\n", r->revision, x ? "XSDT" : "RSDT", x ? r->xsdt : (uint64_t)r->rsdt);
     const struct sdt_header *root = map_table(x ? r->xsdt : r->rsdt);
     if (!root || root->length < sizeof *root || !checksum_ok(root, root->length)) {
         kprintf("acpi: root table invalid\n");
@@ -167,6 +168,7 @@ static bool hpet_init(uintptr_t mbi)
     vmm_set_uncached(t->address, 4096);
     hpet = (volatile uint8_t *)(uintptr_t)t->address;
 
+    kprintf("time: HPET at 0x%lx, checking it\n", t->address);
     uint64_t cap = *(volatile uint64_t *)(hpet + HPET_GCAP_ID);
     hpet_period_fs = cap >> 32;
     hpet_wide = (cap >> 13) & 1;
@@ -302,7 +304,9 @@ static uint64_t tsc_hz_hpet(void)
 {
     uint64_t h0 = hpet_read(), t0 = rdtsc();
     uint64_t span = 50000000000000ull / hpet_period_fs;         /* 50 ms in HPET ticks */
-    while (hpet_read() - h0 < span) cpu_relax();
+    uint64_t spins = 0;
+    while (hpet_read() - h0 < span)                             /* 50 ms is ~100 000 reads */
+        if (++spins > 20000000ull) return 0;                    /* the counter stopped */
     uint64_t h1 = hpet_read(), t1 = rdtsc();
     uint64_t fs = (h1 - h0) * hpet_period_fs;                   /* femtoseconds elapsed */
     uint64_t ns = fs / 1000000ull;
@@ -314,6 +318,8 @@ static bool tsc_init(bool hpet_ok)
 {
     static const char *const how[] = { "HPET-calibrated", "PM-timer-calibrated", "PIT-calibrated", "CPUID" };
     for (int i = 0; i < 4; i++) {
+        if (i == 0 && !hpet_ok) continue;
+        kprintf("time: TSC rate: trying %s\n", how[i]);
         uint64_t hz = i == 0 ? (hpet_ok ? tsc_hz_hpet() : 0) : i == 1 ? tsc_hz_pmtmr()
                     : i == 2 ? tsc_hz_pit() : tsc_hz_cpuid();
         if (tsc_plausible(hz)) { tsc_set(hz, how[i]); return true; }
@@ -396,7 +402,13 @@ void time_init(uintptr_t mbi)
 {
     /* The TSC's rate, from the HPET if there is one: it backs udelay()
      * when the HPET is the clock too. */
-    bool hpet_ok = hpet_init(mbi);
+    /* kestrel.hpet=0: leave the HPET alone (one that hangs or misreads) */
+    bool hpet_ok;
+    if (strstr(g_boot.cmdline, "kestrel.hpet=0")) {
+        acpi_init(mbi);
+        hpet_ok = false;
+        kprintf("time: HPET not used (kestrel.hpet=0)\n");
+    } else hpet_ok = hpet_init(mbi);
     char hpet_desc[64];
     strlcpy(hpet_desc, src_name, sizeof hpet_desc);
     if (!tsc_init(hpet_ok)) {
@@ -423,6 +435,7 @@ void time_init(uintptr_t mbi)
         strlcpy(src_name, tsc_desc, sizeof src_name);
     }
 
+    kprintf("time: reading the RTC\n");
     boot_epoch = rtc_read_epoch();
     kprintf("time: RTC wall clock %ld (Unix seconds)\n", (long)boot_epoch);
     kprintf("time: clocksource %s%s%s\n", src_name, src == SRC_HPET ? "; " : "",
