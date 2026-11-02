@@ -87,6 +87,41 @@ static struct mb2_tag_framebuffer *parse_multiboot(uintptr_t mbi)
     return fb;
 }
 
+/* The boot page tables map 0-4 GiB. Under UEFI a graphics card's frame
+ * buffer is often above that (64-bit BARs, "Above 4G decoding", Resizable
+ * BAR): map it here with 2 MiB pages from static tables, before there is a
+ * page allocator, so the boot trace shows from the first lines. vmm.c later
+ * finds these entries present and keeps them. */
+static uint64_t early_pdpt[512] __attribute__((aligned(4096)));
+static uint64_t early_pd[2][512] __attribute__((aligned(4096)));
+
+static bool early_map_fb(uint64_t phys, uint64_t size)
+{
+    if (!phys || !size) return false;
+    if (phys + size <= BOOT_MAP_END) return true;
+    uint64_t start = phys & ~0x1FFFFFull, end = (phys + size + 0x1FFFFF) & ~0x1FFFFFull;
+    if ((end - 1) >> 30 > (start >> 30) + 1) return false;         /* more than two 1 GiB slots */
+    if ((start >> 39) != ((end - 1) >> 39) || (start >> 39) >= 128) return false;
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & 0x000FFFFFFFFFF000ull);
+    uint64_t *e = &pml4[start >> 39];
+    if (!(*e & 1)) *e = (uint64_t)(uintptr_t)early_pdpt | 3;
+    uint64_t *pdpt = (uint64_t *)(*e & 0x000FFFFFFFFFF000ull);
+    int used = 0;
+    for (uint64_t a = start; a < end; a += 0x200000) {
+        uint64_t *g = &pdpt[(a >> 30) & 511];
+        if (!(*g & 1)) {
+            if (used == 2) return false;
+            *g = (uint64_t)(uintptr_t)early_pd[used++] | 3;
+        }
+        if (*g & 0x80) continue;                                    /* already a 1 GiB page */
+        uint64_t *pd = (uint64_t *)(*g & 0x000FFFFFFFFFF000ull);
+        uint64_t *pde = &pd[(a >> 21) & 511];
+        if (!(*pde & 1)) *pde = a | 0x83;                           /* present, write, 2 MiB */
+    }
+    write_cr3(read_cr3());
+    return true;
+}
+
 static void detect_cpu(void)
 {
     uint32_t a, b, c, d;
@@ -135,6 +170,7 @@ static void video_init(struct mb2_tag_framebuffer *t)
     }
     fb_clear(COL_BLACK);
     fb_flush();
+    klog_trace_screen(true);                        /* on again, from the top of the cleared screen */
 }
 
 /* The PCI enumerator logs through klog_putc(): COM1 + the kernel log. */
@@ -420,6 +456,14 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     if (magic != MB2_BOOTLOADER_MAGIC) panic("bad Multiboot2 magic %x", magic);
     g_boot.mbi = mbi;
     struct mb2_tag_framebuffer *fbt = parse_multiboot(mbi);
+    /* The boot trace: the log on the firmware's frame buffer from here to
+     * the boot manager (klog.c), if the boot page tables already map it. */
+    if (fbt && early_map_fb(fbt->addr, (uint64_t)fbt->pitch * fbt->height) && fb_init(fbt)) {
+        fb_clear(COL_BLACK);
+        klog_trace_screen(true);
+        kprintf("%s %s: boot trace (shown until the boot menu; a photo of it helps when the PC stops here)\n",
+                KESTREL_NAME, KESTREL_VERSION);
+    }
     detect_cpu();
     kprintf("boot: loader \"%s\", firmware %s, cmdline \"%s\"\n", g_boot.loader,
             g_boot.uefi ? "UEFI" : "BIOS", g_boot.cmdline);
@@ -461,6 +505,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);
 
     /* ---------------- Phase 2: boot manager ---------------- */
+    klog_trace_screen(false);
     struct boot_choice ch = bootmgr_run();
     g_boot.boot_entry = (uint32_t)ch.entry;
     g_boot.boot_flags = ch.flags;

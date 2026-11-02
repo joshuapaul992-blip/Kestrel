@@ -12,6 +12,8 @@
  * live and klog_set_console(true) has been called. */
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void klog_set_console(bool on);
+/* Draw each log line on the boot frame buffer (early boot, before the boot manager). */
+void klog_trace_screen(bool on);
 /* Character sink for standalone drivers (pci.c, ahci.c): buffers a line and
  * hands it to kprintf() at each newline. */
 void klog_putc(char c);

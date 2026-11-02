@@ -68,6 +68,8 @@ On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`modu
 
 ## Boot manager
 
+**Boot trace.** From the kernel's first lines until the boot manager, every log line is also drawn on the firmware's frame buffer (`klog_trace_screen()`), and the stick's GRUB entries say when they load and start the kernel. A PC that stops early shows where in a photo, without a serial port or a report.
+
 | Key | Action |
 |---|---|
 | ↑ / ↓, Home / End | Slide the silver highlight bar (6-frame eased animation) |
