@@ -3977,6 +3977,7 @@ int syscall_dispatch(struct int_frame *f)
         __atomic_add_fetch(&cost_cpu[nr], cpu, __ATOMIC_RELAXED);
         __atomic_add_fetch(&cost_wall[nr], wall, __ATOMIC_RELAXED);
         if (cpu > cost_max[nr]) cost_max[nr] = cpu;     /* a race only loses a maximum */
+        if (kstat_stalled(cpu)) kstat_stall(STALL_SYSCALL, cpu, nr, nr == SYS_ioctl ? a2 : 0, t);
         __atomic_add_fetch(&cost_lock[nr], t->ks.lock_cyc - lw0, __ATOMIC_RELAXED);
         t->ks.sys_n++; t->ks.sys_cyc += cpu; t->ks.sys_wall += wall;
         struct kstat_cpu *k = &this_cpu()->ks;

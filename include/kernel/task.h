@@ -103,6 +103,8 @@ struct tcb {
 
     /* scheduling */
     int       quantum;
+    uint64_t  ready_tsc;        /* when it last became ready (kstat.h: runwait stalls) */
+    uint64_t  bkl_from;         /* where it last took the big lock (kstat.h: bklhold) */
     bool      idle_class;       /* runs only when no other task is ready    */
     uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;

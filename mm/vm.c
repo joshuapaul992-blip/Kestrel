@@ -168,10 +168,15 @@ static uint64_t fast_lock(struct mm *mm)
     return f;
 }
 
-static void mm_lock(struct mm *mm)
+static __attribute__((noinline)) void mm_lock(struct mm *mm)
 {
+    uint64_t t0 = rdtsc();
+    struct tcb *holder = __atomic_load_n(&mm->lock.owner, __ATOMIC_RELAXED);
     kmutex_lock(&mm->lock);
     spin_unlock_irqrestore(&mm->fast, fast_lock(mm));   /* a fast fault in progress ends first */
+    uint64_t w = rdtsc() - t0;                          /* kstat.h: arg is the holder we found */
+    if (kstat_stalled(w))
+        kstat_stall(STALL_MMWAIT, w, (uint64_t)__builtin_return_address(0), holder ? (uint64_t)holder->pid : 0, NULL);
 }
 
 static void mm_unlock(struct mm *mm) { kmutex_unlock(&mm->lock); }
@@ -630,7 +635,9 @@ int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
     uint64_t t0 = rdtsc();
     t->fault_kind = KF_OTHER;
     int r = fault_retry(t, mm, addr, err, user_mode);
-    if (r == 0) kstat_fault(t, t->fault_kind, rdtsc() - t0);    /* kstat.h */
+    uint64_t c = rdtsc() - t0;
+    if (r == 0) kstat_fault(t, t->fault_kind, c);       /* kstat.h */
+    if (kstat_stalled(c)) kstat_stall(STALL_FAULT, c, addr, (uint64_t)t->fault_kind, t);
     return r;
 }
 

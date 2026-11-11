@@ -708,6 +708,7 @@ The calling convention is the Linux x86_64 one: the call number goes in `rax`, t
 - block requests per disk (count, bytes, busy time), ext2 block cache hits and misses, and the page cache (files and pages cached, hits, misses, pages read ahead, pages evicted);
 - per process and per thread: run time, system calls, lock waits, faults and I/O.
 - per system call: time spent waiting for the big lock (`lockwait_us=`).
+- stalls of 4 ms or more (a quarter of a frame at 60 FPS), by kind: a CPU with interrupts off (its timer tick came late), a thread that was ready but got no CPU, one system call or page fault, waiting for an address space's lock, waiting for or holding the big lock, and waiting for other CPUs to drop translations. Each kind counts its stalls over 4, 16 and 50 ms and keeps the longest; the latest four of each are listed with the time, the CPU, the thread and where they happened (a kernel address, the system call and its ioctl request, or the faulting address).
 
 `/proc/kprof` is a sampling profile: every timer tick on every CPU counts where it was (user mode, the idle loop, or a 16-byte slot of kernel text), and every contended acquisition of the big lock is counted by its caller (an interrupt by its vector). Reading it lists the busiest slots and the waits; a script resolves the addresses with `addr2line -f -i` against `build/kernel.elf`.
 
