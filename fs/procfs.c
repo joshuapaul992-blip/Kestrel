@@ -419,6 +419,7 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
     if (t->user) P("VmSize:\t%lu kB\nVmRSS:\t%lu kB\n", pages * 4, pages * 4);
     P("Threads:\t%d\nSigPnd:\t%016lx\nShdPnd:\t%016lx\nSigBlk:\t%016lx\n", c->threads,
       t->sig_pending, c->shared_pending, t->sig_mask);
+    P("NoNewPrivs:\t%d\nSeccomp:\t%d\n", t->no_new_privs, t->seccomp_mode);
     kfree(c);
     return n;
 }

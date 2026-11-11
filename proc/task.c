@@ -29,6 +29,7 @@
 #include <kernel/smp.h>
 #include <kernel/spinlock.h>
 #include <kernel/fpu.h>
+#include <kernel/seccomp.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp, int *saved);
 extern void thread_trampoline(void);
@@ -353,6 +354,7 @@ static void reap_one(struct tcb *t)
     fs_put(fs);
     sighand_put(sh);
     signal_put(g);
+    seccomp_release(t);
     if (mm) mm_put(mm);                                 /* normally gone at exit already */
     t->pml4 = 0;
     kstack_free(t->kstack);

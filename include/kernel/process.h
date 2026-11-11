@@ -56,6 +56,7 @@ struct int_frame;
 #define SIGTTOU     22
 #define SIGURG      23
 #define SIGWINCH    28
+#define SIGSYS      31
 
 #define SIG_DFL     0
 #define SIG_IGN     1
@@ -101,6 +102,10 @@ int  signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info);
 /* The current process faulted (idt.c): deliver sig with this siginfo, even
  * if it is blocked or ignored (then the default action applies). */
 void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err);
+void signal_force_info(int sig, const struct ksig_info *info);     /* the same, any siginfo */
+/* The current thread dies of sig at once (a seccomp kill); with `group`, or
+ * when it is the last thread, its whole process does. */
+__attribute__((noreturn)) void signal_die(int sig, bool group, uint64_t rip);
 bool signal_pending(void);                      /* for blocking loops         */
 /* signalfd: take the lowest pending signal of the current thread that is in
  * mask (its own first, then the process'); 0 if none. */

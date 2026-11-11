@@ -28,6 +28,7 @@
 #include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/futex.h>
+#include <kernel/seccomp.h>
 #include <kernel/time.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
@@ -294,6 +295,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->pgid = p->pgid;
     c->sid = p->sid;
     c->sig_mask = p->sig_mask;
+    seccomp_fork(c, p);                                 /* under the lock a TSYNC holds */
     c->sig_pending = 0;
     /* exit_group() or execve() in another thread already sent its SIGKILLs:
      * this one gets its own (taken on its first way back to the kernel) */
@@ -810,7 +812,7 @@ int signal_send_locked(struct tcb *t, int sig) { return send_info_locked(t, sig,
  * force_sig_fault(): a fault cannot be ignored or blocked -- if it is, the
  * action reverts to the default (the process dies) instead of returning to
  * the faulting instruction forever. */
-void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err)
+void signal_force_info(int sig, const struct ksig_info *info)
 {
     struct tcb *t = current_task();
     struct k_sigaction *k = &t->sighand->action[sig - 1];
@@ -819,9 +821,15 @@ void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint6
         k->handler = SIG_DFL;
         set_mask(t, t->sig_mask & ~sigbit(sig));
     }
-    t->siginfo[sig - 1] = (struct ksig_info){ .code = code, .addr = addr, .trapno = trapno, .err = err };
+    t->siginfo[sig - 1] = *info;
     t->sig_pending |= sigbit(sig);
     spin_unlock_irqrestore(&proc_lock, fl);
+}
+
+void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err)
+{
+    struct ksig_info i = { .code = code, .addr = addr, .trapno = trapno, .err = err };
+    signal_force_info(sig, &i);
 }
 
 static uint64_t pending_of(const struct tcb *t) { return t->sig_pending | t->signal->shared_pending; }
@@ -913,6 +921,27 @@ __attribute__((noreturn)) static void die(struct tcb *t, int sig, uint64_t rip, 
     task_exit(128 + sig);
 }
 
+__attribute__((noreturn)) void signal_die(int sig, bool group, uint64_t rip)
+{
+    struct tcb *t = current_task();
+    struct ksig_info i = { .code = SI_KERNEL };
+    if (!group) {                                       /* the last thread takes its process along */
+        uint64_t fl = spin_lock_irqsave(&proc_lock);
+        group = true;
+        for (int n = 0; n < MAX_TASKS && group; n++) {
+            struct tcb *o = task_slot(n);
+            if (o != t && thread_alive(o) && same_group(o, t)) group = false;
+        }
+        if (!group) t->term_signal = sig;
+        spin_unlock_irqrestore(&proc_lock, fl);
+        if (!group) {
+            sti();
+            task_exit(128 + sig);
+        }
+    }
+    die(t, sig, rip, &i);
+}
+
 /* Linux x86_64 signal frame (arch/x86/include/uapi/asm/sigcontext.h). */
 struct sigctx {
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
@@ -937,6 +966,7 @@ struct ksiginfo {
     union {
         struct { int32_t pid; uint32_t uid; int32_t status, pad; int64_t utime, stime; } kill;   /* + SIGCHLD */
         struct { uint64_t addr; } fault;
+        struct { uint64_t call_addr; int32_t syscall; uint32_t arch; } sys;     /* seccomp's SIGSYS */
         uint8_t raw[128 - 16];
     } u;
 };
@@ -953,14 +983,29 @@ _Static_assert(sizeof(struct ksiginfo) == 128, "siginfo layout");
 
 /* siginfo_t as Linux lays it out, for sig with the details in i
  * (rt_sigtimedwait; signal frames build theirs the same way). */
+static void fill_info(struct ksiginfo *u, int sig, const struct ksig_info *i)
+{
+    u->si_signo = sig;
+    u->si_code = i->code;
+    if (fault_signal(sig) && i->trapno) {
+        u->u.fault.addr = i->addr;
+    } else if (sig == SIGSYS && i->code == SYS_SECCOMP) {
+        u->si_errno = i->errnum;                        /* the filter's SECCOMP_RET_DATA */
+        u->u.sys.call_addr = i->addr;
+        u->u.sys.syscall = i->syscall;
+        u->u.sys.arch = i->arch;
+    } else {
+        u->u.kill.pid = i->pid;
+        u->u.kill.uid = i->uid;
+        u->u.kill.status = i->status;
+    }
+}
+
 void signal_user_info(int sig, const struct ksig_info *i, void *out128)
 {
     struct ksiginfo u;
     memset(&u, 0, sizeof u);
-    u.si_signo = sig;
-    u.si_code = i->code;
-    if (fault_signal(sig) && i->trapno) u.u.fault.addr = i->addr;
-    else { u.u.kill.pid = i->pid; u.u.kill.uid = i->uid; u.u.kill.status = i->status; }
+    fill_info(&u, sig, i);
     memcpy(out128, &u, sizeof u);
 }
 
@@ -1046,15 +1091,7 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, const struc
     fr.uc.ss_sp = t->alt_sp;
     fr.uc.ss_size = t->alt_size;
     fr.uc.ss_flags = !t->alt_size ? 2 /* SS_DISABLE */ : sig_on_altstack(t, f->rsp) ? 1 /* SS_ONSTACK */ : 0;
-    fr.info.si_signo = sig;
-    fr.info.si_code = si->code;
-    if (fault_signal(sig) && si->trapno) {
-        fr.info.u.fault.addr = si->addr;
-    } else {
-        fr.info.u.kill.pid = si->pid;
-        fr.info.u.kill.uid = si->uid;
-        fr.info.u.kill.status = si->status;
-    }
+    fill_info(&fr.info, sig, si);
     if (copy_to_user((void *)frame, &fr, sizeof fr)) return false;
 
     f->rip = k->handler;

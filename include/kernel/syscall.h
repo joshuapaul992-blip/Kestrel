@@ -129,6 +129,7 @@ struct int_frame;
 #define SYS_dup3          292
 #define SYS_pipe2         293
 #define SYS_prlimit64     302
+#define SYS_seccomp       317
 #define SYS_getrandom     318
 #define SYS_pread64        17
 #define SYS_pwrite64       18
