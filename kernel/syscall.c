@@ -38,6 +38,7 @@
 #include <kernel/futex.h>
 #include <kernel/vdso.h>
 #include <kernel/fuse.h>
+#include <kernel/seccomp.h>
 
 extern void syscall_entry(void);
 
@@ -1893,7 +1894,7 @@ static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, ui
 #define PR_SET_PTRACER       0x59616d61
 static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)a5; (void)a6;
+    (void)a6;
     struct tcb *t = current_task();
     switch (op) {
     case 15: {                                          /* PR_SET_NAME */
@@ -1915,15 +1916,21 @@ static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, ui
     case 4: return arg <= 1 ? 0 : -EINVAL;               /* PR_SET_DUMPABLE */
     case 7: return 0;                                   /* PR_GET_KEEPCAPS */
     case 8: return arg <= 1 ? 0 : -EINVAL;               /* PR_SET_KEEPCAPS */
-    case 21: return 0;                                  /* PR_GET_SECCOMP: no filter */
+    case 21: return t->seccomp_mode;                    /* PR_GET_SECCOMP (strict mode never gets here) */
+    case 22: return seccomp_prctl_set(arg, a3);         /* PR_SET_SECCOMP */
     case 23: return arg <= 40 ? 1 : -EINVAL;             /* PR_CAPBSET_READ: every capability (sys_capget) */
     case 24: return arg <= 40 ? 0 : -EINVAL;             /* PR_CAPBSET_DROP */
     case 29: return 0;                                  /* PR_SET_TIMERSLACK: timers are exact anyway */
     case 30: return 50000;                              /* PR_GET_TIMERSLACK: Linux's default, in ns */
     case 36: return 0;                                  /* PR_SET_CHILD_SUBREAPER: orphans go to init regardless */
     case 37: return put_user_u32((void *)arg, 0) ? -EFAULT : 0;    /* PR_GET_CHILD_SUBREAPER */
-    case 38: return 0;                                  /* PR_SET_NO_NEW_PRIVS: nothing gains them anyway */
-    case 39: return 0;                                  /* PR_GET_NO_NEW_PRIVS */
+    case 38:                                            /* PR_SET_NO_NEW_PRIVS: for seccomp; one way */
+        if (arg != 1 || a3 || a4 || a5) return -EINVAL;
+        t->no_new_privs = true;
+        return 0;
+    case 39:                                            /* PR_GET_NO_NEW_PRIVS */
+        if (arg || a3 || a4 || a5) return -EINVAL;
+        return t->no_new_privs;
     case 40: {                                          /* PR_GET_TID_ADDRESS */
         uint64_t v = t->tid_address;
         return copy_to_user((void *)arg, &v, sizeof v) ? -EFAULT : 0;
@@ -3633,6 +3640,7 @@ void syscall_init(void)
     REG(SYS_dup3, sys_dup3);           REG(SYS_pipe, sys_pipe);
     REG(SYS_pipe2, sys_pipe2);         REG(SYS_access, sys_access);
     REG(SYS_umask, sys_umask);         REG(SYS_getrandom, sys_getrandom);
+    REG(SYS_seccomp, sys_seccomp);
     REG(SYS_socket, sys_socket);       REG(SYS_socketpair, sys_socketpair);
     REG(SYS_bind, sys_bind);           REG(SYS_listen, sys_listen);
     REG(SYS_connect, sys_connect);     REG(SYS_accept, sys_accept);
@@ -3778,7 +3786,7 @@ static bool may_block(uint64_t nr)
 static bool syscall_fast(struct int_frame *f)
 {
     struct tcb *t = current_task();
-    if (strace_pat[0] || !t->user || signal_pending()) return false;
+    if (strace_pat[0] || !t->user || t->seccomp_mode || signal_pending()) return false;
     switch (f->rax) {
     case SYS_clock_gettime: {
         int kind = clock_kind(f->rdi);
@@ -3946,10 +3954,14 @@ int syscall_dispatch(struct int_frame *f)
     if (syscall_fast(f)) return 0;
     uint64_t nr = f->rax;
     struct tcb *t = current_task();
-    bool locked = strace_pat[0] || !t->user || !syscall_nolock(nr, f);
+    /* seccomp filters see every call first, the ones Kestrel lacks too */
+    bool skip = t->seccomp_mode && !seccomp_syscall(f);
+    bool locked = !skip && (strace_pat[0] || !t->user || !syscall_nolock(nr, f));
     uint64_t lw0 = t->ks.lock_cyc;                      /* waits for the kernel lock, this call */
     if (locked) bkl_enter();                            /* kernel code: one CPU at a time */
-    if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
+    if (skip) {
+        /* f->rax: the filter's errno, or the number under its SIGSYS */
+    } else if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
         static uint8_t warned[SYS_MAX + 1];
         uint64_t k = nr < SYS_MAX ? nr : SYS_MAX;
         if (t->user && warned[k] < 3) {         /* the gaps a ported program hits */

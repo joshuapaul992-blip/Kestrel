@@ -37,9 +37,13 @@ struct ksig_info {
     int32_t  pid;               /* sender / child                          */
     uint32_t uid;
     int32_t  status;            /* SIGCHLD: exit status or signal          */
-    uint64_t addr;              /* faults: si_addr (and sigcontext cr2)    */
+    uint64_t addr;              /* faults: si_addr (and sigcontext cr2);
+                                   seccomp's SIGSYS: si_call_addr          */
     uint64_t err;               /* faults: CPU error code                  */
     uint32_t trapno;            /* faults: exception vector                */
+    int32_t  syscall;           /* seccomp's SIGSYS: si_syscall, si_arch,  */
+    uint32_t arch;              /*   and the filter's data as si_errno     */
+    int32_t  errnum;
 };
 
 /* Kernel layout of struct sigaction (Linux x86_64 rt_sigaction). */
@@ -122,6 +126,9 @@ struct tcb {
     struct sighand_struct *sighand;
     struct signal_struct  *signal;
     uint32_t  uid, gid;
+    uint8_t   seccomp_mode;     /* seccomp.h: none, strict or filters      */
+    bool      no_new_privs;     /* prctl(PR_SET_NO_NEW_PRIVS); kept by fork and execve */
+    struct seccomp_filter *seccomp;     /* newest filter of the chain     */
     int       tty;              /* system_ttys[] index: /dev/tty, stdin/stdout */
 
     /* user process (ring 3); all zero for kernel threads */

@@ -67,7 +67,7 @@ BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
            arch/x86_64/trampoline.asm arch/x86_64/vdso_blob.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/sysvshm.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kernel/vdso.c kernel/syscall.c kernel/seccomp.c kernel/uaccess.c kernel/futex.c kernel/sysvshm.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c mm/pagecache.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c arch/x86_64/fpu.c arch/x86_64/pstate.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c drivers/evdev.c \
            drivers/font_8x16.c drivers/pci/pci.c \
@@ -386,7 +386,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest fusermount3
+MUSL_PROGS  := libctest sandboxtest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest fusermount3
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS) nopietest))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
