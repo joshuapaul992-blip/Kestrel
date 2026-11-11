@@ -1,11 +1,14 @@
 /* include/kernel/time.h -- calibrated monotonic clock, usable before interrupts
  *
  * Source, in order of preference:
- *   1. an invariant TSC (CPUID 0x80000007), calibrated against the HPET:
- *      read in a few cycles, also by the vDSO in user mode (vdso.h)
+ *   1. an invariant TSC (CPUID 0x80000007): read in a few cycles, also by
+ *      the vDSO in user mode (vdso.h)
  *   2. HPET main counter (found through the ACPI HPET table; the period is
  *      given by the hardware, no calibration needed)
- *   3. TSC, calibrated against PIT channel 2 (polled, no IRQ involved)
+ *   3. TSC as it is
+ * The TSC's rate is measured against the HPET, else the ACPI PM timer,
+ * else PIT channel 2 (all polled, no IRQ involved), else read from CPUID
+ * 0x15/0x16: UEFI machines often stop the PIT's clock, some have no HPET.
  * kestrel.clocksource=hpet or =tsc overrides the choice. If the CPUs' TSCs
  * turn out not to be in step (smp.c checks each CPU as it starts), the
  * clock goes back to the HPET.
