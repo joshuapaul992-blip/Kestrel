@@ -1,0 +1,88 @@
+#!/bin/sh
+# /boot/bin/kestrel-install -- the Kestrel disk installer (alpha)
+#
+# Copies the stick Kestrel is running from onto a SATA or NVMe disk, sector
+# for sector (the kernel does the copy: /dev/install, kernel/installer.c).
+# EVERYTHING ON THAT DISK IS ERASED. The copy boots like the stick, by BIOS
+# and by UEFI, once the stick is out. Run it as root, best from the text
+# console (fewer files change while the root file system is copied).
+#   kestrel-install            list the disks, ask, copy
+#   kestrel-install sata0      the same, for that disk (still asks)
+DEV=/dev/install
+
+say() { printf '%s\n' "$*"; }
+field() { sed -n "s/^$1 //p" "$DEV" | head -n 1; }
+
+say ""
+say "Kestrel installer (ALPHA)"
+say "========================="
+say ""
+if [ "$(id -u)" != 0 ]; then say "Run it as root."; exit 1; fi
+if [ ! -r "$DEV" ]; then say "This kernel has no installer ($DEV is missing)."; exit 1; fi
+
+err=$(field error)
+state=$(field state)
+if [ "$state" = copying ]; then say "A copy is already running: $(field progress) MiB"; exit 1; fi
+if [ -n "$err" ] && [ "$state" = idle ]; then say "Cannot install: $err"; exit 1; fi
+set -- $(field source) "$@"
+src=$1; src_mib=$2; shift 2
+
+say "This copies the stick ($src, $src_mib MiB) onto a disk of this PC."
+say ""
+say "  * EVERYTHING ON THE DISK YOU PICK IS ERASED: other systems, files, all of it."
+say "  * Alpha: back up anything you care about first. Only whole disks, no"
+say "    dual boot. The installed root file system has the stick's size."
+say "  * Afterwards: shut down, remove the stick, boot from the disk. On UEFI"
+say "    you may have to pick the disk in the firmware's boot menu once."
+say ""
+disks=$(sed -n 's/^disk //p' "$DEV")
+if [ -z "$disks" ]; then
+    say "No disk can take it: SATA or NVMe disks with 512-byte sectors, at least"
+    say "$src_mib MiB, that are not the stick. Disks Kestrel sees:"
+    cat /proc/partitions 2>/dev/null
+    exit 1
+fi
+say "Disks it can be installed on:"
+say "$disks" | while read -r name mib model; do
+    printf '  %-8s %8s MiB  %s\n' "$name" "$mib" "$model"
+done
+say ""
+
+target=$1
+if [ -z "$target" ]; then
+    printf 'Disk to ERASE and install on (name, or Enter to cancel): '
+    read -r target || exit 1
+fi
+[ -n "$target" ] || { say "Cancelled."; exit 0; }
+line=$(say "$disks" | awk -v d="$target" '$1 == d')
+if [ -z "$line" ]; then say "$target is not one of the disks above."; exit 1; fi
+say ""
+say "About to erase:  $line"
+printf 'Type the disk name again and "yes", like "%s yes", to go ahead: ' "$target"
+read -r again answer || exit 1
+if [ "$again" != "$target" ] || [ "$answer" != yes ]; then say "Cancelled, nothing written."; exit 0; fi
+
+if ! printf 'install %s\n' "$target" > "$DEV"; then
+    say "The kernel refused (see dmesg | grep install)."
+    exit 1
+fi
+say ""
+while :; do
+    state=$(field state)
+    set -- $(field progress)
+    pct=0
+    [ "${2:-0}" -gt 0 ] && pct=$(( $1 * 100 / $2 ))
+    printf '\r  copying: %s / %s MiB (%d%%)   ' "${1:-0}" "${2:-?}" "$pct"
+    [ "$state" = copying ] || break
+    sleep 1
+done
+say ""
+if [ "$state" != done ]; then
+    say "Install FAILED: $(field error)"
+    say "The disk may now hold a partial copy; run the installer again or erase it."
+    exit 1
+fi
+sync
+say ""
+say "Installed on $target."
+say "Shut down, remove the stick, and boot from the disk."

@@ -23,6 +23,7 @@
 #include <kernel/bootinfo.h>
 #include <kernel/posix.h>
 #include <kernel/rootfs.h>
+#include <kernel/bootvol.h>
 
 #define DEFAULT_LABEL "kestrel-root"
 
@@ -44,23 +45,31 @@ static bool cmdline_get(const char *key, char *out, size_t cap)
     return false;
 }
 
+/* The volume labelled `want`: on the boot volume's own disk first (a stick
+ * plugged into a PC that has Kestrel installed takes its own root), then
+ * on any disk. */
 static struct blkdev *find_label(const char *want)
 {
     for (int i = 0; i < blk_count(); i++) {             /* partition tables first */
         struct blkdev *b = blk_get(i);
         if (b && !b->parent && !b->removed && !b->partitions_scanned) blk_scan_partitions(b);
     }
-    for (int i = 0; i < blk_count(); i++) {
-        struct blkdev *b = blk_get(i);
-        char label[17];
-        if (!b || b->removed) continue;
-        if (!b->parent) {                               /* a whole disk: only if it has no partitions */
-            bool parts = false;
-            for (int j = 0; j < blk_count(); j++) if (blk_get(j)->parent == b) { parts = true; break; }
-            if (parts) continue;
+    const struct bootvol_status *bv = bootvol_status();
+    struct blkdev *bvdev = bv->device[0] ? blk_find(bv->device) : NULL;
+    struct blkdev *home = bvdev ? blk_disk_of(bvdev) : NULL;
+    for (int pass = home ? 0 : 1; pass < 2; pass++)
+        for (int i = 0; i < blk_count(); i++) {
+            struct blkdev *b = blk_get(i);
+            char label[17];
+            if (!b || b->removed) continue;
+            if (pass == 0 && blk_disk_of(b) != home) continue;
+            if (!b->parent) {                           /* a whole disk: only if it has no partitions */
+                bool parts = false;
+                for (int j = 0; j < blk_count(); j++) if (blk_get(j)->parent == b) { parts = true; break; }
+                if (parts) continue;
+            }
+            if (ext2_probe(b, label) && !strcmp(label, want)) return b;
         }
-        if (ext2_probe(b, label) && !strcmp(label, want)) return b;
-    }
     return NULL;
 }
 
