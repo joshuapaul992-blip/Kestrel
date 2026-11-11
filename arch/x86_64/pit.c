@@ -5,6 +5,7 @@
 #include <kernel/cpu.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
+#include <kernel/serial.h>
 
 #define PIT_BASE_HZ 1193182u
 
@@ -33,6 +34,7 @@ bool timer_tick_needs_lock(void)
 void timer_tick_fast(void)
 {
     ticks++;
+    serial_poll();
     sched_tick_boot_fast();
 }
 
@@ -49,6 +51,7 @@ void timer_interrupt(bool boot_cpu)
 {
     if (!boot_cpu) { sched_tick_local(); return; }
     ticks++;
+    serial_poll();
     for (int i = 0; i < MAX_TICK_HOOKS && tick_hooks[i]; i++)
         tick_hooks[i]();            /* xhci_poll(), terminal cursor blink, ... */
     sched_tick();               /* wakes sleepers, may preempt the current thread */

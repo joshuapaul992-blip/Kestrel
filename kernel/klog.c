@@ -63,7 +63,7 @@ void kprintf(const char *fmt, ...)
     bool lock = !smp_panicking;
     uint64_t f = lock ? spin_lock_irqsave(&log_lock) : irq_save();
     log_append(buf, (size_t)n);
-    serial_write(buf);
+    serial_log(buf);                                    /* queued: never waits for the UART */
     if (lock) spin_unlock_irqrestore(&log_lock, f);
     else irq_restore(f);
     if (!to_console || !g_fb.ready) return;
@@ -85,6 +85,7 @@ void panic(const char *fmt, ...)
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
 
+    serial_flush();                                     /* what the log still had queued */
     serial_write("\n*** KERNEL PANIC: ");
     serial_write(buf);
     serial_write("\n");
