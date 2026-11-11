@@ -556,13 +556,13 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg boot/grub/grub-bench.cfg tools/mku
 	@echo "  GRUB    core.img (USB, memdisk)"
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/usb-core.img \
 	    -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
-	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb test \
+	    biosdisk memdisk tar normal configfile echo multiboot2 vbe video video_fb test \
 	    part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux)
 	@if [ -f $(BUILD)/usb-esp.img ]; then \
 	    echo "  GRUB    BOOTX64.EFI (USB, memdisk)"; \
 	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(BUILD)/usb-bootx64.efi \
 	        -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
-	        memdisk tar normal configfile multiboot2 efi_gop efi_uga video video_fb test \
+	        memdisk tar normal configfile echo multiboot2 efi_gop efi_uga video video_fb test \
 	        part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux) && \
 	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
 	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
